@@ -84,6 +84,48 @@ When implementation starts, this repository should become a Cargo workspace with
 - `node`
 - `sim`
 
+## Current Implementation Status
+
+The repository now includes a working Rust workspace with:
+
+- shared protocol/config types
+- deterministic mock crypto for local development
+- file-backed ledger state and block logs
+- baseline proposer selection and witness assignment logic
+- TCP-based static-peer networking
+- a CLI node binary and localnet simulator
+
+Important:
+
+- the current backend is a deterministic development backend, not a production-strength post-quantum implementation
+- real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
+
+## Quickstart
+
+Build the binaries:
+
+```bash
+cargo build --bins
+```
+
+Generate a four-node localnet:
+
+```bash
+cargo run -p entangrid-sim -- init-localnet --validators 4 --base-dir var/localnet
+```
+
+Start the localnet:
+
+```bash
+cargo run -p entangrid-sim -- up --base-dir var/localnet
+```
+
+Inject steady transfer traffic from another terminal:
+
+```bash
+cargo run -p entangrid-sim -- load --base-dir var/localnet --scenario steady --duration-secs 12
+```
+
 ## Guiding Principle
 
 The chain should not reward a validator merely for being online.
