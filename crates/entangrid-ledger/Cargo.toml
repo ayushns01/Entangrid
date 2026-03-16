@@ -1,0 +1,12 @@
+[package]
+name = "entangrid-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+entangrid-crypto = { path = "../entangrid-crypto" }
+entangrid-types = { path = "../entangrid-types" }
+serde_json.workspace = true
+
