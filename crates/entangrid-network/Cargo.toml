@@ -1,0 +1,13 @@
+[package]
+name = "entangrid-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+entangrid-crypto = { path = "../entangrid-crypto" }
+entangrid-types = { path = "../entangrid-types" }
+tokio.workspace = true
+
