@@ -38,6 +38,16 @@ enum Commands {
         slots_per_epoch: u64,
         #[arg(long, default_value_t = 3_000)]
         start_delay_millis: u64,
+        #[arg(long, default_value_t = false)]
+        enable_service_gating: bool,
+        #[arg(long)]
+        degraded_validator: Option<u64>,
+        #[arg(long, default_value_t = 0)]
+        degraded_delay_ms: u64,
+        #[arg(long, default_value_t = 0.0)]
+        degraded_drop_probability: f64,
+        #[arg(long, default_value_t = false)]
+        degraded_disable_outbound: bool,
     },
     Up {
         #[arg(long, default_value = "var/localnet")]
@@ -74,12 +84,22 @@ pub async fn cli_main() -> Result<()> {
             slot_duration_millis,
             slots_per_epoch,
             start_delay_millis,
+            enable_service_gating,
+            degraded_validator,
+            degraded_delay_ms,
+            degraded_drop_probability,
+            degraded_disable_outbound,
         } => init_localnet(
             validators,
             &base_dir,
             slot_duration_millis,
             slots_per_epoch,
             start_delay_millis,
+            enable_service_gating,
+            degraded_validator,
+            degraded_delay_ms,
+            degraded_drop_probability,
+            degraded_disable_outbound,
         ),
         Commands::Up { base_dir } => up_localnet(&base_dir).await,
         Commands::Load {
@@ -96,9 +116,21 @@ pub fn init_localnet(
     slot_duration_millis: u64,
     slots_per_epoch: u64,
     start_delay_millis: u64,
+    enable_service_gating: bool,
+    degraded_validator: Option<u64>,
+    degraded_delay_ms: u64,
+    degraded_drop_probability: f64,
+    degraded_disable_outbound: bool,
 ) -> Result<()> {
     if validators < 4 {
         return Err(anyhow!("at least 4 validators are recommended"));
+    }
+    if let Some(degraded_validator) = degraded_validator {
+        if degraded_validator == 0 || degraded_validator > validators as u64 {
+            return Err(anyhow!(
+                "degraded validator id must be within the validator set"
+            ));
+        }
     }
     fs::create_dir_all(base_dir)?;
     let genesis_path = base_dir.join("genesis.toml");
@@ -145,6 +177,13 @@ pub fn init_localnet(
                 address: peer.address.clone(),
             })
             .collect();
+        let fault_profile = degraded_fault_profile(
+            validator.validator_id,
+            degraded_validator,
+            degraded_delay_ms,
+            degraded_drop_probability,
+            degraded_disable_outbound,
+        );
         let config = NodeConfig {
             validator_id: validator.validator_id,
             data_dir: node_dir.to_string_lossy().to_string(),
@@ -155,9 +194,9 @@ pub fn init_localnet(
             metrics_path: node_dir.join("metrics.json").to_string_lossy().to_string(),
             feature_flags: FeatureFlags {
                 enable_receipts: true,
-                enable_service_gating: false,
+                enable_service_gating,
             },
-            fault_profile: FaultProfile::default(),
+            fault_profile,
             sync_on_startup: true,
         };
         let config_path = node_dir.join("node.toml");
@@ -291,11 +330,9 @@ fn write_transaction_for_validator(
     large_memo: bool,
 ) -> Result<()> {
     let sender_account = validator_account(validator_id);
-    let recipient_id = if validator_id == genesis.validators.len() as u64 {
-        1
-    } else {
-        validator_id + 1
-    };
+    let recipient_id =
+        deterministic_recipient_id(genesis, validator_id, sequence, amount, large_memo)
+            .ok_or_else(|| anyhow!("failed to select recipient for validator {validator_id}"))?;
     let recipient_account = validator_account(recipient_id);
     let nonce = next_nonce.entry(sender_account.clone()).or_default();
     let transaction = Transaction {
@@ -342,6 +379,60 @@ fn current_nonces(base_dir: &Path, genesis: &GenesisConfig) -> Result<BTreeMap<S
     Ok(nonces)
 }
 
+fn deterministic_recipient_id(
+    genesis: &GenesisConfig,
+    sender_validator_id: u64,
+    sequence: u64,
+    amount: u64,
+    large_memo: bool,
+) -> Option<u64> {
+    let recipients: Vec<_> = genesis
+        .validators
+        .iter()
+        .map(|validator| validator.validator_id)
+        .filter(|validator_id| *validator_id != sender_validator_id)
+        .collect();
+    if recipients.is_empty() {
+        return None;
+    }
+    let selector = canonical_hash(&(
+        genesis.chain_id.as_str(),
+        sender_validator_id,
+        sequence,
+        amount,
+        large_memo,
+    ));
+    let mut selector_bytes = [0u8; 8];
+    selector_bytes.copy_from_slice(&selector[..8]);
+    let index = u64::from_le_bytes(selector_bytes) as usize % recipients.len();
+    Some(recipients[index])
+}
+
+fn degraded_fault_profile(
+    validator_id: u64,
+    degraded_validator: Option<u64>,
+    degraded_delay_ms: u64,
+    degraded_drop_probability: f64,
+    degraded_disable_outbound: bool,
+) -> FaultProfile {
+    if degraded_validator != Some(validator_id) {
+        return FaultProfile::default();
+    }
+    let outbound_drop_probability =
+        if degraded_delay_ms == 0 && degraded_drop_probability == 0.0 && !degraded_disable_outbound
+        {
+            0.85
+        } else {
+            degraded_drop_probability
+        };
+    FaultProfile {
+        artificial_delay_ms: degraded_delay_ms,
+        outbound_drop_probability,
+        pause_slot_production: false,
+        disable_outbound: degraded_disable_outbound,
+    }
+}
+
 fn manifest_path(base_dir: &Path) -> PathBuf {
     base_dir.join("localnet-manifest.toml")
 }
@@ -377,7 +468,62 @@ mod tests {
     fn init_localnet_creates_manifest() {
         let unique_dir =
             std::env::temp_dir().join(format!("entangrid-sim-test-{}", now_unix_millis()));
-        init_localnet(4, &unique_dir, 2_000, 10, 1_000).unwrap();
+        init_localnet(4, &unique_dir, 2_000, 10, 1_000, false, None, 0, 0.0, false).unwrap();
         assert!(manifest_path(&unique_dir).exists());
+    }
+
+    #[test]
+    fn deterministic_recipient_selection_never_targets_sender() {
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: now_unix_millis(),
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: (1..=4)
+                .map(|validator_id| ValidatorConfig {
+                    validator_id,
+                    stake: 100,
+                    address: format!("127.0.0.1:{}", 4100 + validator_id),
+                    dev_secret: format!("secret-{validator_id}"),
+                    public_identity: vec![],
+                })
+                .collect(),
+            initial_balances: BTreeMap::new(),
+        };
+
+        for sequence in 0..20 {
+            for sender in 1..=4 {
+                let recipient =
+                    deterministic_recipient_id(&genesis, sender, sequence, 1, false).unwrap();
+                assert_ne!(sender, recipient);
+            }
+        }
+    }
+
+    #[test]
+    fn init_localnet_can_enable_service_gating_and_degrade_one_node() {
+        let unique_dir =
+            std::env::temp_dir().join(format!("entangrid-sim-degraded-test-{}", now_unix_millis()));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            true,
+            Some(3),
+            0,
+            0.75,
+            false,
+        )
+        .unwrap();
+        let node_three_path = unique_dir.join("node-3").join("node.toml");
+        let contents = fs::read_to_string(node_three_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert!(node_config.feature_flags.enable_service_gating);
+        assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
     }
 }
