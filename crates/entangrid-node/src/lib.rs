@@ -26,6 +26,7 @@ const SNAPSHOT_FILE: &str = "state_snapshot.json";
 const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
+const SERVICE_GATING_THRESHOLD: f64 = 0.40;
 
 #[derive(Parser)]
 #[command(name = "entangrid-node")]
@@ -230,6 +231,7 @@ impl NodeRunner {
                     assignment.witnesses, assignment.relay_targets
                 ),
             )?;
+            self.log_current_service_score(epoch)?;
         }
 
         self.broadcast_heartbeat(slot, epoch)?;
@@ -272,13 +274,36 @@ impl NodeRunner {
         }
 
         if self.config.feature_flags.enable_service_gating {
-            let score = self.service_score_for_validator(self.config.validator_id, epoch);
-            if score < 0.40 {
+            if epoch < 2 {
                 self.log_event(
-                    "missed-slot",
-                    format!("slot {slot} missed due to service score {score:.3}"),
+                    "service-gating-warmup",
+                    format!("slot {slot} skipping service gating during warmup epoch {epoch}"),
                 )?;
-                return Ok(());
+            } else {
+                let score = self.service_score_for_validator(self.config.validator_id);
+                self.log_event(
+                    "service-gating-check",
+                    format!(
+                        "slot {slot} local_score {score:.3} threshold {:.3}",
+                        SERVICE_GATING_THRESHOLD
+                    ),
+                )?;
+                if score < SERVICE_GATING_THRESHOLD {
+                    self.update_metrics(|metrics| {
+                        metrics.missed_proposer_slots += 1;
+                        metrics.service_gating_rejections += 1;
+                        metrics.last_local_service_score = score;
+                        metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+                    });
+                    self.log_event(
+                        "missed-slot",
+                        format!(
+                            "slot {slot} missed due to service score {score:.3} below threshold {:.3}",
+                            SERVICE_GATING_THRESHOLD
+                        ),
+                    )?;
+                    return Ok(());
+                }
             }
         }
 
@@ -701,17 +726,18 @@ impl NodeRunner {
             return Ok(false);
         }
 
-        let service_score = if self.config.feature_flags.enable_service_gating {
-            Some(self.service_score_for_validator(block.header.proposer_id, block.header.epoch))
-        } else {
-            None
-        };
+        let service_score =
+            if self.config.feature_flags.enable_service_gating && block.header.epoch >= 2 {
+                Some(self.service_score_for_validator(block.header.proposer_id))
+            } else {
+                None
+            };
         self.consensus
             .validate_block_basic(
                 &block,
                 self.ledger.snapshot().tip_hash,
                 service_score,
-                self.config.feature_flags.enable_service_gating,
+                self.config.feature_flags.enable_service_gating && block.header.epoch >= 2,
             )
             .map_err(|error| anyhow!(error))?;
 
@@ -820,16 +846,36 @@ impl NodeRunner {
             .last_processed_slot
             .map(|slot| self.consensus.epoch_for_slot(slot))
             .unwrap_or(0);
-        let earliest_epoch = current_epoch.saturating_sub(3);
         let validator_ids: Vec<_> = self
             .genesis
             .validators
             .iter()
             .map(|validator| validator.validator_id)
             .collect();
+        let completed_epoch = current_epoch.saturating_sub(1);
+
+        if current_epoch == 0 {
+            for validator_id in validator_ids {
+                self.latest_service_scores.insert(validator_id, 1.0);
+            }
+            let scores = self.latest_service_scores.clone();
+            let local_score = scores
+                .get(&self.config.validator_id)
+                .copied()
+                .unwrap_or(1.0);
+            self.update_metrics(|metrics| {
+                metrics.relay_scores = scores;
+                metrics.last_local_service_score = local_score;
+                metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+                metrics.last_completed_service_epoch = 0;
+            });
+            return;
+        }
+
+        let earliest_epoch = completed_epoch.saturating_sub(3);
         for validator_id in validator_ids {
             let mut aggregate = ServiceCounters::default();
-            for epoch in earliest_epoch..=current_epoch {
+            for epoch in earliest_epoch..=completed_epoch {
                 let counters = self.consensus.counters_for_validator(
                     validator_id,
                     epoch,
@@ -850,12 +896,19 @@ impl NodeRunner {
             self.latest_service_scores.insert(validator_id, score);
         }
         let scores = self.latest_service_scores.clone();
+        let local_score = scores
+            .get(&self.config.validator_id)
+            .copied()
+            .unwrap_or(1.0);
         self.update_metrics(|metrics| {
             metrics.relay_scores = scores;
+            metrics.last_local_service_score = local_score;
+            metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+            metrics.last_completed_service_epoch = completed_epoch;
         });
     }
 
-    fn service_score_for_validator(&self, validator_id: ValidatorId, _epoch: Epoch) -> f64 {
+    fn service_score_for_validator(&self, validator_id: ValidatorId) -> f64 {
         self.latest_service_scores
             .get(&validator_id)
             .copied()
@@ -912,6 +965,29 @@ impl NodeRunner {
         };
         self.storage
             .append_json_line(&self.storage.log_path, &entry)
+    }
+
+    fn log_current_service_score(&self, epoch: Epoch) -> Result<()> {
+        if epoch == 0 {
+            return self.log_event(
+                "service-score",
+                format!(
+                    "epoch {epoch} warmup local_score {:.3} threshold {:.3}",
+                    self.service_score_for_validator(self.config.validator_id),
+                    SERVICE_GATING_THRESHOLD
+                ),
+            );
+        }
+
+        self.log_event(
+            "service-score",
+            format!(
+                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3}",
+                epoch.saturating_sub(1),
+                self.service_score_for_validator(self.config.validator_id),
+                SERVICE_GATING_THRESHOLD
+            ),
+        )
     }
 }
 

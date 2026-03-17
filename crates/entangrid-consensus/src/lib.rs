@@ -168,8 +168,7 @@ impl ConsensusEngine {
         let mut heartbeat_slots = BTreeSet::new();
         let mut distinct_peers = BTreeSet::new();
         let mut timely_deliveries = 0;
-        let expected_deliveries =
-            (self.genesis.slots_per_epoch as usize * assignment.witnesses.len()).max(1) as u64;
+        let expected_deliveries = self.genesis.slots_per_epoch.max(1);
 
         for receipt in &relevant {
             if receipt.message_class == MessageClass::Heartbeat {
