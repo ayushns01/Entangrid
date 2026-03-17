@@ -126,6 +126,28 @@ Inject steady transfer traffic from another terminal:
 cargo run -p entangrid-sim -- load --base-dir var/localnet --scenario steady --duration-secs 12
 ```
 
+Run a service-gating demo with one degraded validator:
+
+```bash
+cargo run -p entangrid-sim -- init-localnet \
+  --validators 4 \
+  --base-dir var/localnet-gated \
+  --slot-duration-millis 1000 \
+  --slots-per-epoch 5 \
+  --enable-service-gating \
+  --degraded-validator 4 \
+  --degraded-drop-probability 0.85
+
+cargo run -p entangrid-sim -- up --base-dir var/localnet-gated
+
+cargo run -p entangrid-sim -- load --base-dir var/localnet-gated --scenario steady --duration-secs 15
+```
+
+Then inspect:
+
+- `node-4/events.log` for missed slots due to low service score
+- `node-4/metrics.json` for `service_gating_rejections` and the latest local score
+
 ## Guiding Principle
 
 The chain should not reward a validator merely for being online.
