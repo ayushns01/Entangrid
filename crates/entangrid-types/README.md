@@ -1,0 +1,91 @@
+# entangrid-types
+
+## What this crate does
+
+This crate is the shared language of the project.
+
+It defines the common Rust types that every other crate agrees on:
+
+- validator ids, slots, epochs, hashes, and account ids
+- genesis and node configuration structs
+- transactions and signed transactions
+- blocks and block headers
+- heartbeat pulses, relay receipts, and topology commitments
+- protocol messages sent over the network
+- metrics, snapshots, and log entry formats
+
+If `entangrid-node`, `entangrid-ledger`, `entangrid-consensus`, and `entangrid-network` are the moving parts, `entangrid-types` is the contract that keeps them speaking the same language.
+
+## How it currently works
+
+Right now this crate is intentionally simple and very central.
+
+- `GenesisConfig` describes the chain start state:
+  - validator list
+  - slot timing
+  - epoch size
+  - initial balances
+  - witness count
+- `NodeConfig` describes one running validator node:
+  - validator id
+  - data directory
+  - static peers
+  - feature flags
+  - fault profile
+- `Transaction` is a native balance transfer:
+  - `from`
+  - `to`
+  - `amount`
+  - `nonce`
+  - optional `memo`
+- `SignedTransaction` wraps that transfer with:
+  - signer id
+  - signature
+  - transaction hash
+  - submission timestamp
+- `Block` contains:
+  - a `BlockHeader`
+  - accepted transactions
+  - an optional topology commitment
+  - proposer signature
+  - block hash
+- `ProtocolMessage` is the current network message enum:
+  - transaction broadcast
+  - block proposal
+  - sync request/response
+  - heartbeat pulse
+  - relay receipt
+  - receipt fetch/response
+
+This crate also provides a few shared helpers:
+
+- `canonical_hash(...)` for deterministic hashing through canonical serialization
+- `hash_many(...)` for combining byte parts
+- `validator_account(id)` for mapping validator ids to current account names like `validator-1`
+
+## What this means in the current implementation
+
+Today, the chain is built around validator-owned accounts and transfer-only state transitions.
+
+That means:
+
+- there are no user wallets as separate first-class types yet
+- there is no smart contract call type yet
+- there is no EVM or Solidity-facing transaction format yet
+- the protocol is optimized for a local research chain, not a production compatibility target
+
+This crate is doing exactly what it should do at this stage: keep the rest of the system consistent while the protocol is still evolving.
+
+## Where we want to take it
+
+This crate should grow into the stable protocol schema of Entangrid.
+
+Future direction:
+
+- separate validator identity from ordinary user accounts more clearly
+- add richer transaction types beyond simple transfers
+- support stronger proof and commitment structures
+- introduce versioning and upgrade-friendly wire/state formats
+- prepare the type layer for real post-quantum identities and network evidence
+
+In short: this crate should become the clean, stable data model that the rest of the blockchain can rely on for a long time.
