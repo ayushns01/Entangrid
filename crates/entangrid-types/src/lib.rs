@@ -19,6 +19,8 @@ pub enum MessageClass {
 pub struct FeatureFlags {
     pub enable_receipts: bool,
     pub enable_service_gating: bool,
+    #[serde(default = "default_service_gating_start_epoch")]
+    pub service_gating_start_epoch: Epoch,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -209,12 +211,25 @@ pub struct SignedEnvelope {
     pub payload: ProtocolMessage,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceCounters {
+    pub uptime_windows: u64,
+    pub total_windows: u64,
+    pub timely_deliveries: u64,
+    pub expected_deliveries: u64,
+    pub distinct_peers: u64,
+    pub expected_peers: u64,
+    pub failed_sessions: u64,
+    pub invalid_receipts: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct NodeMetrics {
     pub validator_id: ValidatorId,
     pub current_slot: Slot,
     pub current_epoch: Epoch,
     pub last_completed_service_epoch: Epoch,
+    pub service_gating_start_epoch: Epoch,
     pub active_sessions: u64,
     pub handshake_attempts: u64,
     pub handshake_failures: u64,
@@ -230,6 +245,7 @@ pub struct NodeMetrics {
     pub bytes_received: u64,
     pub last_local_service_score: f64,
     pub service_gating_threshold: f64,
+    pub last_local_service_counters: ServiceCounters,
     pub relay_scores: BTreeMap<ValidatorId, f64>,
     pub last_updated_unix_millis: u64,
 }
@@ -264,6 +280,10 @@ pub fn hash_many(parts: &[&[u8]]) -> HashBytes {
 
 pub fn empty_hash() -> HashBytes {
     [0u8; 32]
+}
+
+pub fn default_service_gating_start_epoch() -> Epoch {
+    2
 }
 
 pub fn validator_account(validator_id: ValidatorId) -> AccountId {

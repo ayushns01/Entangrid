@@ -2,26 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use entangrid_types::{
     Block, CommitmentSummary, Epoch, EpochAssignment, GenesisConfig, HashBytes, MessageClass,
-    RelayReceipt, Slot, TopologyCommitment, ValidatorId, canonical_hash, hash_many,
-    now_unix_millis,
+    RelayReceipt, ServiceCounters, Slot, TopologyCommitment, ValidatorId, canonical_hash,
+    hash_many, now_unix_millis,
 };
 
 #[derive(Clone, Debug)]
 pub struct ConsensusEngine {
     genesis: GenesisConfig,
     validator_ids: Vec<ValidatorId>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ServiceCounters {
-    pub uptime_windows: u64,
-    pub total_windows: u64,
-    pub timely_deliveries: u64,
-    pub expected_deliveries: u64,
-    pub distinct_peers: u64,
-    pub expected_peers: u64,
-    pub failed_sessions: u64,
-    pub invalid_receipts: u64,
 }
 
 impl ConsensusEngine {

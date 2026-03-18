@@ -9,15 +9,15 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use entangrid_consensus::{ConsensusEngine, ServiceCounters};
+use entangrid_consensus::ConsensusEngine;
 use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend};
 use entangrid_ledger::LedgerState;
 use entangrid_network::{NetworkEvent, NetworkHandle, spawn_network};
 use entangrid_types::{
     Block, BlockHeader, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig, HashBytes,
     HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
-    RelayReceipt, SignedTransaction, StateSnapshot, TopologyCommitment, ValidatorId,
-    canonical_hash, empty_hash, now_unix_millis,
+    RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
+    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -118,6 +118,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         last_heartbeat_slot: None,
         last_proposed_slot: None,
         latest_service_scores: BTreeMap::new(),
+        latest_service_counters: BTreeMap::new(),
         failed_sessions: 0,
         invalid_receipts: 0,
     };
@@ -147,6 +148,7 @@ struct NodeRunner {
     last_heartbeat_slot: Option<u64>,
     last_proposed_slot: Option<u64>,
     latest_service_scores: BTreeMap<ValidatorId, f64>,
+    latest_service_counters: BTreeMap<ValidatorId, ServiceCounters>,
     failed_sessions: u64,
     invalid_receipts: u64,
 }
@@ -274,18 +276,28 @@ impl NodeRunner {
         }
 
         if self.config.feature_flags.enable_service_gating {
-            if epoch < 2 {
+            if !self.service_gating_active(epoch) {
                 self.log_event(
                     "service-gating-warmup",
-                    format!("slot {slot} skipping service gating during warmup epoch {epoch}"),
+                    format!(
+                        "slot {slot} skipping service gating until epoch {} (current epoch {epoch})",
+                        self.config.feature_flags.service_gating_start_epoch
+                    ),
                 )?;
             } else {
                 let score = self.service_score_for_validator(self.config.validator_id);
+                let counters = self.local_service_counters();
                 self.log_event(
                     "service-gating-check",
                     format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3}",
-                        SERVICE_GATING_THRESHOLD
+                        "slot {slot} local_score {score:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
+                        SERVICE_GATING_THRESHOLD,
+                        counters.uptime_windows,
+                        counters.total_windows,
+                        counters.timely_deliveries,
+                        counters.expected_deliveries,
+                        counters.distinct_peers,
+                        counters.expected_peers
                     ),
                 )?;
                 if score < SERVICE_GATING_THRESHOLD {
@@ -294,12 +306,19 @@ impl NodeRunner {
                         metrics.service_gating_rejections += 1;
                         metrics.last_local_service_score = score;
                         metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+                        metrics.last_local_service_counters = counters.clone();
                     });
                     self.log_event(
                         "missed-slot",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3}",
-                            SERVICE_GATING_THRESHOLD
+                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with uptime {}/{} timely {}/{} peers {}/{}",
+                            SERVICE_GATING_THRESHOLD,
+                            counters.uptime_windows,
+                            counters.total_windows,
+                            counters.timely_deliveries,
+                            counters.expected_deliveries,
+                            counters.distinct_peers,
+                            counters.expected_peers
                         ),
                     )?;
                     return Ok(());
@@ -726,18 +745,20 @@ impl NodeRunner {
             return Ok(false);
         }
 
-        let service_score =
-            if self.config.feature_flags.enable_service_gating && block.header.epoch >= 2 {
-                Some(self.service_score_for_validator(block.header.proposer_id))
-            } else {
-                None
-            };
+        let service_score = if self.config.feature_flags.enable_service_gating
+            && self.service_gating_active(block.header.epoch)
+        {
+            Some(self.service_score_for_validator(block.header.proposer_id))
+        } else {
+            None
+        };
         self.consensus
             .validate_block_basic(
                 &block,
                 self.ledger.snapshot().tip_hash,
                 service_score,
-                self.config.feature_flags.enable_service_gating && block.header.epoch >= 2,
+                self.config.feature_flags.enable_service_gating
+                    && self.service_gating_active(block.header.epoch),
             )
             .map_err(|error| anyhow!(error))?;
 
@@ -857,17 +878,23 @@ impl NodeRunner {
         if current_epoch == 0 {
             for validator_id in validator_ids {
                 self.latest_service_scores.insert(validator_id, 1.0);
+                self.latest_service_counters
+                    .insert(validator_id, ServiceCounters::default());
             }
             let scores = self.latest_service_scores.clone();
             let local_score = scores
                 .get(&self.config.validator_id)
                 .copied()
                 .unwrap_or(1.0);
+            let local_counters = self.local_service_counters();
             self.update_metrics(|metrics| {
                 metrics.relay_scores = scores;
                 metrics.last_local_service_score = local_score;
                 metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
                 metrics.last_completed_service_epoch = 0;
+                metrics.service_gating_start_epoch =
+                    self.config.feature_flags.service_gating_start_epoch;
+                metrics.last_local_service_counters = local_counters;
             });
             return;
         }
@@ -894,17 +921,22 @@ impl NodeRunner {
             }
             let score = self.consensus.compute_service_score(&aggregate);
             self.latest_service_scores.insert(validator_id, score);
+            self.latest_service_counters.insert(validator_id, aggregate);
         }
         let scores = self.latest_service_scores.clone();
         let local_score = scores
             .get(&self.config.validator_id)
             .copied()
             .unwrap_or(1.0);
+        let local_counters = self.local_service_counters();
         self.update_metrics(|metrics| {
             metrics.relay_scores = scores;
             metrics.last_local_service_score = local_score;
             metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
             metrics.last_completed_service_epoch = completed_epoch;
+            metrics.service_gating_start_epoch =
+                self.config.feature_flags.service_gating_start_epoch;
+            metrics.last_local_service_counters = local_counters;
         });
     }
 
@@ -913,6 +945,17 @@ impl NodeRunner {
             .get(&validator_id)
             .copied()
             .unwrap_or(1.0)
+    }
+
+    fn local_service_counters(&self) -> ServiceCounters {
+        self.latest_service_counters
+            .get(&self.config.validator_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn service_gating_active(&self, epoch: Epoch) -> bool {
+        epoch >= self.config.feature_flags.service_gating_start_epoch
     }
 
     fn broadcast_sync_request(&self) -> Result<()> {
@@ -968,13 +1011,21 @@ impl NodeRunner {
     }
 
     fn log_current_service_score(&self, epoch: Epoch) -> Result<()> {
-        if epoch == 0 {
+        let counters = self.local_service_counters();
+        if epoch < self.config.feature_flags.service_gating_start_epoch {
             return self.log_event(
                 "service-score",
                 format!(
-                    "epoch {epoch} warmup local_score {:.3} threshold {:.3}",
+                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
+                    self.config.feature_flags.service_gating_start_epoch,
                     self.service_score_for_validator(self.config.validator_id),
-                    SERVICE_GATING_THRESHOLD
+                    SERVICE_GATING_THRESHOLD,
+                    counters.uptime_windows,
+                    counters.total_windows,
+                    counters.timely_deliveries,
+                    counters.expected_deliveries,
+                    counters.distinct_peers,
+                    counters.expected_peers
                 ),
             );
         }
@@ -982,10 +1033,16 @@ impl NodeRunner {
         self.log_event(
             "service-score",
             format!(
-                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3}",
+                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
                 epoch.saturating_sub(1),
                 self.service_score_for_validator(self.config.validator_id),
-                SERVICE_GATING_THRESHOLD
+                SERVICE_GATING_THRESHOLD,
+                counters.uptime_windows,
+                counters.total_windows,
+                counters.timely_deliveries,
+                counters.expected_deliveries,
+                counters.distinct_peers,
+                counters.expected_peers
             ),
         )
     }

@@ -40,6 +40,8 @@ enum Commands {
         start_delay_millis: u64,
         #[arg(long, default_value_t = false)]
         enable_service_gating: bool,
+        #[arg(long, default_value_t = 2)]
+        service_gating_start_epoch: u64,
         #[arg(long)]
         degraded_validator: Option<u64>,
         #[arg(long, default_value_t = 0)]
@@ -85,6 +87,7 @@ pub async fn cli_main() -> Result<()> {
             slots_per_epoch,
             start_delay_millis,
             enable_service_gating,
+            service_gating_start_epoch,
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -96,6 +99,7 @@ pub async fn cli_main() -> Result<()> {
             slots_per_epoch,
             start_delay_millis,
             enable_service_gating,
+            service_gating_start_epoch,
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -117,6 +121,7 @@ pub fn init_localnet(
     slots_per_epoch: u64,
     start_delay_millis: u64,
     enable_service_gating: bool,
+    service_gating_start_epoch: u64,
     degraded_validator: Option<u64>,
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
@@ -195,6 +200,7 @@ pub fn init_localnet(
             feature_flags: FeatureFlags {
                 enable_receipts: true,
                 enable_service_gating,
+                service_gating_start_epoch,
             },
             fault_profile,
             sync_on_startup: true,
@@ -468,7 +474,20 @@ mod tests {
     fn init_localnet_creates_manifest() {
         let unique_dir =
             std::env::temp_dir().join(format!("entangrid-sim-test-{}", now_unix_millis()));
-        init_localnet(4, &unique_dir, 2_000, 10, 1_000, false, None, 0, 0.0, false).unwrap();
+        init_localnet(
+            4,
+            &unique_dir,
+            2_000,
+            10,
+            1_000,
+            false,
+            2,
+            None,
+            0,
+            0.0,
+            false,
+        )
+        .unwrap();
         assert!(manifest_path(&unique_dir).exists());
     }
 
@@ -514,6 +533,7 @@ mod tests {
             5,
             1_000,
             true,
+            3,
             Some(3),
             0,
             0.75,
@@ -524,6 +544,7 @@ mod tests {
         let contents = fs::read_to_string(node_three_path).unwrap();
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.enable_service_gating);
+        assert_eq!(node_config.feature_flags.service_gating_start_epoch, 3);
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
     }
 }
