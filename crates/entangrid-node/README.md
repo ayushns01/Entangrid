@@ -89,6 +89,15 @@ The node also:
 - stores and re-gossips valid receipts
 - computes rolling service scores
 - optionally rejects local block production if its score is below threshold
+- respects a configurable `service_gating_start_epoch` instead of using a fixed warmup epoch
+- records the latest local score breakdown in metrics and logs
+
+That means the node can now explain service gating in a much more concrete way:
+
+- what the score was
+- how many uptime windows were observed
+- how many deliveries were timely
+- how many peers were actually reached
 
 ## What this crate is today
 
@@ -104,6 +113,13 @@ It already does a lot:
 - receipt generation and storage
 - file-backed persistence
 - service-gating prototype behavior
+
+The recent gating-focused improvement in this crate was mostly about observability and control:
+
+- service gating start is now configurable per localnet
+- proposer checks log the counters behind the score
+- missed slots log the reason more clearly
+- `metrics.json` keeps the latest local service counters alongside the score
 
 But it is still intentionally early-stage.
 

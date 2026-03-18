@@ -135,6 +135,7 @@ cargo run -p entangrid-sim -- init-localnet \
   --slot-duration-millis 1000 \
   --slots-per-epoch 5 \
   --enable-service-gating \
+  --service-gating-start-epoch 3 \
   --degraded-validator 4 \
   --degraded-drop-probability 0.85
 
@@ -146,7 +147,7 @@ cargo run -p entangrid-sim -- load --base-dir var/localnet-gated --scenario stea
 Then inspect:
 
 - `node-4/events.log` for missed slots due to low service score
-- `node-4/metrics.json` for `service_gating_rejections` and the latest local score
+- `node-4/metrics.json` for `service_gating_rejections`, `service_gating_start_epoch`, the latest local score, and the latest local service counters
 
 ## Guiding Principle
 

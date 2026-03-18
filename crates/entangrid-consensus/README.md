@@ -65,6 +65,8 @@ Current score formula:
 
 The result is clamped into the range `[0, 1]`.
 
+The counters themselves now use the shared `ServiceCounters` type from `entangrid-types`, which makes it easier for the node runtime and metrics output to explain why a score is high or low.
+
 ### Commitments
 
 The crate can summarize receipts into a `TopologyCommitment`.
@@ -84,6 +86,12 @@ Current block checks are intentionally simple:
 - proposer must match the slot schedule
 - parent hash must match the expected current tip
 - optional service gating can reject a proposer below threshold
+
+Important detail:
+
+- this crate computes the score and enforces the threshold when asked
+- the node runtime decides **when** service gating starts for a given network through config
+- that start epoch is now configurable instead of being hard-coded in the runtime
 
 ## What this consensus is today
 

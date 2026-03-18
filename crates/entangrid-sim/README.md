@@ -39,6 +39,7 @@ It also:
 - seeds initial balances
 - configures all peers statically
 - can enable service gating
+- can set the epoch where service gating should start
 - can mark one validator as degraded
 
 ### `up`
@@ -82,6 +83,12 @@ The simulator can configure a degraded validator using:
 - outbound disablement
 
 That is how we currently test service scoring and proposer gating behavior.
+
+Recent improvement:
+
+- `init-localnet` now accepts `--service-gating-start-epoch`
+- this makes it easier to keep the first few epochs as warmup before proposer gating is enforced
+- this is especially helpful when you want cleaner local experiments and less startup noise
 
 ## What it is today
 
