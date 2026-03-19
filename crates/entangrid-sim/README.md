@@ -40,6 +40,7 @@ It also:
 - configures all peers statically
 - can enable service gating
 - can set the epoch where service gating should start
+- can set how many epochs are included in the rolling service-score window
 - can mark one validator as degraded
 
 ### `up`
@@ -87,8 +88,9 @@ That is how we currently test service scoring and proposer gating behavior.
 Recent improvement:
 
 - `init-localnet` now accepts `--service-gating-start-epoch`
+- `init-localnet` now accepts `--service-score-window-epochs`
 - this makes it easier to keep the first few epochs as warmup before proposer gating is enforced
-- this is especially helpful when you want cleaner local experiments and less startup noise
+- this also makes it easier to trade off score stability versus responsiveness in local experiments
 
 ## What it is today
 

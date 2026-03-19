@@ -136,6 +136,7 @@ cargo run -p entangrid-sim -- init-localnet \
   --slots-per-epoch 5 \
   --enable-service-gating \
   --service-gating-start-epoch 3 \
+  --service-score-window-epochs 4 \
   --degraded-validator 4 \
   --degraded-drop-probability 0.85
 

@@ -65,6 +65,11 @@ Current score formula:
 
 The result is clamped into the range `[0, 1]`.
 
+Recent improvement:
+
+- component ratios are capped so duplicate or excessive receipts do not give more than full credit for one score dimension
+- this makes the score harder to inflate accidentally during noisy local experiments
+
 The counters themselves now use the shared `ServiceCounters` type from `entangrid-types`, which makes it easier for the node runtime and metrics output to explain why a score is high or low.
 
 ### Commitments
@@ -91,6 +96,7 @@ Important detail:
 
 - this crate computes the score and enforces the threshold when asked
 - the node runtime decides **when** service gating starts for a given network through config
+- the node runtime also decides how many recent epochs are included in the rolling score window
 - that start epoch is now configurable instead of being hard-coded in the runtime
 
 ## What this consensus is today

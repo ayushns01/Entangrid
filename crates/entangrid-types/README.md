@@ -60,6 +60,7 @@ Right now this crate is intentionally simple and very central.
   - receipt enablement
   - service-gating enablement
   - the epoch where gating should start
+  - the number of epochs included in the rolling service-score window
 - `ServiceCounters` is the shared score-breakdown struct used to describe:
   - uptime windows
   - timely deliveries
@@ -91,6 +92,7 @@ This crate is doing exactly what it should do at this stage: keep the rest of th
 One recent example of that role is service gating:
 
 - the simulator writes `service_gating_start_epoch` into node config through these shared types
+- the simulator also writes the service-score window length through these shared types
 - the node reports score breakdowns back into `NodeMetrics` through these shared types
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
 
