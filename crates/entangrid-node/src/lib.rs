@@ -290,8 +290,9 @@ impl NodeRunner {
                 self.log_event(
                     "service-gating-check",
                     format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
+                        "slot {slot} local_score {score:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
                         SERVICE_GATING_THRESHOLD,
+                        self.config.feature_flags.service_score_window_epochs,
                         counters.uptime_windows,
                         counters.total_windows,
                         counters.timely_deliveries,
@@ -311,8 +312,9 @@ impl NodeRunner {
                     self.log_event(
                         "missed-slot",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with uptime {}/{} timely {}/{} peers {}/{}",
+                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} uptime {}/{} timely {}/{} peers {}/{}",
                             SERVICE_GATING_THRESHOLD,
+                            self.config.feature_flags.service_score_window_epochs,
                             counters.uptime_windows,
                             counters.total_windows,
                             counters.timely_deliveries,
@@ -894,12 +896,15 @@ impl NodeRunner {
                 metrics.last_completed_service_epoch = 0;
                 metrics.service_gating_start_epoch =
                     self.config.feature_flags.service_gating_start_epoch;
+                metrics.service_score_window_epochs =
+                    self.config.feature_flags.service_score_window_epochs;
                 metrics.last_local_service_counters = local_counters;
             });
             return;
         }
 
-        let earliest_epoch = completed_epoch.saturating_sub(3);
+        let window_epochs = self.config.feature_flags.service_score_window_epochs.max(1);
+        let earliest_epoch = completed_epoch.saturating_sub(window_epochs.saturating_sub(1));
         for validator_id in validator_ids {
             let mut aggregate = ServiceCounters::default();
             for epoch in earliest_epoch..=completed_epoch {
@@ -910,14 +915,8 @@ impl NodeRunner {
                     0,
                     0,
                 );
-                aggregate.uptime_windows += counters.uptime_windows;
-                aggregate.total_windows += counters.total_windows;
-                aggregate.timely_deliveries += counters.timely_deliveries;
-                aggregate.expected_deliveries += counters.expected_deliveries;
-                aggregate.distinct_peers += counters.distinct_peers;
-                aggregate.expected_peers += counters.expected_peers;
-                aggregate.failed_sessions += counters.failed_sessions;
-                aggregate.invalid_receipts += counters.invalid_receipts;
+                let weight = epoch.saturating_sub(earliest_epoch) + 1;
+                accumulate_weighted_counters(&mut aggregate, &counters, weight);
             }
             let score = self.consensus.compute_service_score(&aggregate);
             self.latest_service_scores.insert(validator_id, score);
@@ -936,6 +935,8 @@ impl NodeRunner {
             metrics.last_completed_service_epoch = completed_epoch;
             metrics.service_gating_start_epoch =
                 self.config.feature_flags.service_gating_start_epoch;
+            metrics.service_score_window_epochs =
+                self.config.feature_flags.service_score_window_epochs;
             metrics.last_local_service_counters = local_counters;
         });
     }
@@ -1016,10 +1017,11 @@ impl NodeRunner {
             return self.log_event(
                 "service-score",
                 format!(
-                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
+                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
                     self.config.feature_flags.service_gating_start_epoch,
                     self.service_score_for_validator(self.config.validator_id),
                     SERVICE_GATING_THRESHOLD,
+                    self.config.feature_flags.service_score_window_epochs,
                     counters.uptime_windows,
                     counters.total_windows,
                     counters.timely_deliveries,
@@ -1033,10 +1035,11 @@ impl NodeRunner {
         self.log_event(
             "service-score",
             format!(
-                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} uptime {}/{} timely {}/{} peers {}/{}",
+                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
                 epoch.saturating_sub(1),
                 self.service_score_for_validator(self.config.validator_id),
                 SERVICE_GATING_THRESHOLD,
+                self.config.feature_flags.service_score_window_epochs,
                 counters.uptime_windows,
                 counters.total_windows,
                 counters.timely_deliveries,
@@ -1052,6 +1055,37 @@ fn receipt_signing_hash(receipt: &RelayReceipt) -> HashBytes {
     let mut unsigned = receipt.clone();
     unsigned.signature.clear();
     canonical_hash(&unsigned)
+}
+
+fn accumulate_weighted_counters(
+    aggregate: &mut ServiceCounters,
+    counters: &ServiceCounters,
+    weight: u64,
+) {
+    aggregate.uptime_windows = aggregate
+        .uptime_windows
+        .saturating_add(counters.uptime_windows.saturating_mul(weight));
+    aggregate.total_windows = aggregate
+        .total_windows
+        .saturating_add(counters.total_windows.saturating_mul(weight));
+    aggregate.timely_deliveries = aggregate
+        .timely_deliveries
+        .saturating_add(counters.timely_deliveries.saturating_mul(weight));
+    aggregate.expected_deliveries = aggregate
+        .expected_deliveries
+        .saturating_add(counters.expected_deliveries.saturating_mul(weight));
+    aggregate.distinct_peers = aggregate
+        .distinct_peers
+        .saturating_add(counters.distinct_peers.saturating_mul(weight));
+    aggregate.expected_peers = aggregate
+        .expected_peers
+        .saturating_add(counters.expected_peers.saturating_mul(weight));
+    aggregate.failed_sessions = aggregate
+        .failed_sessions
+        .saturating_add(counters.failed_sessions.saturating_mul(weight));
+    aggregate.invalid_receipts = aggregate
+        .invalid_receipts
+        .saturating_add(counters.invalid_receipts.saturating_mul(weight));
 }
 
 #[derive(Clone, Debug)]

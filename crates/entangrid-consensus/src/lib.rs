@@ -122,11 +122,12 @@ impl ConsensusEngine {
     }
 
     pub fn compute_service_score(&self, counters: &ServiceCounters) -> f64 {
-        let uptime_ratio = ratio(counters.uptime_windows, counters.total_windows);
-        let delivery_ratio = ratio(counters.timely_deliveries, counters.expected_deliveries);
-        let diversity_ratio = ratio(counters.distinct_peers, counters.expected_peers);
+        let uptime_ratio = capped_ratio(counters.uptime_windows, counters.total_windows);
+        let delivery_ratio = capped_ratio(counters.timely_deliveries, counters.expected_deliveries);
+        let diversity_ratio = capped_ratio(counters.distinct_peers, counters.expected_peers);
         let penalty_ratio = ratio(
-            counters.failed_sessions + counters.invalid_receipts,
+            (counters.failed_sessions + counters.invalid_receipts)
+                .min(counters.total_windows.max(1)),
             counters.total_windows.max(1),
         );
         (0.25 * uptime_ratio + 0.50 * delivery_ratio + 0.25 * diversity_ratio - penalty_ratio)
@@ -251,6 +252,10 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
     (numerator as f64 / denominator as f64).clamp(0.0, 1.0)
 }
 
+fn capped_ratio(numerator: u64, denominator: u64) -> f64 {
+    ratio(numerator.min(denominator), denominator)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -316,5 +321,21 @@ mod tests {
             assert!(!assignment.witnesses.contains(&validator_id));
             assert!(!assignment.relay_targets.contains(&validator_id));
         }
+    }
+
+    #[test]
+    fn service_score_caps_duplicate_credit() {
+        let engine = ConsensusEngine::new(sample_genesis());
+        let score = engine.compute_service_score(&ServiceCounters {
+            uptime_windows: 1,
+            total_windows: 5,
+            timely_deliveries: 10,
+            expected_deliveries: 5,
+            distinct_peers: 1,
+            expected_peers: 2,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        });
+        assert!((score - 0.675).abs() < f64::EPSILON);
     }
 }

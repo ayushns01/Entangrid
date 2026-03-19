@@ -42,6 +42,8 @@ enum Commands {
         enable_service_gating: bool,
         #[arg(long, default_value_t = 2)]
         service_gating_start_epoch: u64,
+        #[arg(long, default_value_t = 4)]
+        service_score_window_epochs: u64,
         #[arg(long)]
         degraded_validator: Option<u64>,
         #[arg(long, default_value_t = 0)]
@@ -88,6 +90,7 @@ pub async fn cli_main() -> Result<()> {
             start_delay_millis,
             enable_service_gating,
             service_gating_start_epoch,
+            service_score_window_epochs,
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -100,6 +103,7 @@ pub async fn cli_main() -> Result<()> {
             start_delay_millis,
             enable_service_gating,
             service_gating_start_epoch,
+            service_score_window_epochs,
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -122,6 +126,7 @@ pub fn init_localnet(
     start_delay_millis: u64,
     enable_service_gating: bool,
     service_gating_start_epoch: u64,
+    service_score_window_epochs: u64,
     degraded_validator: Option<u64>,
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
@@ -201,6 +206,7 @@ pub fn init_localnet(
                 enable_receipts: true,
                 enable_service_gating,
                 service_gating_start_epoch,
+                service_score_window_epochs,
             },
             fault_profile,
             sync_on_startup: true,
@@ -482,6 +488,7 @@ mod tests {
             1_000,
             false,
             2,
+            4,
             None,
             0,
             0.0,
@@ -534,6 +541,7 @@ mod tests {
             1_000,
             true,
             3,
+            6,
             Some(3),
             0,
             0.75,
@@ -545,6 +553,7 @@ mod tests {
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.enable_service_gating);
         assert_eq!(node_config.feature_flags.service_gating_start_epoch, 3);
+        assert_eq!(node_config.feature_flags.service_score_window_epochs, 6);
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
     }
 }

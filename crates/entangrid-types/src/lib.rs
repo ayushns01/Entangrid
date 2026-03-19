@@ -21,6 +21,8 @@ pub struct FeatureFlags {
     pub enable_service_gating: bool,
     #[serde(default = "default_service_gating_start_epoch")]
     pub service_gating_start_epoch: Epoch,
+    #[serde(default = "default_service_score_window_epochs")]
+    pub service_score_window_epochs: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -230,6 +232,7 @@ pub struct NodeMetrics {
     pub current_epoch: Epoch,
     pub last_completed_service_epoch: Epoch,
     pub service_gating_start_epoch: Epoch,
+    pub service_score_window_epochs: u64,
     pub active_sessions: u64,
     pub handshake_attempts: u64,
     pub handshake_failures: u64,
@@ -284,6 +287,10 @@ pub fn empty_hash() -> HashBytes {
 
 pub fn default_service_gating_start_epoch() -> Epoch {
     2
+}
+
+pub fn default_service_score_window_epochs() -> u64 {
+    4
 }
 
 pub fn validator_account(validator_id: ValidatorId) -> AccountId {
