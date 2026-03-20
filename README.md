@@ -126,6 +126,12 @@ Inject steady transfer traffic from another terminal:
 cargo run -p entangrid-sim -- load --base-dir var/localnet --scenario steady --duration-secs 12
 ```
 
+Summarize the latest localnet metrics:
+
+```bash
+cargo run -p entangrid-sim -- report --base-dir var/localnet
+```
+
 Run a service-gating demo with one degraded validator:
 
 ```bash
@@ -143,12 +149,14 @@ cargo run -p entangrid-sim -- init-localnet \
 cargo run -p entangrid-sim -- up --base-dir var/localnet-gated
 
 cargo run -p entangrid-sim -- load --base-dir var/localnet-gated --scenario steady --duration-secs 15
+
+cargo run -p entangrid-sim -- report --base-dir var/localnet-gated
 ```
 
 Then inspect:
 
 - `node-4/events.log` for missed slots due to low service score
-- `node-4/metrics.json` for `service_gating_rejections`, `service_gating_start_epoch`, the latest local score, and the latest local service counters
+- `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `service_gating_start_epoch`, the latest local score, and the latest local service counters
 
 ## Guiding Principle
 

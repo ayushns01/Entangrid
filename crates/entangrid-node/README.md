@@ -87,6 +87,7 @@ The node also:
 
 - creates relay receipts when it is an assigned witness
 - stores and re-gossips valid receipts
+- ignores duplicate logical receipt events so repeated evidence does not inflate the score
 - computes rolling service scores
 - optionally rejects local block production if its score is below threshold
 - respects a configurable `service_gating_start_epoch` instead of using a fixed warmup epoch
@@ -122,6 +123,7 @@ The recent gating-focused improvement in this crate was mostly about observabili
 - proposer checks log the counters behind the score
 - missed slots log the reason more clearly
 - `metrics.json` keeps the latest local service counters alongside the score
+- `metrics.json` now also tracks how many duplicate receipts were ignored
 
 But it is still intentionally early-stage.
 

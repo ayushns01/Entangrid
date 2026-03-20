@@ -9,6 +9,7 @@ It helps you:
 - generate a multi-node local network
 - launch validator processes
 - inject traffic into that network
+- summarize the latest localnet metrics
 - simulate degraded validator behavior
 
 It is called a simulator, but an important detail is:
@@ -74,6 +75,18 @@ The simulator:
 - writes those transactions into the target node's `inbox/`
 
 Then the node process reads and handles them.
+
+### `report`
+
+This command reads each node's `metrics.json` and prints a quick localnet summary.
+
+It is useful for quickly checking:
+
+- current validator scores
+- missed proposer slots
+- gating rejections
+- duplicate receipts that were ignored
+- high-level proposer and validation activity
 
 ### Fault and degradation controls
 

@@ -69,6 +69,7 @@ Right now this crate is intentionally simple and very central.
 - `NodeMetrics` now carries both:
   - the latest local service score
   - the latest local service counters used to explain that score
+  - duplicate receipt counts that were ignored by the node
 
 This crate also provides a few shared helpers:
 
