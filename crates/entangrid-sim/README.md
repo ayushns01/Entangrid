@@ -55,6 +55,11 @@ For each node it captures:
 
 The nodes then run until you stop the simulator with `Ctrl+C`.
 
+Recent improvement:
+
+- `up` now rebuilds `entangrid-node` before launch so it does not accidentally use a stale binary from an older compile
+- if the localnet is still fresh and its genesis time has already passed, `up` moves genesis slightly forward before launch so the network starts near epoch 0 instead of skipping straight past the intended warmup period
+
 ### `load`
 
 This command creates traffic.

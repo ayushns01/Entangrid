@@ -75,12 +75,13 @@ impl ConsensusEngine {
                 .min(rotated.len().saturating_sub(1));
             for offset in 1..=max_relations {
                 let target = rotated[(position + offset) % rotated.len()];
-                let witness = rotated[(position + rotated.len() - offset) % rotated.len()];
                 if target != validator_id {
                     relay_targets.push(target);
-                }
-                if witness != validator_id {
-                    witnesses.push(witness);
+                    // In the current direct-delivery prototype, only the receiving relay target
+                    // can actually observe and receipt the event, so witness assignments need to
+                    // line up with relay targets to avoid penalizing validators for missing
+                    // third-party observations the network does not yet model.
+                    witnesses.push(target);
                 }
             }
             assignments.insert(
@@ -115,6 +116,51 @@ impl ConsensusEngine {
             .unwrap_or(false)
     }
 
+    pub fn is_relay_target_for(
+        &self,
+        source_validator_id: ValidatorId,
+        destination_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> bool {
+        self.assignment_for(epoch, source_validator_id)
+            .map(|assignment| assignment.relay_targets.contains(&destination_validator_id))
+            .unwrap_or(false)
+    }
+
+    pub fn validate_receipt_assignment(&self, receipt: &RelayReceipt) -> Result<(), String> {
+        if self.epoch_for_slot(receipt.slot) != receipt.epoch {
+            return Err("receipt epoch does not match slot".into());
+        }
+        if !self.is_witness_for(
+            receipt.witness_validator_id,
+            receipt.source_validator_id,
+            receipt.epoch,
+        ) {
+            return Err("receipt witness is not assigned for source validator".into());
+        }
+        if !self.is_relay_target_for(
+            receipt.source_validator_id,
+            receipt.destination_validator_id,
+            receipt.epoch,
+        ) {
+            return Err("receipt destination is not an assigned relay target".into());
+        }
+        Ok(())
+    }
+
+    pub fn receipts_for_validator(
+        &self,
+        validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+    ) -> Vec<RelayReceipt> {
+        receipts
+            .iter()
+            .filter(|receipt| receipt.source_validator_id == validator_id && receipt.epoch == epoch)
+            .cloned()
+            .collect()
+    }
+
     pub fn compute_receipt_root(receipts: &[RelayReceipt]) -> HashBytes {
         let mut hashes: Vec<_> = receipts.iter().map(canonical_hash).collect();
         hashes.sort_unstable();
@@ -142,6 +188,24 @@ impl ConsensusEngine {
         failed_sessions: u64,
         invalid_receipts: u64,
     ) -> ServiceCounters {
+        let relevant = self.receipts_for_validator(validator_id, epoch, receipts);
+        self.counters_from_receipts(
+            validator_id,
+            epoch,
+            &relevant,
+            failed_sessions,
+            invalid_receipts,
+        )
+    }
+
+    pub fn counters_from_receipts(
+        &self,
+        validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+        failed_sessions: u64,
+        invalid_receipts: u64,
+    ) -> ServiceCounters {
         let assignment = self
             .assignment_for(epoch, validator_id)
             .unwrap_or(EpochAssignment {
@@ -150,16 +214,12 @@ impl ConsensusEngine {
                 witnesses: Vec::new(),
                 relay_targets: Vec::new(),
             });
-        let relevant: Vec<_> = receipts
-            .iter()
-            .filter(|receipt| receipt.source_validator_id == validator_id && receipt.epoch == epoch)
-            .collect();
         let mut heartbeat_slots = BTreeSet::new();
         let mut distinct_peers = BTreeSet::new();
         let mut timely_deliveries = 0;
         let expected_deliveries = self.genesis.slots_per_epoch.max(1);
 
-        for receipt in &relevant {
+        for receipt in receipts {
             if receipt.message_class == MessageClass::Heartbeat {
                 heartbeat_slots.insert(receipt.slot);
             }
@@ -189,23 +249,35 @@ impl ConsensusEngine {
         failed_sessions: u64,
         invalid_receipts: u64,
     ) -> TopologyCommitment {
-        let relevant: Vec<RelayReceipt> = receipts
-            .iter()
-            .filter(|receipt| receipt.source_validator_id == validator_id && receipt.epoch == epoch)
-            .cloned()
-            .collect();
-
-        let counters = self.counters_for_validator(
+        let relevant = self.receipts_for_validator(validator_id, epoch, receipts);
+        self.commitment_from_receipts(
             validator_id,
             epoch,
             &relevant,
+            failed_sessions,
+            invalid_receipts,
+        )
+    }
+
+    pub fn commitment_from_receipts(
+        &self,
+        validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+        failed_sessions: u64,
+        invalid_receipts: u64,
+    ) -> TopologyCommitment {
+        let counters = self.counters_from_receipts(
+            validator_id,
+            epoch,
+            receipts,
             failed_sessions,
             invalid_receipts,
         );
         let relay_score = self.compute_service_score(&counters);
         let mut by_message_class = BTreeMap::new();
         let mut peers = BTreeSet::new();
-        for receipt in &relevant {
+        for receipt in receipts {
             *by_message_class
                 .entry(receipt.message_class.clone())
                 .or_insert(0) += 1;
@@ -214,8 +286,8 @@ impl ConsensusEngine {
         TopologyCommitment {
             epoch,
             validator_id,
-            receipt_root: Self::compute_receipt_root(&relevant),
-            receipt_count: relevant.len() as u64,
+            receipt_root: Self::compute_receipt_root(receipts),
+            receipt_count: receipts.len() as u64,
             summary: CommitmentSummary {
                 by_message_class,
                 distinct_peers: peers.len() as u64,
@@ -260,7 +332,7 @@ fn capped_ratio(numerator: u64, denominator: u64) -> f64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use entangrid_types::{GenesisConfig, ValidatorConfig, empty_hash};
+    use entangrid_types::{GenesisConfig, MessageClass, RelayReceipt, ValidatorConfig, empty_hash};
 
     use super::*;
 
@@ -324,6 +396,15 @@ mod tests {
     }
 
     #[test]
+    fn direct_delivery_witnesses_match_relay_targets() {
+        let engine = ConsensusEngine::new(sample_genesis());
+        let assignments = engine.assignments_for_epoch(2);
+        for assignment in assignments.values() {
+            assert_eq!(assignment.witnesses, assignment.relay_targets);
+        }
+    }
+
+    #[test]
     fn service_score_caps_duplicate_credit() {
         let engine = ConsensusEngine::new(sample_genesis());
         let score = engine.compute_service_score(&ServiceCounters {
@@ -337,5 +418,33 @@ mod tests {
             invalid_receipts: 0,
         });
         assert!((score - 0.675).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn receipt_assignment_validation_requires_assigned_witness_and_target() {
+        let engine = ConsensusEngine::new(sample_genesis());
+        let assignment = engine.assignment_for(0, 1).unwrap();
+        let receipt = RelayReceipt {
+            epoch: 0,
+            slot: 0,
+            source_validator_id: 1,
+            destination_validator_id: assignment.relay_targets[0],
+            witness_validator_id: assignment.witnesses[0],
+            message_class: MessageClass::Heartbeat,
+            transcript_digest: [0u8; 32],
+            latency_bucket_ms: 100,
+            byte_count_bucket: 1,
+            sequence_number: 0,
+            signature: vec![],
+        };
+        assert!(engine.validate_receipt_assignment(&receipt).is_ok());
+
+        let mut wrong_target = receipt.clone();
+        wrong_target.destination_validator_id = 1;
+        assert!(engine.validate_receipt_assignment(&wrong_target).is_err());
+
+        let mut wrong_witness = receipt;
+        wrong_witness.witness_validator_id = 1;
+        assert!(engine.validate_receipt_assignment(&wrong_witness).is_err());
     }
 }

@@ -232,6 +232,8 @@ pub fn init_localnet(
 
 pub async fn up_localnet(base_dir: &Path) -> Result<()> {
     let manifest = read_manifest(base_dir)?;
+    ensure_node_binary_built().await?;
+    refresh_genesis_time_for_fresh_localnet(&manifest)?;
     let node_binary = node_binary_path()?;
     let mut children: Vec<Child> = Vec::new();
 
@@ -617,6 +619,61 @@ fn node_binary_path() -> Result<PathBuf> {
     Ok(candidate)
 }
 
+async fn ensure_node_binary_built() -> Result<()> {
+    let status = Command::new("cargo")
+        .arg("build")
+        .arg("--bin")
+        .arg("entangrid-node")
+        .current_dir(workspace_root()?)
+        .status()
+        .await?;
+    if !status.success() {
+        return Err(anyhow!("failed to build entangrid-node"));
+    }
+    Ok(())
+}
+
+fn workspace_root() -> Result<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("failed to resolve workspace root"))
+}
+
+fn refresh_genesis_time_for_fresh_localnet(manifest: &LocalnetManifest) -> Result<()> {
+    if !localnet_is_fresh(manifest)? {
+        return Ok(());
+    }
+
+    let genesis_path = PathBuf::from(&manifest.genesis_path);
+    let contents = fs::read_to_string(&genesis_path)?;
+    let mut genesis: GenesisConfig = toml::from_str(&contents)?;
+    let now = now_unix_millis();
+    if now < genesis.genesis_time_unix_millis {
+        return Ok(());
+    }
+
+    genesis.genesis_time_unix_millis = now + genesis.slot_duration_millis.max(1_000);
+    fs::write(&genesis_path, toml::to_string_pretty(&genesis)?)?;
+    Ok(())
+}
+
+fn localnet_is_fresh(manifest: &LocalnetManifest) -> Result<bool> {
+    for config_path in &manifest.node_configs {
+        let config_contents = fs::read_to_string(config_path)?;
+        let config: NodeConfig = toml::from_str(&config_contents)?;
+        let node_dir = PathBuf::from(&config.data_dir);
+        for file_name in ["blocks.jsonl", "receipts.jsonl", "state_snapshot.json"] {
+            let path = node_dir.join(file_name);
+            if path.exists() && fs::metadata(path)?.len() > 0 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +831,25 @@ mod tests {
         assert_eq!(report.total_duplicate_receipts_ignored, 4);
         assert_eq!(report.highest_score, Some((1, 0.85)));
         assert_eq!(report.lowest_score, Some((2, 0.25)));
+    }
+
+    #[test]
+    fn refreshes_fresh_localnet_genesis_time_before_start() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-genesis-refresh-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(4, &unique_dir, 1_000, 5, 1, true, 3, 4, None, 0, 0.0, false).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let manifest = read_manifest(&unique_dir).unwrap();
+        let before: GenesisConfig =
+            toml::from_str(&fs::read_to_string(&manifest.genesis_path).unwrap()).unwrap();
+        refresh_genesis_time_for_fresh_localnet(&manifest).unwrap();
+        let after: GenesisConfig =
+            toml::from_str(&fs::read_to_string(&manifest.genesis_path).unwrap()).unwrap();
+
+        assert!(localnet_is_fresh(&manifest).unwrap());
+        assert!(after.genesis_time_unix_millis > before.genesis_time_unix_millis);
     }
 }

@@ -188,6 +188,7 @@ impl NodeRunner {
                 _ = sync_tick.tick() => {
                     if self.config.sync_on_startup {
                         self.broadcast_sync_request()?;
+                        self.broadcast_chain_snapshot()?;
                     }
                 }
                 maybe_event = self.network_event_rx.recv() => {
@@ -241,6 +242,7 @@ impl NodeRunner {
         self.broadcast_heartbeat(slot, epoch)?;
         self.maybe_propose_block(slot, epoch).await?;
         self.try_promote_orphans().await?;
+        self.persist_metrics()?;
         Ok(())
     }
 
@@ -325,23 +327,31 @@ impl NodeRunner {
                             counters.expected_peers
                         ),
                     )?;
+                    self.persist_metrics()?;
                     return Ok(());
                 }
             }
         }
 
         self.last_proposed_slot = Some(slot);
-        let commitment = if self.config.feature_flags.enable_receipts && epoch > 0 {
-            Some(self.consensus.commitment_for_validator(
-                self.config.validator_id,
-                epoch - 1,
-                &self.receipts,
-                self.failed_sessions,
-                self.invalid_receipts,
-            ))
-        } else {
-            None
-        };
+        let (commitment, commitment_receipts) =
+            if self.config.feature_flags.enable_receipts && epoch > 0 {
+                let commitment_receipts = self.consensus.receipts_for_validator(
+                    self.config.validator_id,
+                    epoch - 1,
+                    &self.receipts,
+                );
+                let commitment = self.consensus.commitment_from_receipts(
+                    self.config.validator_id,
+                    epoch - 1,
+                    &commitment_receipts,
+                    0,
+                    0,
+                );
+                (Some(commitment), commitment_receipts)
+            } else {
+                (None, Vec::new())
+            };
 
         let transactions = self.select_transactions_for_block();
         let mut simulated_ledger = self.ledger.clone();
@@ -378,6 +388,7 @@ impl NodeRunner {
             header,
             transactions: accepted,
             commitment,
+            commitment_receipts,
             signature,
             block_hash,
         };
@@ -406,8 +417,15 @@ impl NodeRunner {
             let contents = fs::read_to_string(&path)?;
             let transaction: SignedTransaction = serde_json::from_str(&contents)
                 .with_context(|| format!("failed to parse inbox tx {}", path.display()))?;
-            self.handle_transaction(transaction.clone(), self.config.validator_id, true)
-                .await?;
+            if let Err(error) = self
+                .handle_transaction(transaction.clone(), self.config.validator_id, true)
+                .await
+            {
+                self.log_event(
+                    "inbox-tx-rejected",
+                    format!("path {} detail {}", path.display(), error),
+                )?;
+            }
             let processed_path = self.storage.processed_dir.join(
                 path.file_name()
                     .ok_or_else(|| anyhow!("inbox file missing name"))?,
@@ -467,8 +485,15 @@ impl NodeRunner {
     ) -> Result<()> {
         match payload {
             ProtocolMessage::TransactionBroadcast(transaction) => {
-                self.handle_transaction(transaction, from_validator_id, false)
-                    .await?;
+                if let Err(error) = self
+                    .handle_transaction(transaction, from_validator_id, false)
+                    .await
+                {
+                    self.log_event(
+                        "peer-tx-rejected",
+                        format!("from {from_validator_id} detail {error}"),
+                    )?;
+                }
             }
             ProtocolMessage::BlockProposal(block) => {
                 self.maybe_issue_receipt(
@@ -481,9 +506,34 @@ impl NodeRunner {
                     block.header.block_number,
                 )
                 .await?;
-                if self.accept_block(block.clone(), false).await? {
-                    self.network
-                        .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
+                match self.accept_block(block.clone(), false).await {
+                    Ok(true) => {
+                        self.network
+                            .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
+                    }
+                    Ok(false) => {
+                        if let Err(error) = self.push_chain_to(from_validator_id) {
+                            self.log_event(
+                                "sync-push-failed",
+                                format!("to {from_validator_id} detail {error}"),
+                            )?;
+                        }
+                        if let Err(error) = self.request_sync_from(from_validator_id) {
+                            self.log_event(
+                                "sync-request-failed",
+                                format!("to {from_validator_id} detail {error}"),
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        self.log_event(
+                            "peer-block-rejected",
+                            format!(
+                                "from {from_validator_id} height {} slot {} detail {}",
+                                block.header.block_number, block.header.slot, error
+                            ),
+                        )?;
+                    }
                 }
             }
             ProtocolMessage::SyncRequest { requester_id } => {
@@ -506,11 +556,27 @@ impl NodeRunner {
                 chain,
             } => {
                 if chain.snapshot.height > self.ledger.block_height() {
-                    self.apply_chain_snapshot(chain)?;
-                    self.log_event(
-                        "sync-applied",
-                        format!("adopted chain from validator {responder_id}"),
-                    )?;
+                    match self.apply_chain_snapshot(chain) {
+                        Ok(()) => {
+                            self.log_event(
+                                "sync-applied",
+                                format!("adopted chain from validator {responder_id}"),
+                            )?;
+                        }
+                        Err(error) => {
+                            self.log_event(
+                                "sync-rejected",
+                                format!("from {responder_id} detail {error}"),
+                            )?;
+                        }
+                    }
+                } else if chain.snapshot.height < self.ledger.block_height() {
+                    if let Err(error) = self.push_chain_to(responder_id) {
+                        self.log_event(
+                            "sync-push-failed",
+                            format!("to {responder_id} detail {error}"),
+                        )?;
+                    }
                 }
             }
             ProtocolMessage::HeartbeatPulse(pulse) => {
@@ -590,6 +656,7 @@ impl NodeRunner {
                 transaction.transaction.nonce
             ),
         )?;
+        self.persist_metrics()?;
 
         let slot = self
             .last_processed_slot
@@ -654,6 +721,12 @@ impl NodeRunner {
         {
             return Ok(());
         }
+        if !self
+            .consensus
+            .is_relay_target_for(source_validator_id, destination_validator_id, epoch)
+        {
+            return Ok(());
+        }
 
         let mut receipt = RelayReceipt {
             epoch,
@@ -678,9 +751,23 @@ impl NodeRunner {
     }
 
     fn store_receipt(&mut self, receipt: RelayReceipt) -> Result<bool> {
+        if let Err(error) = self.validate_receipt(&receipt) {
+            self.log_event(
+                "invalid-receipt",
+                format!(
+                    "source {} witness {} slot {} detail {}",
+                    receipt.source_validator_id, receipt.witness_validator_id, receipt.slot, error
+                ),
+            )?;
+            return Ok(false);
+        }
+        self.persist_receipt(receipt)
+    }
+
+    fn validate_receipt(&mut self, receipt: &RelayReceipt) -> Result<()> {
         let receipt_hash = canonical_hash(&receipt);
         if self.seen_receipts.contains(&receipt_hash) {
-            return Ok(false);
+            return Ok(());
         }
         let receipt_hash_to_verify = receipt_signing_hash(&receipt);
         let verified = self.crypto.verify(
@@ -691,6 +778,18 @@ impl NodeRunner {
         if !verified {
             self.invalid_receipts += 1;
             return Err(anyhow!("invalid receipt signature"));
+        }
+        if let Err(error) = self.consensus.validate_receipt_assignment(receipt) {
+            self.invalid_receipts += 1;
+            return Err(anyhow!(error));
+        }
+        Ok(())
+    }
+
+    fn persist_receipt(&mut self, receipt: RelayReceipt) -> Result<bool> {
+        let receipt_hash = canonical_hash(&receipt);
+        if self.seen_receipts.contains(&receipt_hash) {
+            return Ok(false);
         }
         let receipt_event_hash = receipt_event_hash(&receipt);
         if self.seen_receipt_events.contains(&receipt_event_hash) {
@@ -716,6 +815,7 @@ impl NodeRunner {
                 receipt.source_validator_id, receipt.witness_validator_id, receipt.slot
             ),
         )?;
+        self.persist_metrics()?;
         Ok(true)
     }
 
@@ -787,8 +887,11 @@ impl NodeRunner {
             return Err(anyhow!("topology root mismatch"));
         }
 
+        if block.commitment.is_none() && !block.commitment_receipts.is_empty() {
+            return Err(anyhow!("commitment receipts present without commitment"));
+        }
         if let Some(commitment) = &block.commitment {
-            self.validate_commitment(commitment)?;
+            self.validate_commitment(commitment, &block.commitment_receipts)?;
         }
 
         let mut next_ledger = self.ledger.clone();
@@ -799,6 +902,7 @@ impl NodeRunner {
         self.storage
             .append_json_line(&self.storage.blocks_path, &block)?;
         self.storage.write_snapshot(self.ledger.snapshot())?;
+        self.import_commitment_receipts(&block.commitment_receipts)?;
         for transaction in &block.transactions {
             self.mempool.remove(&transaction.tx_hash);
         }
@@ -821,19 +925,50 @@ impl NodeRunner {
                 block.transactions.len()
             ),
         )?;
+        self.persist_metrics()?;
         Ok(true)
     }
 
-    fn validate_commitment(&self, commitment: &TopologyCommitment) -> Result<()> {
-        let expected = self.consensus.commitment_for_validator(
+    fn validate_commitment(
+        &mut self,
+        commitment: &TopologyCommitment,
+        commitment_receipts: &[RelayReceipt],
+    ) -> Result<()> {
+        let mut exact_hashes = BTreeSet::new();
+        let mut event_hashes = BTreeSet::new();
+        for receipt in commitment_receipts {
+            if receipt.source_validator_id != commitment.validator_id {
+                return Err(anyhow!("commitment receipt source mismatch"));
+            }
+            if receipt.epoch != commitment.epoch {
+                return Err(anyhow!("commitment receipt epoch mismatch"));
+            }
+            self.validate_receipt(receipt)?;
+            let receipt_hash = canonical_hash(receipt);
+            if !exact_hashes.insert(receipt_hash) {
+                return Err(anyhow!("duplicate receipt in commitment"));
+            }
+            let event_hash = receipt_event_hash(receipt);
+            if !event_hashes.insert(event_hash) {
+                return Err(anyhow!("duplicate receipt event in commitment"));
+            }
+        }
+        let expected = self.consensus.commitment_from_receipts(
             commitment.validator_id,
             commitment.epoch,
-            &self.receipts,
-            self.failed_sessions,
-            self.invalid_receipts,
+            commitment_receipts,
+            0,
+            0,
         );
-        if expected.receipt_root != commitment.receipt_root {
+        if expected != *commitment {
             return Err(anyhow!("receipt root mismatch"));
+        }
+        Ok(())
+    }
+
+    fn import_commitment_receipts(&mut self, receipts: &[RelayReceipt]) -> Result<()> {
+        for receipt in receipts {
+            let _ = self.persist_receipt(receipt.clone())?;
         }
         Ok(())
     }
@@ -849,7 +984,15 @@ impl NodeRunner {
                 .position(|orphan| orphan.header.parent_hash == tip_hash)
             {
                 let orphan = self.orphan_blocks.remove(index);
-                let _ = self.accept_block(orphan, false).await?;
+                if let Err(error) = self.accept_block(orphan.clone(), false).await {
+                    self.log_event(
+                        "orphan-rejected",
+                        format!(
+                            "height {} slot {} detail {}",
+                            orphan.header.block_number, orphan.header.slot, error
+                        ),
+                    )?;
+                }
                 progress = true;
             }
         }
@@ -978,6 +1121,45 @@ impl NodeRunner {
         )
     }
 
+    fn broadcast_chain_snapshot(&self) -> Result<()> {
+        let chain = ChainSnapshot {
+            snapshot: self.ledger.snapshot().clone(),
+            blocks: self.blocks.clone(),
+            receipts: self.receipts.clone(),
+        };
+        self.network.broadcast(
+            &self.config.peers,
+            ProtocolMessage::SyncResponse {
+                responder_id: self.config.validator_id,
+                chain,
+            },
+        )
+    }
+
+    fn request_sync_from(&self, validator_id: ValidatorId) -> Result<()> {
+        self.network.send_to(
+            self.find_peer(validator_id)?,
+            ProtocolMessage::SyncRequest {
+                requester_id: self.config.validator_id,
+            },
+        )
+    }
+
+    fn push_chain_to(&self, validator_id: ValidatorId) -> Result<()> {
+        let chain = ChainSnapshot {
+            snapshot: self.ledger.snapshot().clone(),
+            blocks: self.blocks.clone(),
+            receipts: self.receipts.clone(),
+        };
+        self.network.send_to(
+            self.find_peer(validator_id)?,
+            ProtocolMessage::SyncResponse {
+                responder_id: self.config.validator_id,
+                chain,
+            },
+        )
+    }
+
     fn snapshot_metrics(&self) -> NodeMetrics {
         self.metrics
             .lock()
@@ -990,6 +1172,10 @@ impl NodeRunner {
             update(&mut metrics);
             metrics.last_updated_unix_millis = now_unix_millis();
         }
+    }
+
+    fn persist_metrics(&self) -> Result<()> {
+        self.storage.write_metrics(&self.snapshot_metrics())
     }
 
     fn find_peer(&self, validator_id: ValidatorId) -> Result<PeerConfig> {

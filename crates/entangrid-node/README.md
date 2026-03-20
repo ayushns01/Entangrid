@@ -75,9 +75,15 @@ When the node proposes or receives a block, it:
 - checks slot proposer correctness
 - checks parent hash
 - checks transaction root and topology root
-- validates any included commitment
+- validates any included commitment against the exact receipt bundle carried with the block
 - applies the block to a cloned ledger
 - persists the block and updated snapshot
+
+Recent improvement:
+
+- the node no longer tries to recompute commitment roots from whatever local receipt gossip it happened to see
+- accepted blocks can import commitment receipt bundles into local receipt storage
+- this prevents degraded nodes from crashing on `receipt root mismatch` just because their local receipt cache differed from the proposer’s
 
 If the parent is unknown, the block is stored as an orphan.
 
@@ -93,6 +99,8 @@ The node also:
 - respects a configurable `service_gating_start_epoch` instead of using a fixed warmup epoch
 - respects a configurable rolling service-score window length
 - records the latest local score breakdown in metrics and logs
+- drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
+- writes metrics more eagerly around block and slot transitions so localnet reports stay closer to the saved chain state
 
 That means the node can now explain service gating in a much more concrete way:
 
@@ -124,6 +132,14 @@ The recent gating-focused improvement in this crate was mostly about observabili
 - missed slots log the reason more clearly
 - `metrics.json` keeps the latest local service counters alongside the score
 - `metrics.json` now also tracks how many duplicate receipts were ignored
+
+The recent validation-focused improvement in this crate was about correctness under degraded networking:
+
+- commitment validation now uses explicit proof data from the block
+- stricter receipt assignment checks are enforced
+- malformed peer data is rejected locally instead of taking the node down
+- when a peer appears to be on a stale or forked branch, the node now pushes its own longer chain snapshot back to that peer instead of only asking for sync in the opposite direction
+- nodes now also broadcast their current chain snapshot on the periodic sync tick, so a heavily degraded peer can still recover through inbound sync traffic even if it cannot send a clean sync request itself
 
 But it is still intentionally early-stage.
 

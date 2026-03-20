@@ -52,6 +52,12 @@ For each epoch, validators are rotated and assigned:
 
 The assignments are deterministic, so every node can recompute them from genesis and the epoch number.
 
+Current prototype detail:
+
+- in the direct-delivery localnet model, witnesses are intentionally aligned with relay targets
+- that is because only the receiving relay target actually observes the message today
+- this keeps the witness rules consistent with what the runtime can really prove, instead of assuming third-party observers that the current network layer does not yet model
+
 ### Relay scoring
 
 The crate turns relay receipts into service counters, then into a service score.
@@ -83,6 +89,15 @@ That includes:
 - message-class counts
 - distinct peers
 - computed relay score
+
+Recent improvement:
+
+- the crate can now filter the exact receipt bundle for one validator and epoch
+- it can validate whether a receipt matches the assigned witness and relay-target relationship
+- it can build a commitment directly from an explicit receipt bundle
+
+That matters because different nodes may hear different gossip receipts in a degraded network.
+By working from the exact receipt bundle carried with a block, every validator can recompute the same commitment root instead of guessing from its local receipt cache.
 
 ### Basic block validation
 

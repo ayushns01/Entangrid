@@ -159,6 +159,8 @@ pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<SignedTransaction>,
     pub commitment: Option<TopologyCommitment>,
+    #[serde(default)]
+    pub commitment_receipts: Vec<RelayReceipt>,
     pub signature: Vec<u8>,
     pub block_hash: HashBytes,
 }

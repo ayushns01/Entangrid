@@ -94,6 +94,8 @@ The repository now includes a working Rust workspace with:
 - baseline proposer selection and witness assignment logic
 - TCP-based static-peer networking
 - a CLI node binary and localnet simulator
+- block commitments backed by explicit receipt bundles in the runtime prototype
+- a direct-delivery witness model where relay targets act as the current prototype witnesses for receipt generation
 
 Important:
 
@@ -119,6 +121,9 @@ Start the localnet:
 ```bash
 cargo run -p entangrid-sim -- up --base-dir var/localnet
 ```
+
+`up` rebuilds `entangrid-node` before launch, and for a brand-new localnet it will nudge the fresh genesis time forward if you waited too long between `init-localnet` and `up`.
+During runtime, nodes also try to push a longer chain snapshot to peers that appear stuck on a stale branch, and they periodically broadcast their current chain snapshot on the sync tick. That helps degraded validators recover even when their own outbound sync traffic is unreliable.
 
 Inject steady transfer traffic from another terminal:
 

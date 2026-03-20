@@ -47,6 +47,7 @@ Right now this crate is intentionally simple and very central.
   - a `BlockHeader`
   - accepted transactions
   - an optional topology commitment
+  - the receipt bundle that proves that commitment in the current prototype
   - proposer signature
   - block hash
 - `ProtocolMessage` is the current network message enum:
@@ -96,6 +97,12 @@ One recent example of that role is service gating:
 - the simulator also writes the service-score window length through these shared types
 - the node reports score breakdowns back into `NodeMetrics` through these shared types
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
+
+One recent example of the type layer evolving with the protocol is block commitments:
+
+- `Block` now carries `commitment_receipts` alongside the compact `TopologyCommitment`
+- that lets validators recompute the same receipt root from the same proof bundle
+- the field is deserialized with a default empty list so older saved block files remain readable
 
 ## Where we want to take it
 
