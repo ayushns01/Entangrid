@@ -226,6 +226,7 @@ pub struct ServiceCounters {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct NodeMetrics {
     pub validator_id: ValidatorId,
     pub current_slot: Slot,
@@ -240,6 +241,7 @@ pub struct NodeMetrics {
     pub blocks_validated: u64,
     pub missed_proposer_slots: u64,
     pub service_gating_rejections: u64,
+    pub duplicate_receipts_ignored: u64,
     pub tx_ingress: u64,
     pub tx_propagated: u64,
     pub receipts_created: u64,

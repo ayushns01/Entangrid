@@ -10,9 +10,9 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_types::{
-    FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, PeerConfig,
-    SignedTransaction, Transaction, ValidatorConfig, canonical_hash, empty_hash, now_unix_millis,
-    validator_account,
+    FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
+    PeerConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash, empty_hash,
+    now_unix_millis, validator_account,
 };
 use tokio::process::{Child, Command};
 use tracing::info;
@@ -65,6 +65,10 @@ enum Commands {
         #[arg(long, default_value_t = 12)]
         duration_secs: u64,
     },
+    Report {
+        #[arg(long, default_value = "var/localnet")]
+        base_dir: PathBuf,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -115,6 +119,7 @@ pub async fn cli_main() -> Result<()> {
             scenario,
             duration_secs,
         } => load_scenario(&base_dir, scenario, duration_secs).await,
+        Commands::Report { base_dir } => report_localnet(&base_dir),
     }
 }
 
@@ -331,6 +336,13 @@ pub async fn load_scenario(
     Ok(())
 }
 
+pub fn report_localnet(base_dir: &Path) -> Result<()> {
+    let manifest = read_manifest(base_dir)?;
+    let report = build_localnet_report(base_dir, &manifest)?;
+    println!("{}", report.render_text());
+    Ok(())
+}
+
 fn write_transaction_for_validator(
     base_dir: &Path,
     genesis: &GenesisConfig,
@@ -454,6 +466,139 @@ fn read_manifest(base_dir: &Path) -> Result<LocalnetManifest> {
     Ok(toml::from_str(&contents)?)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ValidatorReport {
+    validator_id: u64,
+    current_epoch: u64,
+    current_slot: u64,
+    last_local_service_score: f64,
+    service_gating_rejections: u64,
+    missed_proposer_slots: u64,
+    duplicate_receipts_ignored: u64,
+    blocks_proposed: u64,
+    blocks_validated: u64,
+    tx_ingress: u64,
+    receipts_created: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LocalnetReport {
+    base_dir: String,
+    configured_validators: usize,
+    validators_with_metrics: usize,
+    total_blocks_proposed: u64,
+    total_missed_slots: u64,
+    total_gating_rejections: u64,
+    total_duplicate_receipts_ignored: u64,
+    lowest_score: Option<(u64, f64)>,
+    highest_score: Option<(u64, f64)>,
+    validators: Vec<ValidatorReport>,
+}
+
+impl LocalnetReport {
+    fn render_text(&self) -> String {
+        let mut lines = vec![
+            format!("Localnet report: {}", self.base_dir),
+            format!(
+                "validators with metrics: {}/{}",
+                self.validators_with_metrics, self.configured_validators
+            ),
+            format!("total blocks proposed: {}", self.total_blocks_proposed),
+            format!("total missed proposer slots: {}", self.total_missed_slots),
+            format!("total gating rejections: {}", self.total_gating_rejections),
+            format!(
+                "total duplicate receipts ignored: {}",
+                self.total_duplicate_receipts_ignored
+            ),
+        ];
+        if let Some((validator_id, score)) = self.highest_score {
+            lines.push(format!(
+                "highest score: validator {validator_id} = {score:.3}"
+            ));
+        }
+        if let Some((validator_id, score)) = self.lowest_score {
+            lines.push(format!(
+                "lowest score: validator {validator_id} = {score:.3}"
+            ));
+        }
+        for validator in &self.validators {
+            lines.push(format!(
+                "validator {}: epoch {} slot {} score {:.3} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {}",
+                validator.validator_id,
+                validator.current_epoch,
+                validator.current_slot,
+                validator.last_local_service_score,
+                validator.blocks_proposed,
+                validator.blocks_validated,
+                validator.tx_ingress,
+                validator.receipts_created,
+                validator.missed_proposer_slots,
+                validator.service_gating_rejections,
+                validator.duplicate_receipts_ignored
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result<LocalnetReport> {
+    let mut validators = Vec::new();
+    let mut total_blocks_proposed = 0;
+    let mut total_missed_slots = 0;
+    let mut total_gating_rejections = 0;
+    let mut total_duplicate_receipts_ignored = 0;
+
+    for config_path in &manifest.node_configs {
+        let contents = fs::read_to_string(config_path)?;
+        let config: NodeConfig = toml::from_str(&contents)?;
+        let metrics_path = PathBuf::from(&config.metrics_path);
+        if !metrics_path.exists() {
+            continue;
+        }
+        let metrics: NodeMetrics = serde_json::from_str(&fs::read_to_string(metrics_path)?)?;
+        total_blocks_proposed += metrics.blocks_proposed;
+        total_missed_slots += metrics.missed_proposer_slots;
+        total_gating_rejections += metrics.service_gating_rejections;
+        total_duplicate_receipts_ignored += metrics.duplicate_receipts_ignored;
+        validators.push(ValidatorReport {
+            validator_id: metrics.validator_id,
+            current_epoch: metrics.current_epoch,
+            current_slot: metrics.current_slot,
+            last_local_service_score: metrics.last_local_service_score,
+            service_gating_rejections: metrics.service_gating_rejections,
+            missed_proposer_slots: metrics.missed_proposer_slots,
+            duplicate_receipts_ignored: metrics.duplicate_receipts_ignored,
+            blocks_proposed: metrics.blocks_proposed,
+            blocks_validated: metrics.blocks_validated,
+            tx_ingress: metrics.tx_ingress,
+            receipts_created: metrics.receipts_created,
+        });
+    }
+
+    validators.sort_by_key(|validator| validator.validator_id);
+    let lowest_score = validators
+        .iter()
+        .map(|validator| (validator.validator_id, validator.last_local_service_score))
+        .min_by(|left, right| left.1.total_cmp(&right.1));
+    let highest_score = validators
+        .iter()
+        .map(|validator| (validator.validator_id, validator.last_local_service_score))
+        .max_by(|left, right| left.1.total_cmp(&right.1));
+
+    Ok(LocalnetReport {
+        base_dir: base_dir.to_string_lossy().to_string(),
+        configured_validators: manifest.node_configs.len(),
+        validators_with_metrics: validators.len(),
+        total_blocks_proposed,
+        total_missed_slots,
+        total_gating_rejections,
+        total_duplicate_receipts_ignored,
+        lowest_score,
+        highest_score,
+        validators,
+    })
+}
+
 fn node_binary_path() -> Result<PathBuf> {
     let current_exe = std::env::current_exe()?;
     let parent = current_exe
@@ -555,5 +700,79 @@ mod tests {
         assert_eq!(node_config.feature_flags.service_gating_start_epoch, 3);
         assert_eq!(node_config.feature_flags.service_score_window_epochs, 6);
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
+    }
+
+    #[test]
+    fn report_summarizes_existing_metrics() {
+        let unique_dir =
+            std::env::temp_dir().join(format!("entangrid-sim-report-test-{}", now_unix_millis()));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            true,
+            3,
+            4,
+            None,
+            0,
+            0.0,
+            false,
+        )
+        .unwrap();
+        let manifest = read_manifest(&unique_dir).unwrap();
+        let first_config: NodeConfig =
+            toml::from_str(&fs::read_to_string(&manifest.node_configs[0]).unwrap()).unwrap();
+        let second_config: NodeConfig =
+            toml::from_str(&fs::read_to_string(&manifest.node_configs[1]).unwrap()).unwrap();
+
+        fs::write(
+            &first_config.metrics_path,
+            serde_json::to_vec_pretty(&NodeMetrics {
+                validator_id: 1,
+                current_epoch: 4,
+                current_slot: 19,
+                last_local_service_score: 0.85,
+                blocks_proposed: 3,
+                blocks_validated: 7,
+                tx_ingress: 11,
+                receipts_created: 9,
+                missed_proposer_slots: 0,
+                service_gating_rejections: 0,
+                duplicate_receipts_ignored: 1,
+                ..NodeMetrics::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            &second_config.metrics_path,
+            serde_json::to_vec_pretty(&NodeMetrics {
+                validator_id: 2,
+                current_epoch: 4,
+                current_slot: 19,
+                last_local_service_score: 0.25,
+                blocks_proposed: 1,
+                blocks_validated: 6,
+                tx_ingress: 8,
+                receipts_created: 7,
+                missed_proposer_slots: 2,
+                service_gating_rejections: 2,
+                duplicate_receipts_ignored: 3,
+                ..NodeMetrics::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = build_localnet_report(&unique_dir, &manifest).unwrap();
+        assert_eq!(report.validators_with_metrics, 2);
+        assert_eq!(report.total_blocks_proposed, 4);
+        assert_eq!(report.total_missed_slots, 2);
+        assert_eq!(report.total_gating_rejections, 2);
+        assert_eq!(report.total_duplicate_receipts_ignored, 4);
+        assert_eq!(report.highest_score, Some((1, 0.85)));
+        assert_eq!(report.lowest_score, Some((2, 0.25)));
     }
 }

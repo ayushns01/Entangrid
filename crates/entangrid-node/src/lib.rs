@@ -113,6 +113,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         seen_transactions: BTreeSet::new(),
         seen_blocks: BTreeSet::new(),
         seen_receipts: BTreeSet::new(),
+        seen_receipt_events: BTreeSet::new(),
         last_processed_slot: None,
         last_logged_epoch: None,
         last_heartbeat_slot: None,
@@ -143,6 +144,7 @@ struct NodeRunner {
     seen_transactions: BTreeSet<HashBytes>,
     seen_blocks: BTreeSet<HashBytes>,
     seen_receipts: BTreeSet<HashBytes>,
+    seen_receipt_events: BTreeSet<HashBytes>,
     last_processed_slot: Option<u64>,
     last_logged_epoch: Option<Epoch>,
     last_heartbeat_slot: Option<u64>,
@@ -690,7 +692,15 @@ impl NodeRunner {
             self.invalid_receipts += 1;
             return Err(anyhow!("invalid receipt signature"));
         }
+        let receipt_event_hash = receipt_event_hash(&receipt);
+        if self.seen_receipt_events.contains(&receipt_event_hash) {
+            self.update_metrics(|metrics| {
+                metrics.duplicate_receipts_ignored += 1;
+            });
+            return Ok(false);
+        }
         self.seen_receipts.insert(receipt_hash);
+        self.seen_receipt_events.insert(receipt_event_hash);
         self.receipts.push(receipt.clone());
         self.storage
             .append_json_line(&self.storage.receipts_path, &receipt)?;
@@ -994,6 +1004,7 @@ impl NodeRunner {
     fn rebuild_seen_sets(&mut self) {
         self.seen_blocks = self.blocks.iter().map(|block| block.block_hash).collect();
         self.seen_receipts = self.receipts.iter().map(canonical_hash).collect();
+        self.seen_receipt_events = self.receipts.iter().map(receipt_event_hash).collect();
         for block in &self.blocks {
             for transaction in &block.transactions {
                 self.seen_transactions.insert(transaction.tx_hash);
@@ -1055,6 +1066,18 @@ fn receipt_signing_hash(receipt: &RelayReceipt) -> HashBytes {
     let mut unsigned = receipt.clone();
     unsigned.signature.clear();
     canonical_hash(&unsigned)
+}
+
+fn receipt_event_hash(receipt: &RelayReceipt) -> HashBytes {
+    canonical_hash(&(
+        receipt.epoch,
+        receipt.slot,
+        receipt.source_validator_id,
+        receipt.destination_validator_id,
+        receipt.witness_validator_id,
+        receipt.message_class.clone(),
+        receipt.sequence_number,
+    ))
 }
 
 fn accumulate_weighted_counters(
@@ -1200,4 +1223,41 @@ fn init_tracing() {
         .with_env_filter("info")
         .with_target(false)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_receipt() -> RelayReceipt {
+        RelayReceipt {
+            epoch: 1,
+            slot: 2,
+            source_validator_id: 1,
+            destination_validator_id: 2,
+            witness_validator_id: 3,
+            message_class: MessageClass::Transaction,
+            transcript_digest: [1u8; 32],
+            latency_bucket_ms: 100,
+            byte_count_bucket: 8,
+            sequence_number: 7,
+            signature: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn receipt_event_hash_ignores_non_identity_fields() {
+        let mut first = sample_receipt();
+        let mut second = sample_receipt();
+        second.signature = vec![9, 9, 9];
+        second.transcript_digest = [9u8; 32];
+        second.latency_bucket_ms = 900;
+        second.byte_count_bucket = 42;
+
+        assert_eq!(receipt_event_hash(&first), receipt_event_hash(&second));
+        assert_ne!(canonical_hash(&first), canonical_hash(&second));
+
+        first.sequence_number += 1;
+        assert_ne!(receipt_event_hash(&first), receipt_event_hash(&second));
+    }
 }
