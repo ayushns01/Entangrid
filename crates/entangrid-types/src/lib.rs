@@ -184,15 +184,35 @@ pub struct ChainSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChainSegment {
+    pub base_height: u64,
+    pub base_tip_hash: HashBytes,
+    pub target_snapshot: StateSnapshot,
+    pub blocks: Vec<Block>,
+    pub receipts: Vec<RelayReceipt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ProtocolMessage {
     TransactionBroadcast(SignedTransaction),
     BlockProposal(Block),
+    SyncStatus {
+        validator_id: ValidatorId,
+        height: u64,
+        tip_hash: HashBytes,
+    },
     SyncRequest {
         requester_id: ValidatorId,
+        known_height: u64,
+        known_tip_hash: HashBytes,
     },
     SyncResponse {
         responder_id: ValidatorId,
         chain: ChainSnapshot,
+    },
+    SyncBlocks {
+        responder_id: ValidatorId,
+        chain: ChainSegment,
     },
     HeartbeatPulse(HeartbeatPulse),
     RelayReceipt(RelayReceipt),
@@ -256,6 +276,11 @@ pub struct NodeMetrics {
     pub service_gating_threshold: f64,
     pub last_local_service_counters: ServiceCounters,
     pub relay_scores: BTreeMap<ValidatorId, f64>,
+    pub sync_requests_throttled: u64,
+    pub incremental_sync_served: u64,
+    pub incremental_sync_applied: u64,
+    pub full_sync_served: u64,
+    pub full_sync_applied: u64,
     pub last_updated_unix_millis: u64,
 }
 

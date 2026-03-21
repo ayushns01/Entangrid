@@ -53,7 +53,7 @@ Right now this crate is intentionally simple and very central.
 - `ProtocolMessage` is the current network message enum:
   - transaction broadcast
   - block proposal
-  - sync request/response
+  - sync status, sync request/response, and incremental sync blocks
   - heartbeat pulse
   - relay receipt
   - receipt fetch/response
@@ -72,6 +72,7 @@ Right now this crate is intentionally simple and very central.
   - the latest local service score
   - the latest local service counters used to explain that score
   - duplicate receipt counts that were ignored by the node
+  - sync-throttle and sync-mode counters so recovery behavior is visible in reports
 
 This crate also provides a few shared helpers:
 
@@ -104,6 +105,12 @@ One recent example of the type layer evolving with the protocol is block commitm
 - `Block` now carries `commitment_receipts` alongside the compact `TopologyCommitment`
 - that lets validators recompute the same receipt root from the same proof bundle
 - the field is deserialized with a default empty list so older saved block files remain readable
+
+One recent example of the type layer evolving with recovery behavior is sync:
+
+- `ProtocolMessage` now distinguishes small `SyncStatus` announcements from heavier sync payloads
+- `ChainSegment` lets same-chain peers exchange only the missing block suffix plus recent receipts
+- full `ChainSnapshot` is still available as the fallback for unknown or divergent peers
 
 ## Where we want to take it
 

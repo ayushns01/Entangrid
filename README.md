@@ -123,7 +123,7 @@ cargo run -p entangrid-sim -- up --base-dir var/localnet
 ```
 
 `up` rebuilds `entangrid-node` before launch, and for a brand-new localnet it will nudge the fresh genesis time forward if you waited too long between `init-localnet` and `up`.
-During runtime, nodes also try to push a longer chain snapshot to peers that appear stuck on a stale branch, and they periodically broadcast their current chain snapshot on the sync tick. That helps degraded validators recover even when their own outbound sync traffic is unreliable.
+During runtime, nodes now broadcast lightweight sync status on the sync tick, answer explicit sync requests with incremental block catch-up when possible, and fall back to full snapshots only when a peer is unknown or clearly on a different branch. Healthy peers also proactively push the best available sync bundle to peers that still look stale, so degraded validators can recover without the old constant full-snapshot broadcast.
 
 Inject steady transfer traffic from another terminal:
 
@@ -175,6 +175,7 @@ Recent hardening also tightened two protocol-surface issues found during adversa
 - sync snapshot adoption now validates incoming blocks structurally instead of trusting raw ledger replay alone
 - sync snapshot adoption now validates incoming receipt bundles before they can affect local service scoring
 - inbound network frames now have a fixed maximum size to avoid unbounded allocation on a malicious length prefix
+- sync now uses `SyncStatus` plus incremental block segments for same-chain peers, with per-peer request throttling and full snapshots kept as the safe fallback
 
 Then inspect:
 

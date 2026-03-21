@@ -14,8 +14,8 @@ use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend};
 use entangrid_ledger::LedgerState;
 use entangrid_network::{NetworkEvent, NetworkHandle, spawn_network};
 use entangrid_types::{
-    Block, BlockHeader, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig, HashBytes,
-    HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
+    Block, BlockHeader, ChainSegment, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig,
+    HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
     RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
     ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
@@ -26,6 +26,8 @@ const SNAPSHOT_FILE: &str = "state_snapshot.json";
 const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
+const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
+const SYNC_REQUEST_COOLDOWN_MILLIS: u64 = 1_500;
 
 #[derive(Parser)]
 #[command(name = "entangrid-node")]
@@ -123,6 +125,8 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         invalid_receipts: 0,
         observed_failed_sessions: BTreeSet::new(),
         observed_invalid_receipts: BTreeMap::new(),
+        last_sync_request_served_at: BTreeMap::new(),
+        peer_sync_status: BTreeMap::new(),
     };
     runner.rebuild_seen_sets();
     runner.run().await
@@ -156,6 +160,8 @@ struct NodeRunner {
     invalid_receipts: u64,
     observed_failed_sessions: BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
     observed_invalid_receipts: BTreeMap<(Epoch, ValidatorId), u64>,
+    last_sync_request_served_at: BTreeMap<ValidatorId, u64>,
+    peer_sync_status: BTreeMap<ValidatorId, (u64, HashBytes)>,
 }
 
 impl NodeRunner {
@@ -196,7 +202,8 @@ impl NodeRunner {
                 _ = sync_tick.tick() => {
                     if self.config.sync_on_startup {
                         self.broadcast_sync_request()?;
-                        self.broadcast_chain_snapshot()?;
+                        self.broadcast_sync_status()?;
+                        self.push_sync_to_stale_peers()?;
                     }
                 }
                 maybe_event = self.network_event_rx.recv() => {
@@ -529,6 +536,11 @@ impl NodeRunner {
                 }
             }
             ProtocolMessage::BlockProposal(block) => {
+                self.record_peer_sync_status(
+                    from_validator_id,
+                    block.header.block_number,
+                    block.block_hash,
+                );
                 self.maybe_issue_receipt(
                     from_validator_id,
                     self.config.validator_id,
@@ -545,7 +557,11 @@ impl NodeRunner {
                             .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
                     }
                     Ok(false) => {
-                        if let Err(error) = self.push_chain_to(from_validator_id) {
+                        let peer_height = block.header.block_number.saturating_sub(1);
+                        let peer_tip_hash = block.header.parent_hash;
+                        if let Err(error) =
+                            self.push_best_sync_to(from_validator_id, peer_height, peer_tip_hash)
+                        {
                             self.log_event(
                                 "sync-push-failed",
                                 format!("to {from_validator_id} detail {error}"),
@@ -569,28 +585,64 @@ impl NodeRunner {
                     }
                 }
             }
-            ProtocolMessage::SyncRequest { requester_id } => {
-                let chain = ChainSnapshot {
-                    snapshot: self.ledger.snapshot().clone(),
-                    blocks: self.blocks.clone(),
-                    receipts: self.receipts.clone(),
-                };
-                let peer = self.find_peer(requester_id)?;
-                self.network.send_to(
-                    peer,
-                    ProtocolMessage::SyncResponse {
-                        responder_id: self.config.validator_id,
-                        chain,
-                    },
-                )?;
+            ProtocolMessage::SyncStatus {
+                validator_id,
+                height,
+                tip_hash,
+            } => {
+                self.record_peer_sync_status(validator_id, height, tip_hash);
+                let local_height = self.ledger.block_height();
+                let local_tip_hash = self.ledger.snapshot().tip_hash;
+                if height > local_height {
+                    if let Err(error) = self.request_sync_from(validator_id) {
+                        self.log_event(
+                            "sync-request-failed",
+                            format!("to {validator_id} detail {error}"),
+                        )?;
+                    }
+                } else if height < local_height || tip_hash != local_tip_hash {
+                    if let Err(error) = self.push_best_sync_to(validator_id, height, tip_hash) {
+                        self.log_event(
+                            "sync-push-failed",
+                            format!("to {validator_id} detail {error}"),
+                        )?;
+                    }
+                }
+            }
+            ProtocolMessage::SyncRequest {
+                requester_id,
+                known_height,
+                known_tip_hash,
+            } => {
+                self.record_peer_sync_status(requester_id, known_height, known_tip_hash);
+                if self.sync_request_is_throttled(requester_id) {
+                    self.update_metrics(|metrics| {
+                        metrics.sync_requests_throttled += 1;
+                    });
+                    self.log_event(
+                        "sync-request-throttled",
+                        format!("from {requester_id} height {known_height}"),
+                    )?;
+                    return Ok(());
+                }
+                self.record_sync_request_served(requester_id);
+                self.send_best_sync_to(requester_id, known_height, known_tip_hash)?;
             }
             ProtocolMessage::SyncResponse {
                 responder_id,
                 chain,
             } => {
+                self.record_peer_sync_status(
+                    responder_id,
+                    chain.snapshot.height,
+                    chain.snapshot.tip_hash,
+                );
                 if chain.snapshot.height > self.ledger.block_height() {
                     match self.apply_chain_snapshot(chain) {
                         Ok(()) => {
+                            self.update_metrics(|metrics| {
+                                metrics.full_sync_applied += 1;
+                            });
                             self.log_event(
                                 "sync-applied",
                                 format!("adopted chain from validator {responder_id}"),
@@ -604,11 +656,51 @@ impl NodeRunner {
                         }
                     }
                 } else if chain.snapshot.height < self.ledger.block_height() {
-                    if let Err(error) = self.push_chain_to(responder_id) {
+                    if let Err(error) = self.push_best_sync_to(
+                        responder_id,
+                        chain.snapshot.height,
+                        chain.snapshot.tip_hash,
+                    ) {
                         self.log_event(
                             "sync-push-failed",
                             format!("to {responder_id} detail {error}"),
                         )?;
+                    }
+                }
+            }
+            ProtocolMessage::SyncBlocks {
+                responder_id,
+                chain,
+            } => {
+                self.record_peer_sync_status(
+                    responder_id,
+                    chain.target_snapshot.height,
+                    chain.target_snapshot.tip_hash,
+                );
+                if chain.target_snapshot.height <= self.ledger.block_height() {
+                    return Ok(());
+                }
+                match self.apply_chain_segment(chain) {
+                    Ok(()) => {
+                        self.update_metrics(|metrics| {
+                            metrics.incremental_sync_applied += 1;
+                        });
+                        self.log_event(
+                            "sync-blocks-applied",
+                            format!("adopted incremental sync from validator {responder_id}"),
+                        )?;
+                    }
+                    Err(error) => {
+                        self.log_event(
+                            "sync-blocks-rejected",
+                            format!("from {responder_id} detail {error}"),
+                        )?;
+                        if let Err(request_error) = self.request_sync_from(responder_id) {
+                            self.log_event(
+                                "sync-request-failed",
+                                format!("to {responder_id} detail {request_error}"),
+                            )?;
+                        }
                     }
                 }
             }
@@ -1026,6 +1118,66 @@ impl NodeRunner {
         Ok(())
     }
 
+    fn apply_chain_segment(&mut self, chain: ChainSegment) -> Result<()> {
+        if chain.base_height != self.ledger.block_height() {
+            return Err(anyhow!(
+                "incremental sync height mismatch local {} remote {}",
+                self.ledger.block_height(),
+                chain.base_height
+            ));
+        }
+        if chain.base_tip_hash != self.ledger.snapshot().tip_hash {
+            return Err(anyhow!("incremental sync tip mismatch"));
+        }
+
+        let receipts =
+            validate_snapshot_receipts(&self.consensus, self.crypto.as_ref(), &chain.receipts)?;
+        let mut ledger = self.ledger.clone();
+        let mut expected_parent_hash = self.ledger.snapshot().tip_hash;
+        for block in &chain.blocks {
+            validate_snapshot_block(
+                &self.consensus,
+                self.crypto.as_ref(),
+                &ledger,
+                block,
+                expected_parent_hash,
+            )?;
+            let mut next_ledger = ledger.clone();
+            next_ledger.apply_block(block, self.crypto.as_ref())?;
+            ledger = next_ledger;
+            expected_parent_hash = block.block_hash;
+        }
+
+        if ledger.snapshot() != &chain.target_snapshot {
+            return Err(anyhow!("incremental sync replay mismatch"));
+        }
+
+        self.ledger = ledger;
+        self.blocks.extend(chain.blocks);
+        self.rebuild_seen_sets();
+        self.storage.write_snapshot(self.ledger.snapshot())?;
+        self.storage
+            .overwrite_json_lines(&self.storage.blocks_path, &self.blocks)?;
+        for receipt in receipts {
+            self.store_receipt(receipt)?;
+        }
+        Ok(())
+    }
+
+    fn sync_request_is_throttled(&self, validator_id: ValidatorId) -> bool {
+        self.last_sync_request_served_at
+            .get(&validator_id)
+            .map(|last_served_at| {
+                now_unix_millis().saturating_sub(*last_served_at) < SYNC_REQUEST_COOLDOWN_MILLIS
+            })
+            .unwrap_or(false)
+    }
+
+    fn record_sync_request_served(&mut self, validator_id: ValidatorId) {
+        self.last_sync_request_served_at
+            .insert(validator_id, now_unix_millis());
+    }
+
     fn refresh_service_scores(&mut self) {
         let current_epoch = self
             .last_processed_slot
@@ -1139,21 +1291,19 @@ impl NodeRunner {
             &self.config.peers,
             ProtocolMessage::SyncRequest {
                 requester_id: self.config.validator_id,
+                known_height: self.ledger.block_height(),
+                known_tip_hash: self.ledger.snapshot().tip_hash,
             },
         )
     }
 
-    fn broadcast_chain_snapshot(&self) -> Result<()> {
-        let chain = ChainSnapshot {
-            snapshot: self.ledger.snapshot().clone(),
-            blocks: self.blocks.clone(),
-            receipts: self.receipts.clone(),
-        };
+    fn broadcast_sync_status(&self) -> Result<()> {
         self.network.broadcast(
             &self.config.peers,
-            ProtocolMessage::SyncResponse {
-                responder_id: self.config.validator_id,
-                chain,
+            ProtocolMessage::SyncStatus {
+                validator_id: self.config.validator_id,
+                height: self.ledger.block_height(),
+                tip_hash: self.ledger.snapshot().tip_hash,
             },
         )
     }
@@ -1163,23 +1313,108 @@ impl NodeRunner {
             self.find_peer(validator_id)?,
             ProtocolMessage::SyncRequest {
                 requester_id: self.config.validator_id,
+                known_height: self.ledger.block_height(),
+                known_tip_hash: self.ledger.snapshot().tip_hash,
             },
         )
     }
 
-    fn push_chain_to(&self, validator_id: ValidatorId) -> Result<()> {
-        let chain = ChainSnapshot {
-            snapshot: self.ledger.snapshot().clone(),
-            blocks: self.blocks.clone(),
-            receipts: self.receipts.clone(),
-        };
+    fn push_best_sync_to(
+        &self,
+        validator_id: ValidatorId,
+        known_height: u64,
+        known_tip_hash: HashBytes,
+    ) -> Result<()> {
+        self.send_best_sync_to(validator_id, known_height, known_tip_hash)
+    }
+
+    fn send_best_sync_to(
+        &self,
+        validator_id: ValidatorId,
+        known_height: u64,
+        known_tip_hash: HashBytes,
+    ) -> Result<()> {
+        let peer = self.find_peer(validator_id)?;
+        if let Some(chain) = self.build_chain_segment(known_height, known_tip_hash) {
+            self.update_metrics(|metrics| {
+                metrics.incremental_sync_served += 1;
+            });
+            return self.network.send_to(
+                peer,
+                ProtocolMessage::SyncBlocks {
+                    responder_id: self.config.validator_id,
+                    chain,
+                },
+            );
+        }
+
+        self.send_full_snapshot_to(peer)
+    }
+
+    fn send_full_snapshot_to(&self, peer: PeerConfig) -> Result<()> {
+        let chain = self.build_chain_snapshot();
+        self.update_metrics(|metrics| {
+            metrics.full_sync_served += 1;
+        });
         self.network.send_to(
-            self.find_peer(validator_id)?,
+            peer,
             ProtocolMessage::SyncResponse {
                 responder_id: self.config.validator_id,
                 chain,
             },
         )
+    }
+
+    fn build_chain_snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            snapshot: self.ledger.snapshot().clone(),
+            blocks: self.blocks.clone(),
+            receipts: self.receipts.clone(),
+        }
+    }
+
+    fn build_chain_segment(
+        &self,
+        known_height: u64,
+        known_tip_hash: HashBytes,
+    ) -> Option<ChainSegment> {
+        build_chain_segment_from_chain(
+            self.ledger.snapshot(),
+            &self.blocks,
+            &self.receipts,
+            self.config.feature_flags.service_score_window_epochs,
+            known_height,
+            known_tip_hash,
+        )
+    }
+
+    fn push_sync_to_stale_peers(&self) -> Result<()> {
+        let local_height = self.ledger.block_height();
+        let local_tip_hash = self.ledger.snapshot().tip_hash;
+        for peer in &self.config.peers {
+            if let Some((known_height, known_tip_hash)) =
+                self.peer_sync_status.get(&peer.validator_id).copied()
+            {
+                if local_height > known_height
+                    || (local_height == known_height && local_tip_hash != known_tip_hash)
+                {
+                    self.send_best_sync_to(peer.validator_id, known_height, known_tip_hash)?;
+                }
+            } else if local_height > 0 {
+                self.send_full_snapshot_to(peer.clone())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_peer_sync_status(
+        &mut self,
+        validator_id: ValidatorId,
+        height: u64,
+        tip_hash: HashBytes,
+    ) {
+        self.peer_sync_status
+            .insert(validator_id, (height, tip_hash));
     }
 
     fn snapshot_metrics(&self) -> NodeMetrics {
@@ -1336,6 +1571,60 @@ fn receipt_event_hash(receipt: &RelayReceipt) -> HashBytes {
         receipt.message_class.clone(),
         receipt.sequence_number,
     ))
+}
+
+fn build_chain_segment_from_chain(
+    target_snapshot: &StateSnapshot,
+    blocks: &[Block],
+    receipts: &[RelayReceipt],
+    window_epochs: u64,
+    known_height: u64,
+    known_tip_hash: HashBytes,
+) -> Option<ChainSegment> {
+    if known_height >= blocks.len() as u64 {
+        return None;
+    }
+
+    let expected_tip_hash = if known_height == 0 {
+        empty_hash()
+    } else {
+        blocks
+            .get(known_height.saturating_sub(1) as usize)?
+            .block_hash
+    };
+    if expected_tip_hash != known_tip_hash {
+        return None;
+    }
+
+    let missing_blocks = blocks.get(known_height as usize..)?.to_vec();
+    if missing_blocks.is_empty() || missing_blocks.len() > MAX_INCREMENTAL_SYNC_BLOCKS {
+        return None;
+    }
+
+    let latest_epoch = blocks.last().map(|block| block.header.epoch).unwrap_or(0);
+    let earliest_recent_epoch = latest_epoch.saturating_sub(window_epochs.saturating_sub(1));
+    let base_epoch = if known_height == 0 {
+        0
+    } else {
+        blocks
+            .get(known_height.saturating_sub(1) as usize)
+            .map(|block| block.header.epoch)
+            .unwrap_or(0)
+    };
+    let earliest_receipt_epoch = earliest_recent_epoch.min(base_epoch.saturating_sub(1));
+    let recent_receipts = receipts
+        .iter()
+        .filter(|receipt| receipt.epoch >= earliest_receipt_epoch)
+        .cloned()
+        .collect();
+
+    Some(ChainSegment {
+        base_height: known_height,
+        base_tip_hash: known_tip_hash,
+        target_snapshot: target_snapshot.clone(),
+        blocks: missing_blocks,
+        receipts: recent_receipts,
+    })
 }
 
 fn validate_chain_snapshot(
@@ -1866,5 +2155,46 @@ mod tests {
 
         let error = validate_chain_snapshot(&genesis, &consensus, &crypto, &chain).unwrap_err();
         assert!(error.to_string().contains("unexpected proposer"));
+    }
+
+    #[test]
+    fn build_chain_segment_returns_missing_blocks_for_matching_tip() {
+        let genesis = sample_genesis();
+        let block = first_valid_block(&genesis);
+        let snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &[block.clone()],
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+
+        let segment =
+            build_chain_segment_from_chain(&snapshot, &[block.clone()], &[], 4, 0, empty_hash())
+                .expect("matching genesis tip should produce a segment");
+
+        assert_eq!(segment.base_height, 0);
+        assert_eq!(segment.base_tip_hash, empty_hash());
+        assert_eq!(segment.blocks, vec![block]);
+        assert!(segment.receipts.is_empty());
+        assert_eq!(segment.target_snapshot, snapshot);
+    }
+
+    #[test]
+    fn build_chain_segment_rejects_mismatched_tip() {
+        let genesis = sample_genesis();
+        let block = first_valid_block(&genesis);
+        let snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &[block.clone()],
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+
+        let segment = build_chain_segment_from_chain(&snapshot, &[block], &[], 4, 0, [9u8; 32]);
+        assert!(segment.is_none());
     }
 }

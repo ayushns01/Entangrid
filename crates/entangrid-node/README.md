@@ -38,7 +38,7 @@ The node then runs a few repeating tasks:
 - slot tick
 - inbox scan
 - metrics flush
-- sync request broadcast
+- sync request and sync status broadcast
 - incoming network event handling
 
 ### Slot tick behavior
@@ -127,7 +127,7 @@ It already does a lot:
 - block production
 - block validation
 - mempool handling
-- sync requests/responses
+- sync status announcements, sync requests/responses, and incremental catch-up
 - heartbeat broadcasting
 - receipt generation and storage
 - file-backed persistence
@@ -148,8 +148,10 @@ The recent validation-focused improvement in this crate was about correctness un
 - commitment validation now uses explicit proof data from the block
 - stricter receipt assignment checks are enforced
 - malformed peer data is rejected locally instead of taking the node down
-- when a peer appears to be on a stale or forked branch, the node now pushes its own longer chain snapshot back to that peer instead of only asking for sync in the opposite direction
-- nodes now also broadcast their current chain snapshot on the periodic sync tick, so a heavily degraded peer can still recover through inbound sync traffic even if it cannot send a clean sync request itself
+- the periodic sync tick now broadcasts lightweight `SyncStatus` instead of a full chain snapshot
+- when a peer is on the same branch but behind, the node now prefers an incremental block segment over a full snapshot
+- when a peer is unknown, diverged, or cannot advertise its stale state, the node falls back to a full snapshot so recovery still works
+- repeated sync requests from the same peer are throttled, which makes the prototype harder to abuse without breaking recovery
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 
 But it is still intentionally early-stage.
