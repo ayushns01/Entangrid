@@ -78,6 +78,13 @@ Recent improvement:
 
 The counters themselves now use the shared `ServiceCounters` type from `entangrid-types`, which makes it easier for the node runtime and metrics output to explain why a score is high or low.
 
+Current runtime detail:
+
+- the node now feeds real penalty inputs into those counters instead of leaving them as placeholders
+- failed outbound session attempts penalize the local validator only when an assigned relay target could not be reached, and only once per target per epoch
+- invalid receipts penalize the witness validator that signed them
+- so the `minus penalties` part of the formula is now active in the running prototype, not just present in the math
+
 ### Commitments
 
 The crate can summarize receipts into a `TopologyCommitment`.

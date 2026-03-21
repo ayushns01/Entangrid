@@ -93,6 +93,7 @@ It is useful for quickly checking:
 - missed proposer slots
 - gating rejections
 - duplicate receipts that were ignored
+- failed-session and invalid-receipt penalties from the latest local score window
 - high-level proposer and validation activity
 
 ### `matrix`
@@ -114,7 +115,7 @@ For each scenario it:
 - runs the configured load
 - waits for convergence during a bounded settle window
 - captures the structural/localnet report at that converged moment
-- checks scenario-specific expectations such as "the degraded validator had the lowest score" and, in the harshest cases, "that validator was actually gated"
+- checks scenario-specific expectations such as "the degraded validator had the lowest score", "that validator was actually gated" in the harshest cases, and "baseline validators stayed above a minimum score floor"
 - shuts the nodes down
 - verifies structural chain health
 - writes Markdown and JSON summaries under the chosen output directory
@@ -123,6 +124,7 @@ Recent improvement:
 
 - matrix shutdown now interrupts all validators together before a hard kill, which makes the generated reports much less likely to trip over truncated final JSONL appends or shutdown-induced chain skew
 - matrix/report JSONL readers now ignore only a truncated trailing line, so interrupted runs are easier to inspect without hiding mid-file corruption
+- localnet and matrix summaries now expose the penalty counters behind each validator's current score, which makes threshold and score-window tuning much easier to compare across runs
 
 ### Fault and degradation controls
 

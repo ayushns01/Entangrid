@@ -121,6 +121,8 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         latest_service_counters: BTreeMap::new(),
         failed_sessions: 0,
         invalid_receipts: 0,
+        observed_failed_sessions: BTreeSet::new(),
+        observed_invalid_receipts: BTreeMap::new(),
     };
     runner.rebuild_seen_sets();
     runner.run().await
@@ -152,6 +154,8 @@ struct NodeRunner {
     latest_service_counters: BTreeMap<ValidatorId, ServiceCounters>,
     failed_sessions: u64,
     invalid_receipts: u64,
+    observed_failed_sessions: BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
+    observed_invalid_receipts: BTreeMap<(Epoch, ValidatorId), u64>,
 }
 
 impl NodeRunner {
@@ -312,7 +316,7 @@ impl NodeRunner {
                 self.log_event(
                     "service-gating-check",
                     format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
+                        "slot {slot} local_score {score:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                         self.service_gating_threshold(),
                         self.config.feature_flags.service_score_window_epochs,
                         counters.uptime_windows,
@@ -320,7 +324,9 @@ impl NodeRunner {
                         counters.timely_deliveries,
                         counters.expected_deliveries,
                         counters.distinct_peers,
-                        counters.expected_peers
+                        counters.expected_peers,
+                        counters.failed_sessions,
+                        counters.invalid_receipts
                     ),
                 )?;
                 if score < self.service_gating_threshold() {
@@ -334,7 +340,7 @@ impl NodeRunner {
                     self.log_event(
                         "missed-slot",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} uptime {}/{} timely {}/{} peers {}/{}",
+                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                             self.service_gating_threshold(),
                             self.config.feature_flags.service_score_window_epochs,
                             counters.uptime_windows,
@@ -342,7 +348,9 @@ impl NodeRunner {
                             counters.timely_deliveries,
                             counters.expected_deliveries,
                             counters.distinct_peers,
-                            counters.expected_peers
+                            counters.expected_peers,
+                            counters.failed_sessions,
+                            counters.invalid_receipts
                         ),
                     )?;
                     self.persist_metrics()?;
@@ -484,6 +492,13 @@ impl NodeRunner {
                 detail,
             } => {
                 self.failed_sessions += 1;
+                if let Some(peer_validator_id) = peer_validator_id {
+                    self.record_failed_session(
+                        self.current_epoch(),
+                        self.config.validator_id,
+                        peer_validator_id,
+                    );
+                }
                 self.update_metrics(|metrics| {
                     metrics.handshake_failures += 1;
                 });
@@ -795,10 +810,12 @@ impl NodeRunner {
         )?;
         if !verified {
             self.invalid_receipts += 1;
+            self.record_invalid_receipt(receipt.epoch, receipt.witness_validator_id);
             return Err(anyhow!("invalid receipt signature"));
         }
         if let Err(error) = self.consensus.validate_receipt_assignment(receipt) {
             self.invalid_receipts += 1;
+            self.record_invalid_receipt(receipt.epoch, receipt.witness_validator_id);
             return Err(anyhow!(error));
         }
         Ok(())
@@ -1077,15 +1094,18 @@ impl NodeRunner {
 
         let window_epochs = self.config.feature_flags.service_score_window_epochs.max(1);
         let earliest_epoch = completed_epoch.saturating_sub(window_epochs.saturating_sub(1));
+        self.prune_penalty_observations(earliest_epoch);
         for validator_id in validator_ids {
             let mut aggregate = ServiceCounters::default();
             for epoch in earliest_epoch..=completed_epoch {
+                let failed_sessions = self.failed_sessions_for(validator_id, epoch);
+                let invalid_receipts = self.invalid_receipts_for(validator_id, epoch);
                 let counters = self.consensus.counters_for_validator(
                     validator_id,
                     epoch,
                     &self.receipts,
-                    0,
-                    0,
+                    failed_sessions,
+                    invalid_receipts,
                 );
                 let weight = epoch.saturating_sub(earliest_epoch) + 1;
                 accumulate_weighted_counters(&mut aggregate, &counters, weight);
@@ -1125,6 +1145,12 @@ impl NodeRunner {
             .get(&self.config.validator_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn current_epoch(&self) -> Epoch {
+        self.last_processed_slot
+            .map(|slot| self.consensus.epoch_for_slot(slot))
+            .unwrap_or_else(|| self.consensus.epoch_for_slot(self.consensus.current_slot()))
     }
 
     fn service_gating_active(&self, epoch: Epoch) -> bool {
@@ -1221,6 +1247,52 @@ impl NodeRunner {
         }
     }
 
+    fn record_failed_session(
+        &mut self,
+        epoch: Epoch,
+        validator_id: ValidatorId,
+        peer_validator_id: ValidatorId,
+    ) {
+        if !self
+            .consensus
+            .is_relay_target_for(validator_id, peer_validator_id, epoch)
+        {
+            return;
+        }
+        self.observed_failed_sessions
+            .insert((epoch, validator_id, peer_validator_id));
+    }
+
+    fn record_invalid_receipt(&mut self, epoch: Epoch, validator_id: ValidatorId) {
+        *self
+            .observed_invalid_receipts
+            .entry((epoch, validator_id))
+            .or_default() += 1;
+    }
+
+    fn failed_sessions_for(&self, validator_id: ValidatorId, epoch: Epoch) -> u64 {
+        self.observed_failed_sessions
+            .iter()
+            .filter(|(recorded_epoch, recorded_validator_id, _)| {
+                *recorded_epoch == epoch && *recorded_validator_id == validator_id
+            })
+            .count() as u64
+    }
+
+    fn invalid_receipts_for(&self, validator_id: ValidatorId, epoch: Epoch) -> u64 {
+        self.observed_invalid_receipts
+            .get(&(epoch, validator_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn prune_penalty_observations(&mut self, earliest_epoch: Epoch) {
+        self.observed_failed_sessions
+            .retain(|(epoch, _, _)| *epoch >= earliest_epoch);
+        self.observed_invalid_receipts
+            .retain(|(epoch, _), _| *epoch >= earliest_epoch);
+    }
+
     fn log_event(&self, event: impl Into<String>, detail: impl Into<String>) -> Result<()> {
         let entry = EventLogEntry {
             timestamp_unix_millis: now_unix_millis(),
@@ -1237,7 +1309,7 @@ impl NodeRunner {
             return self.log_event(
                 "service-score",
                 format!(
-                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
+                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                     self.config.feature_flags.service_gating_start_epoch,
                     self.service_score_for_validator(self.config.validator_id),
                     self.service_gating_threshold(),
@@ -1247,7 +1319,9 @@ impl NodeRunner {
                     counters.timely_deliveries,
                     counters.expected_deliveries,
                     counters.distinct_peers,
-                    counters.expected_peers
+                    counters.expected_peers,
+                    counters.failed_sessions,
+                    counters.invalid_receipts
                 ),
             );
         }
@@ -1255,7 +1329,7 @@ impl NodeRunner {
         self.log_event(
             "service-score",
             format!(
-                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
+                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                 epoch.saturating_sub(1),
                 self.service_score_for_validator(self.config.validator_id),
                 self.service_gating_threshold(),
@@ -1265,7 +1339,9 @@ impl NodeRunner {
                 counters.timely_deliveries,
                 counters.expected_deliveries,
                 counters.distinct_peers,
-                counters.expected_peers
+                counters.expected_peers,
+                counters.failed_sessions,
+                counters.invalid_receipts
             ),
         )
     }

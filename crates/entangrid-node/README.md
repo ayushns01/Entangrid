@@ -100,6 +100,9 @@ The node also:
 - respects a configurable `service_gating_start_epoch` instead of using a fixed warmup epoch
 - respects a configurable `service_gating_threshold` instead of using a hard-coded rejection line
 - respects a configurable rolling service-score window length
+- now feeds two real penalty sources into the score instead of leaving them at zero:
+  - failed outbound session attempts count against the local validator only when an assigned relay target could not be reached, and only once per target per epoch
+  - invalid receipts count against the witness validator that signed them
 - records the latest local score breakdown in metrics and logs
 - drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
 - writes metrics more eagerly around block and slot transitions so localnet reports stay closer to the saved chain state
@@ -110,6 +113,7 @@ That means the node can now explain service gating in a much more concrete way:
 - how many uptime windows were observed
 - how many deliveries were timely
 - how many peers were actually reached
+- how many failed sessions and invalid receipts were counted as penalties
 
 ## What this crate is today
 

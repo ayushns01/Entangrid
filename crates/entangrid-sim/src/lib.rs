@@ -109,6 +109,7 @@ struct MatrixScenario {
     load_duration_secs: u64,
     settle_secs: u64,
     expected_lowest_validator: Option<u64>,
+    min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
 }
@@ -492,6 +493,7 @@ async fn run_matrix_scenario(
         gating_enabled: scenario.enable_service_gating,
         gating_threshold: scenario.service_gating_threshold,
         expected_lowest_validator: scenario.expected_lowest_validator,
+        min_lowest_score: scenario.min_lowest_score,
         max_lowest_score: scenario.max_lowest_score,
         min_validator_gating_rejections: scenario.min_validator_gating_rejections,
         localnet_report,
@@ -551,6 +553,16 @@ fn scenario_expectations_met(
         }
     }
 
+    if let Some(min_score) = scenario.min_lowest_score {
+        if localnet_report
+            .lowest_score
+            .map(|(_, score)| score < min_score)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+
     if let Some(max_score) = scenario.max_lowest_score {
         if localnet_report
             .lowest_score
@@ -596,6 +608,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_duration_secs: 12,
             settle_secs,
             expected_lowest_validator: None,
+            min_lowest_score: Some(0.95),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
         },
@@ -617,6 +630,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_duration_secs: 18,
             settle_secs,
             expected_lowest_validator: None,
+            min_lowest_score: Some(0.45),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
         },
@@ -638,6 +652,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_duration_secs: 18,
             settle_secs,
             expected_lowest_validator: Some(4),
+            min_lowest_score: None,
             max_lowest_score: Some(0.85),
             min_validator_gating_rejections: None,
         },
@@ -659,6 +674,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_duration_secs: 20,
             settle_secs,
             expected_lowest_validator: Some(3),
+            min_lowest_score: None,
             max_lowest_score: Some(0.20),
             min_validator_gating_rejections: Some((3, 1)),
         },
@@ -680,6 +696,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_duration_secs: 20,
             settle_secs,
             expected_lowest_validator: Some(3),
+            min_lowest_score: None,
             max_lowest_score: Some(0.05),
             min_validator_gating_rejections: Some((3, 1)),
         },
@@ -815,6 +832,8 @@ struct ValidatorReport {
     current_epoch: u64,
     current_slot: u64,
     last_local_service_score: f64,
+    failed_sessions: u64,
+    invalid_receipts: u64,
     service_gating_rejections: u64,
     missed_proposer_slots: u64,
     duplicate_receipts_ignored: u64,
@@ -867,6 +886,7 @@ struct MatrixScenarioResult {
     gating_enabled: bool,
     gating_threshold: f64,
     expected_lowest_validator: Option<u64>,
+    min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
     localnet_report: LocalnetReport,
@@ -909,11 +929,13 @@ impl LocalnetReport {
         }
         for validator in &self.validators {
             lines.push(format!(
-                "validator {}: epoch {} slot {} score {:.3} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {}",
+                "validator {}: epoch {} slot {} score {:.3} failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {}",
                 validator.validator_id,
                 validator.current_epoch,
                 validator.current_slot,
                 validator.last_local_service_score,
+                validator.failed_sessions,
+                validator.invalid_receipts,
                 validator.blocks_proposed,
                 validator.blocks_validated,
                 validator.tx_ingress,
@@ -935,6 +957,12 @@ impl MatrixScenarioResult {
             && self.structural_report.all_stderr_clean
             && self.expected_lowest_validator.is_none_or(|validator_id| {
                 self.localnet_report.lowest_score.map(|(actual, _)| actual) == Some(validator_id)
+            })
+            && self.min_lowest_score.is_none_or(|min_score| {
+                self.localnet_report
+                    .lowest_score
+                    .map(|(_, score)| score >= min_score)
+                    .unwrap_or(false)
             })
             && self.max_lowest_score.is_none_or(|max_score| {
                 self.localnet_report
@@ -1049,16 +1077,15 @@ impl MatrixReport {
                 scenario.structural_report.all_stderr_clean
             ));
             lines.push(String::new());
-            lines.push(
-                "| Validator | Score | Proposed | Validated | Missed | Gated | Receipts |"
-                    .to_string(),
-            );
-            lines.push("|---|---|---|---|---|---|---|".to_string());
+            lines.push("| Validator | Score | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts |".to_string());
+            lines.push("|---|---|---|---|---|---|---|---|---|".to_string());
             for validator in &scenario.localnet_report.validators {
                 lines.push(format!(
-                    "| {} | {:.3} | {} | {} | {} | {} | {} |",
+                    "| {} | {:.3} | {} | {} | {} | {} | {} | {} | {} |",
                     validator.validator_id,
                     validator.last_local_service_score,
+                    validator.failed_sessions,
+                    validator.invalid_receipts,
                     validator.blocks_proposed,
                     validator.blocks_validated,
                     validator.missed_proposer_slots,
@@ -1096,6 +1123,8 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
             current_epoch: metrics.current_epoch,
             current_slot: metrics.current_slot,
             last_local_service_score: metrics.last_local_service_score,
+            failed_sessions: metrics.last_local_service_counters.failed_sessions,
+            invalid_receipts: metrics.last_local_service_counters.invalid_receipts,
             service_gating_rejections: metrics.service_gating_rejections,
             missed_proposer_slots: metrics.missed_proposer_slots,
             duplicate_receipts_ignored: metrics.duplicate_receipts_ignored,
@@ -1424,6 +1453,10 @@ mod tests {
                 current_epoch: 4,
                 current_slot: 19,
                 last_local_service_score: 0.85,
+                last_local_service_counters: entangrid_types::ServiceCounters {
+                    failed_sessions: 1,
+                    ..Default::default()
+                },
                 blocks_proposed: 3,
                 blocks_validated: 7,
                 tx_ingress: 11,
@@ -1443,6 +1476,10 @@ mod tests {
                 current_epoch: 4,
                 current_slot: 19,
                 last_local_service_score: 0.25,
+                last_local_service_counters: entangrid_types::ServiceCounters {
+                    invalid_receipts: 2,
+                    ..Default::default()
+                },
                 blocks_proposed: 1,
                 blocks_validated: 6,
                 tx_ingress: 8,
@@ -1464,6 +1501,8 @@ mod tests {
         assert_eq!(report.total_duplicate_receipts_ignored, 4);
         assert_eq!(report.highest_score, Some((1, 0.85)));
         assert_eq!(report.lowest_score, Some((2, 0.25)));
+        assert_eq!(report.validators[0].failed_sessions, 1);
+        assert_eq!(report.validators[1].invalid_receipts, 2);
     }
 
     #[test]
@@ -1532,6 +1571,7 @@ mod tests {
                 gating_enabled: true,
                 gating_threshold: 0.40,
                 expected_lowest_validator: Some(4),
+                min_lowest_score: None,
                 max_lowest_score: Some(0.30),
                 min_validator_gating_rejections: Some((4, 1)),
                 localnet_report: LocalnetReport {
@@ -1549,6 +1589,8 @@ mod tests {
                         current_epoch: 4,
                         current_slot: 19,
                         last_local_service_score: 0.25,
+                        failed_sessions: 1,
+                        invalid_receipts: 2,
                         service_gating_rejections: 2,
                         missed_proposer_slots: 2,
                         duplicate_receipts_ignored: 0,
@@ -1588,6 +1630,7 @@ mod tests {
             gating_enabled: true,
             gating_threshold: 0.40,
             expected_lowest_validator: Some(4),
+            min_lowest_score: None,
             max_lowest_score: Some(0.30),
             min_validator_gating_rejections: Some((4, 1)),
             localnet_report: LocalnetReport {
@@ -1605,6 +1648,8 @@ mod tests {
                     current_epoch: 4,
                     current_slot: 19,
                     last_local_service_score: 0.35,
+                    failed_sessions: 0,
+                    invalid_receipts: 0,
                     service_gating_rejections: 0,
                     missed_proposer_slots: 0,
                     duplicate_receipts_ignored: 0,

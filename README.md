@@ -168,12 +168,13 @@ cargo run -p entangrid-sim -- matrix \
   --settle-secs 18
 ```
 
-The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking.
+The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking. Those expectations now cover both sides of the policy: harsh degraded runs must actually gate the targeted validator, and baseline runs must keep honest validators above a minimum score floor.
+The localnet reports now also surface the penalty inputs behind the latest score, including failed session counts and invalid receipts, so threshold and window tuning is easier to inspect from one run to the next.
 
 Then inspect:
 
 - `node-4/events.log` for missed slots due to low service score
-- `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `service_gating_start_epoch`, the latest local score, and the latest local service counters
+- `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `service_gating_start_epoch`, the latest local score, and the latest local service counters, including any failed-session or invalid-receipt penalties that contributed to that score
 
 ## Guiding Principle
 
