@@ -85,6 +85,9 @@ Recent improvement:
 - accepted blocks can import commitment receipt bundles into local receipt storage
 - this prevents degraded nodes from crashing on `receipt root mismatch` just because their local receipt cache differed from the proposer’s
 - the node now handles interrupt and terminate signals by flushing its latest snapshot and metrics before exiting
+- sync snapshot adoption now validates the incoming block history structurally instead of trusting raw replay alone
+- sync snapshot adoption now validates and deduplicates incoming receipts before they can influence local service scores
+- this closes a class of sync-poisoning bugs where a malicious peer could try to inject invalid receipt evidence or an invalid longer chain through `SyncResponse`
 
 If the parent is unknown, the block is stored as an orphan.
 

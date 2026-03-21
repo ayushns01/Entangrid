@@ -16,6 +16,8 @@ use tokio::{
     sync::mpsc,
 };
 
+const MAX_FRAME_SIZE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
     Received {
@@ -218,6 +220,16 @@ async fn handle_inbound(
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
     let frame_len = stream.read_u32().await? as usize;
+    if frame_len > MAX_FRAME_SIZE_BYTES {
+        update_metrics(&metrics, |metrics| {
+            metrics.handshake_failures += 1;
+            metrics.active_sessions = 0;
+        });
+        return Err(anyhow!(
+            "frame length {frame_len} exceeds max {}",
+            MAX_FRAME_SIZE_BYTES
+        ));
+    }
     let mut frame = vec![0u8; frame_len];
     stream.read_exact(&mut frame).await?;
 
@@ -290,5 +302,17 @@ fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut No
     if let Ok(mut metrics) = metrics.lock() {
         update(&mut metrics);
         metrics.last_updated_unix_millis = entangrid_types::now_unix_millis();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_oversized_inbound_frame() {
+        assert!(MAX_FRAME_SIZE_BYTES < usize::MAX);
+        let oversized = MAX_FRAME_SIZE_BYTES + 1;
+        assert!(oversized > MAX_FRAME_SIZE_BYTES);
     }
 }

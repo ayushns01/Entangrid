@@ -63,6 +63,11 @@ On receive, the crate:
 - verifies the signature
 - emits a `NetworkEvent::Received` only if validation passes
 
+Recent hardening:
+
+- inbound frames now have a fixed maximum size before allocation
+- oversized frames are rejected early instead of letting an attacker force unbounded memory growth through a large declared frame length
+
 ### Session observations
 
 The crate also asks the crypto backend to derive session material so the node can observe transcript/session events.

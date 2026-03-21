@@ -170,6 +170,11 @@ cargo run -p entangrid-sim -- matrix \
 
 The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking. Those expectations now cover both sides of the policy: harsh degraded runs must actually gate the targeted validator, and baseline runs must keep honest validators above a minimum score floor.
 The localnet reports now also surface the penalty inputs behind the latest score, including failed session counts and invalid receipts, so threshold and window tuning is easier to inspect from one run to the next.
+Recent hardening also tightened two protocol-surface issues found during adversarial review:
+
+- sync snapshot adoption now validates incoming blocks structurally instead of trusting raw ledger replay alone
+- sync snapshot adoption now validates incoming receipt bundles before they can affect local service scoring
+- inbound network frames now have a fixed maximum size to avoid unbounded allocation on a malicious length prefix
 
 Then inspect:
 

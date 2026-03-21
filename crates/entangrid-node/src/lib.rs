@@ -970,36 +970,12 @@ impl NodeRunner {
         commitment: &TopologyCommitment,
         commitment_receipts: &[RelayReceipt],
     ) -> Result<()> {
-        let mut exact_hashes = BTreeSet::new();
-        let mut event_hashes = BTreeSet::new();
-        for receipt in commitment_receipts {
-            if receipt.source_validator_id != commitment.validator_id {
-                return Err(anyhow!("commitment receipt source mismatch"));
-            }
-            if receipt.epoch != commitment.epoch {
-                return Err(anyhow!("commitment receipt epoch mismatch"));
-            }
-            self.validate_receipt(receipt)?;
-            let receipt_hash = canonical_hash(receipt);
-            if !exact_hashes.insert(receipt_hash) {
-                return Err(anyhow!("duplicate receipt in commitment"));
-            }
-            let event_hash = receipt_event_hash(receipt);
-            if !event_hashes.insert(event_hash) {
-                return Err(anyhow!("duplicate receipt event in commitment"));
-            }
-        }
-        let expected = self.consensus.commitment_from_receipts(
-            commitment.validator_id,
-            commitment.epoch,
+        validate_commitment_bundle(
+            &self.consensus,
+            self.crypto.as_ref(),
+            commitment,
             commitment_receipts,
-            0,
-            0,
-        );
-        if expected != *commitment {
-            return Err(anyhow!("receipt root mismatch"));
-        }
-        Ok(())
+        )
     }
 
     fn import_commitment_receipts(&mut self, receipts: &[RelayReceipt]) -> Result<()> {
@@ -1036,14 +1012,11 @@ impl NodeRunner {
     }
 
     fn apply_chain_snapshot(&mut self, chain: ChainSnapshot) -> Result<()> {
-        let ledger =
-            LedgerState::replay_blocks(&self.genesis, &chain.blocks, self.crypto.as_ref())?;
-        if ledger.snapshot() != &chain.snapshot {
-            return Err(anyhow!("snapshot replay mismatch"));
-        }
+        let (ledger, receipts) =
+            validate_chain_snapshot(&self.genesis, &self.consensus, self.crypto.as_ref(), &chain)?;
         self.ledger = ledger;
         self.blocks = chain.blocks;
-        self.receipts = chain.receipts;
+        self.receipts = receipts;
         self.rebuild_seen_sets();
         self.storage.write_snapshot(self.ledger.snapshot())?;
         self.storage
@@ -1365,6 +1338,167 @@ fn receipt_event_hash(receipt: &RelayReceipt) -> HashBytes {
     ))
 }
 
+fn validate_chain_snapshot(
+    genesis: &GenesisConfig,
+    consensus: &ConsensusEngine,
+    crypto: &dyn CryptoBackend,
+    chain: &ChainSnapshot,
+) -> Result<(LedgerState, Vec<RelayReceipt>)> {
+    let receipts = validate_snapshot_receipts(consensus, crypto, &chain.receipts)?;
+    let mut ledger = LedgerState::from_genesis(genesis);
+    let mut expected_parent_hash = empty_hash();
+
+    for block in &chain.blocks {
+        validate_snapshot_block(consensus, crypto, &ledger, block, expected_parent_hash)?;
+        let mut next_ledger = ledger.clone();
+        next_ledger.apply_block(block, crypto)?;
+        ledger = next_ledger;
+        expected_parent_hash = block.block_hash;
+    }
+
+    if ledger.snapshot() != &chain.snapshot {
+        return Err(anyhow!("snapshot replay mismatch"));
+    }
+
+    Ok((ledger, receipts))
+}
+
+fn validate_snapshot_receipts(
+    consensus: &ConsensusEngine,
+    crypto: &dyn CryptoBackend,
+    receipts: &[RelayReceipt],
+) -> Result<Vec<RelayReceipt>> {
+    let mut exact_hashes = BTreeSet::new();
+    let mut event_hashes = BTreeSet::new();
+    let mut sanitized = Vec::with_capacity(receipts.len());
+
+    for receipt in receipts {
+        let receipt_hash = canonical_hash(receipt);
+        if !exact_hashes.insert(receipt_hash) {
+            return Err(anyhow!("duplicate receipt in snapshot"));
+        }
+        let event_hash = receipt_event_hash(receipt);
+        if !event_hashes.insert(event_hash) {
+            return Err(anyhow!("duplicate receipt event in snapshot"));
+        }
+
+        let receipt_hash_to_verify = receipt_signing_hash(receipt);
+        let verified = crypto.verify(
+            receipt.witness_validator_id,
+            &receipt_hash_to_verify,
+            &receipt.signature,
+        )?;
+        if !verified {
+            return Err(anyhow!("invalid receipt signature in snapshot"));
+        }
+        consensus
+            .validate_receipt_assignment(receipt)
+            .map_err(|error| anyhow!(error))?;
+        sanitized.push(receipt.clone());
+    }
+
+    Ok(sanitized)
+}
+
+fn validate_snapshot_block(
+    consensus: &ConsensusEngine,
+    crypto: &dyn CryptoBackend,
+    ledger: &LedgerState,
+    block: &Block,
+    expected_parent_hash: HashBytes,
+) -> Result<()> {
+    let expected_hash =
+        canonical_hash(&(block.header.clone(), &block.transactions, &block.commitment));
+    if expected_hash != block.block_hash {
+        return Err(anyhow!("block hash mismatch in snapshot"));
+    }
+    let verified = crypto.verify(
+        block.header.proposer_id,
+        &block.block_hash,
+        &block.signature,
+    )?;
+    if !verified {
+        return Err(anyhow!("invalid block signature in snapshot"));
+    }
+    if block.header.block_number != ledger.block_height() + 1 {
+        return Err(anyhow!("unexpected block number in snapshot"));
+    }
+    consensus
+        .validate_block_basic(block, expected_parent_hash, None, false, 0.0)
+        .map_err(|error| anyhow!(error))?;
+
+    let transactions_root = canonical_hash(&block.transactions);
+    if transactions_root != block.header.transactions_root {
+        return Err(anyhow!("transactions root mismatch in snapshot"));
+    }
+    let topology_root = block
+        .commitment
+        .as_ref()
+        .map(canonical_hash)
+        .unwrap_or_else(empty_hash);
+    if topology_root != block.header.topology_root {
+        return Err(anyhow!("topology root mismatch in snapshot"));
+    }
+
+    if block.commitment.is_none() && !block.commitment_receipts.is_empty() {
+        return Err(anyhow!("commitment receipts present without commitment"));
+    }
+    if let Some(commitment) = &block.commitment {
+        validate_commitment_bundle(consensus, crypto, commitment, &block.commitment_receipts)?;
+    }
+
+    Ok(())
+}
+
+fn validate_commitment_bundle(
+    consensus: &ConsensusEngine,
+    crypto: &dyn CryptoBackend,
+    commitment: &TopologyCommitment,
+    commitment_receipts: &[RelayReceipt],
+) -> Result<()> {
+    let mut exact_hashes = BTreeSet::new();
+    let mut event_hashes = BTreeSet::new();
+    for receipt in commitment_receipts {
+        if receipt.source_validator_id != commitment.validator_id {
+            return Err(anyhow!("commitment receipt source mismatch"));
+        }
+        if receipt.epoch != commitment.epoch {
+            return Err(anyhow!("commitment receipt epoch mismatch"));
+        }
+        let receipt_hash_to_verify = receipt_signing_hash(receipt);
+        let verified = crypto.verify(
+            receipt.witness_validator_id,
+            &receipt_hash_to_verify,
+            &receipt.signature,
+        )?;
+        if !verified {
+            return Err(anyhow!("invalid commitment receipt signature"));
+        }
+        consensus
+            .validate_receipt_assignment(receipt)
+            .map_err(|error| anyhow!(error))?;
+        let receipt_hash = canonical_hash(receipt);
+        if !exact_hashes.insert(receipt_hash) {
+            return Err(anyhow!("duplicate receipt in commitment"));
+        }
+        let event_hash = receipt_event_hash(receipt);
+        if !event_hashes.insert(event_hash) {
+            return Err(anyhow!("duplicate receipt event in commitment"));
+        }
+    }
+    let expected = consensus.commitment_from_receipts(
+        commitment.validator_id,
+        commitment.epoch,
+        commitment_receipts,
+        0,
+        0,
+    );
+    if expected != *commitment {
+        return Err(anyhow!("receipt root mismatch"));
+    }
+    Ok(())
+}
+
 fn accumulate_weighted_counters(
     aggregate: &mut ServiceCounters,
     counters: &ServiceCounters,
@@ -1546,7 +1680,41 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+    use entangrid_types::{
+        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, empty_hash,
+        validator_account,
+    };
+
     use super::*;
+
+    fn sample_genesis() -> GenesisConfig {
+        let mut balances = BTreeMap::new();
+        for validator_id in 1..=4 {
+            balances.insert(validator_account(validator_id), 1_000);
+        }
+        GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: (1..=4)
+                .map(|validator_id| ValidatorConfig {
+                    validator_id,
+                    stake: 100,
+                    address: format!("127.0.0.1:{}", 4100 + validator_id),
+                    dev_secret: format!("secret-{validator_id}"),
+                    public_identity: vec![],
+                })
+                .collect(),
+            initial_balances: balances,
+        }
+    }
 
     fn sample_receipt() -> RelayReceipt {
         RelayReceipt {
@@ -1561,6 +1729,56 @@ mod tests {
             byte_count_bucket: 8,
             sequence_number: 7,
             signature: vec![1, 2, 3],
+        }
+    }
+
+    fn first_valid_block(genesis: &GenesisConfig) -> Block {
+        let crypto = DeterministicCryptoBackend::from_genesis(genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let mut ledger = LedgerState::from_genesis(genesis);
+
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: Some("sync-test".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed_transaction = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+        ledger.apply_transaction(&signed_transaction).unwrap();
+
+        let slot = (0..20)
+            .find(|slot| consensus.proposer_for_slot(*slot) == 1)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = vec![signed_transaction];
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number: 1,
+            parent_hash: empty_hash(),
+            slot,
+            epoch,
+            proposer_id: 1,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(1, &block_hash).unwrap(),
+            block_hash,
         }
     }
 
@@ -1605,5 +1823,48 @@ mod tests {
             .load_json_lines::<RelayReceipt>(&storage.receipts_path)
             .unwrap();
         assert_eq!(receipts.len(), 1);
+    }
+
+    #[test]
+    fn validate_chain_snapshot_rejects_invalid_receipts() {
+        let genesis = sample_genesis();
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let mut receipt = sample_receipt();
+        receipt.epoch = 0;
+        receipt.slot = 0;
+        receipt.source_validator_id = 1;
+        receipt.destination_validator_id = 2;
+        receipt.witness_validator_id = 2;
+        receipt.signature = vec![9, 9, 9];
+        let chain = ChainSnapshot {
+            snapshot: LedgerState::from_genesis(&genesis).snapshot().clone(),
+            blocks: Vec::new(),
+            receipts: vec![receipt],
+        };
+
+        let error = validate_chain_snapshot(&genesis, &consensus, &crypto, &chain).unwrap_err();
+        assert!(error.to_string().contains("invalid receipt signature"));
+    }
+
+    #[test]
+    fn validate_chain_snapshot_rejects_invalid_block_schedule() {
+        let genesis = sample_genesis();
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let mut block = first_valid_block(&genesis);
+        let wrong_proposer = 2;
+        block.header.proposer_id = wrong_proposer;
+        block.block_hash =
+            canonical_hash(&(block.header.clone(), &block.transactions, &block.commitment));
+        block.signature = crypto.sign(wrong_proposer, &block.block_hash).unwrap();
+        let chain = ChainSnapshot {
+            snapshot: LedgerState::from_genesis(&genesis).snapshot().clone(),
+            blocks: vec![block],
+            receipts: Vec::new(),
+        };
+
+        let error = validate_chain_snapshot(&genesis, &consensus, &crypto, &chain).unwrap_err();
+        assert!(error.to_string().contains("unexpected proposer"));
     }
 }
