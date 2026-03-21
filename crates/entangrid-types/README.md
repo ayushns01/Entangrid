@@ -61,6 +61,7 @@ Right now this crate is intentionally simple and very central.
   - receipt enablement
   - service-gating enablement
   - the epoch where gating should start
+  - the score threshold used by service gating
   - the number of epochs included in the rolling service-score window
 - `ServiceCounters` is the shared score-breakdown struct used to describe:
   - uptime windows

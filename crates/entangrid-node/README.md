@@ -84,6 +84,7 @@ Recent improvement:
 - the node no longer tries to recompute commitment roots from whatever local receipt gossip it happened to see
 - accepted blocks can import commitment receipt bundles into local receipt storage
 - this prevents degraded nodes from crashing on `receipt root mismatch` just because their local receipt cache differed from the proposer’s
+- the node now handles interrupt and terminate signals by flushing its latest snapshot and metrics before exiting
 
 If the parent is unknown, the block is stored as an orphan.
 
@@ -97,6 +98,7 @@ The node also:
 - computes rolling service scores
 - optionally rejects local block production if its score is below threshold
 - respects a configurable `service_gating_start_epoch` instead of using a fixed warmup epoch
+- respects a configurable `service_gating_threshold` instead of using a hard-coded rejection line
 - respects a configurable rolling service-score window length
 - records the latest local score breakdown in metrics and logs
 - drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
@@ -127,6 +129,7 @@ It already does a lot:
 The recent gating-focused improvement in this crate was mostly about observability and control:
 
 - service gating start is now configurable per localnet
+- service gating threshold is now configurable per localnet
 - the rolling score window is now configurable per localnet
 - proposer checks log the counters behind the score
 - missed slots log the reason more clearly
@@ -140,6 +143,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - malformed peer data is rejected locally instead of taking the node down
 - when a peer appears to be on a stale or forked branch, the node now pushes its own longer chain snapshot back to that peer instead of only asking for sync in the opposite direction
 - nodes now also broadcast their current chain snapshot on the periodic sync tick, so a heavily degraded peer can still recover through inbound sync traffic even if it cannot send a clean sync request itself
+- startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 
 But it is still intentionally early-stage.
 

@@ -26,7 +26,6 @@ const SNAPSHOT_FILE: &str = "state_snapshot.json";
 const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
-const SERVICE_GATING_THRESHOLD: f64 = 0.40;
 
 #[derive(Parser)]
 #[command(name = "entangrid-node")]
@@ -172,9 +171,14 @@ impl NodeRunner {
         inbox_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(2));
         let mut sync_tick = tokio::time::interval(Duration::from_secs(5));
+        let mut shutdown = std::pin::pin!(shutdown_signal());
 
         loop {
             tokio::select! {
+                _ = &mut shutdown => {
+                    self.handle_shutdown()?;
+                    return Ok(());
+                }
                 _ = slot_tick.tick() => {
                     self.process_slot_tick().await?;
                 }
@@ -199,6 +203,20 @@ impl NodeRunner {
                 }
             }
         }
+    }
+
+    fn handle_shutdown(&mut self) -> Result<()> {
+        self.refresh_service_scores();
+        self.storage.write_snapshot(self.ledger.snapshot())?;
+        self.persist_metrics()?;
+        self.log_event(
+            "node-stopped",
+            format!(
+                "validator {} shutting down cleanly",
+                self.config.validator_id
+            ),
+        )?;
+        Ok(())
     }
 
     async fn process_slot_tick(&mut self) -> Result<()> {
@@ -295,7 +313,7 @@ impl NodeRunner {
                     "service-gating-check",
                     format!(
                         "slot {slot} local_score {score:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
-                        SERVICE_GATING_THRESHOLD,
+                        self.service_gating_threshold(),
                         self.config.feature_flags.service_score_window_epochs,
                         counters.uptime_windows,
                         counters.total_windows,
@@ -305,19 +323,19 @@ impl NodeRunner {
                         counters.expected_peers
                     ),
                 )?;
-                if score < SERVICE_GATING_THRESHOLD {
+                if score < self.service_gating_threshold() {
                     self.update_metrics(|metrics| {
                         metrics.missed_proposer_slots += 1;
                         metrics.service_gating_rejections += 1;
                         metrics.last_local_service_score = score;
-                        metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+                        metrics.service_gating_threshold = self.service_gating_threshold();
                         metrics.last_local_service_counters = counters.clone();
                     });
                     self.log_event(
                         "missed-slot",
                         format!(
                             "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} uptime {}/{} timely {}/{} peers {}/{}",
-                            SERVICE_GATING_THRESHOLD,
+                            self.service_gating_threshold(),
                             self.config.feature_flags.service_score_window_epochs,
                             counters.uptime_windows,
                             counters.total_windows,
@@ -871,6 +889,7 @@ impl NodeRunner {
                 service_score,
                 self.config.feature_flags.enable_service_gating
                     && self.service_gating_active(block.header.epoch),
+                self.service_gating_threshold(),
             )
             .map_err(|error| anyhow!(error))?;
 
@@ -1045,7 +1064,7 @@ impl NodeRunner {
             self.update_metrics(|metrics| {
                 metrics.relay_scores = scores;
                 metrics.last_local_service_score = local_score;
-                metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+                metrics.service_gating_threshold = self.service_gating_threshold();
                 metrics.last_completed_service_epoch = 0;
                 metrics.service_gating_start_epoch =
                     self.config.feature_flags.service_gating_start_epoch;
@@ -1084,7 +1103,7 @@ impl NodeRunner {
         self.update_metrics(|metrics| {
             metrics.relay_scores = scores;
             metrics.last_local_service_score = local_score;
-            metrics.service_gating_threshold = SERVICE_GATING_THRESHOLD;
+            metrics.service_gating_threshold = self.service_gating_threshold();
             metrics.last_completed_service_epoch = completed_epoch;
             metrics.service_gating_start_epoch =
                 self.config.feature_flags.service_gating_start_epoch;
@@ -1110,6 +1129,10 @@ impl NodeRunner {
 
     fn service_gating_active(&self, epoch: Epoch) -> bool {
         epoch >= self.config.feature_flags.service_gating_start_epoch
+    }
+
+    fn service_gating_threshold(&self) -> f64 {
+        self.config.feature_flags.service_gating_threshold
     }
 
     fn broadcast_sync_request(&self) -> Result<()> {
@@ -1217,7 +1240,7 @@ impl NodeRunner {
                     "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
                     self.config.feature_flags.service_gating_start_epoch,
                     self.service_score_for_validator(self.config.validator_id),
-                    SERVICE_GATING_THRESHOLD,
+                    self.service_gating_threshold(),
                     self.config.feature_flags.service_score_window_epochs,
                     counters.uptime_windows,
                     counters.total_windows,
@@ -1235,7 +1258,7 @@ impl NodeRunner {
                 "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{}",
                 epoch.saturating_sub(1),
                 self.service_score_for_validator(self.config.validator_id),
-                SERVICE_GATING_THRESHOLD,
+                self.service_gating_threshold(),
                 self.config.feature_flags.service_score_window_epochs,
                 counters.uptime_windows,
                 counters.total_windows,
@@ -1397,11 +1420,45 @@ impl Storage {
         }
         let contents = fs::read_to_string(path)?;
         let mut values = Vec::new();
-        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-            values.push(serde_json::from_str(line)?);
+        let lines: Vec<&str> = contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        for (index, line) in lines.iter().enumerate() {
+            match serde_json::from_str(line) {
+                Ok(value) => values.push(value),
+                Err(error)
+                    if index + 1 == lines.len()
+                        && error.classify() == serde_json::error::Category::Eof =>
+                {
+                    info!(
+                        "ignoring truncated trailing JSONL entry while loading {}",
+                        path.display()
+                    );
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(values)
     }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut terminate) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn init_tracing() {
@@ -1445,5 +1502,32 @@ mod tests {
 
         first.sequence_number += 1;
         assert_ne!(receipt_event_hash(&first), receipt_event_hash(&second));
+    }
+
+    #[test]
+    fn storage_ignores_truncated_trailing_jsonl_entry() {
+        let unique_dir =
+            std::env::temp_dir().join(format!("entangrid-node-test-{}", now_unix_millis()));
+        let storage = Storage {
+            data_dir: unique_dir.clone(),
+            inbox_dir: unique_dir.join("inbox"),
+            processed_dir: unique_dir.join("processed"),
+            blocks_path: unique_dir.join(BLOCKS_FILE),
+            receipts_path: unique_dir.join(RECEIPTS_FILE),
+            orphan_path: unique_dir.join(ORPHANS_FILE),
+            snapshot_path: unique_dir.join(SNAPSHOT_FILE),
+            log_path: unique_dir.join("events.log"),
+            metrics_path: unique_dir.join("metrics.json"),
+        };
+        storage.init().unwrap();
+
+        let valid = serde_json::to_string(&sample_receipt()).unwrap();
+        let truncated = "{\"epoch\":1,\"slot\":2,\"source_validator_id\":1,\"destination_validator_id\":2,\"witness_validator_id\":3,\"message_class\":\"Transaction\",\"transcript_digest\":[1,2";
+        fs::write(&storage.receipts_path, format!("{valid}\n{truncated}")).unwrap();
+
+        let receipts = storage
+            .load_json_lines::<RelayReceipt>(&storage.receipts_path)
+            .unwrap();
+        assert_eq!(receipts.len(), 1);
     }
 }

@@ -21,6 +21,8 @@ pub struct FeatureFlags {
     pub enable_service_gating: bool,
     #[serde(default = "default_service_gating_start_epoch")]
     pub service_gating_start_epoch: Epoch,
+    #[serde(default = "default_service_gating_threshold")]
+    pub service_gating_threshold: f64,
     #[serde(default = "default_service_score_window_epochs")]
     pub service_score_window_epochs: u64,
 }
@@ -291,6 +293,10 @@ pub fn empty_hash() -> HashBytes {
 
 pub fn default_service_gating_start_epoch() -> Epoch {
     2
+}
+
+pub fn default_service_gating_threshold() -> f64 {
+    0.40
 }
 
 pub fn default_service_score_window_epochs() -> u64 {

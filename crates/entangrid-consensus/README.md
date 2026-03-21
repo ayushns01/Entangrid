@@ -111,6 +111,7 @@ Important detail:
 
 - this crate computes the score and enforces the threshold when asked
 - the node runtime decides **when** service gating starts for a given network through config
+- the node runtime also decides **what threshold** service gating uses for a given network through config
 - the node runtime also decides how many recent epochs are included in the rolling score window
 - that start epoch is now configurable instead of being hard-coded in the runtime
 

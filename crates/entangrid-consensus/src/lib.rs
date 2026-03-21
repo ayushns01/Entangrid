@@ -302,6 +302,7 @@ impl ConsensusEngine {
         expected_parent_hash: HashBytes,
         service_score: Option<f64>,
         enable_service_gating: bool,
+        service_gating_threshold: f64,
     ) -> Result<(), String> {
         let expected_proposer = self.proposer_for_slot(block.header.slot);
         if block.header.proposer_id != expected_proposer {
@@ -310,7 +311,7 @@ impl ConsensusEngine {
         if block.header.parent_hash != expected_parent_hash {
             return Err("unexpected parent hash".into());
         }
-        if enable_service_gating && service_score.unwrap_or_default() < 0.40 {
+        if enable_service_gating && service_score.unwrap_or_default() < service_gating_threshold {
             return Err("service gating rejected proposer".into());
         }
         Ok(())
