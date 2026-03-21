@@ -108,6 +108,9 @@ struct MatrixScenario {
     load_scenario: LoadScenario,
     load_duration_secs: u64,
     settle_secs: u64,
+    expected_lowest_validator: Option<u64>,
+    max_lowest_score: Option<f64>,
+    min_validator_gating_rejections: Option<(u64, u64)>,
 }
 
 pub async fn cli_main() -> Result<()> {
@@ -475,11 +478,7 @@ async fn run_matrix_scenario(
             scenario.load_duration_secs,
         )
         .await?;
-        wait_for_convergence(base_dir, scenario.settle_secs).await?;
-        let manifest = read_manifest(base_dir)?;
-        let (localnet_report, structural_report) =
-            capture_converged_reports(base_dir, &manifest).await?;
-        Ok::<_, anyhow::Error>((localnet_report, structural_report))
+        wait_for_scenario_expectations(base_dir, scenario).await
     }
     .await;
     shutdown_children(&mut children).await;
@@ -492,34 +491,89 @@ async fn run_matrix_scenario(
         settle_secs: scenario.settle_secs,
         gating_enabled: scenario.enable_service_gating,
         gating_threshold: scenario.service_gating_threshold,
+        expected_lowest_validator: scenario.expected_lowest_validator,
+        max_lowest_score: scenario.max_lowest_score,
+        min_validator_gating_rejections: scenario.min_validator_gating_rejections,
         localnet_report,
         structural_report,
     })
 }
 
-async fn capture_converged_reports(
+async fn wait_for_scenario_expectations(
     base_dir: &Path,
-    manifest: &LocalnetManifest,
+    scenario: &MatrixScenario,
 ) -> Result<(LocalnetReport, StructuralReport)> {
-    for _ in 0..10 {
+    let manifest = read_manifest(base_dir)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(scenario.settle_secs);
+
+    loop {
         if let (Ok(localnet_report), Ok(structural_report)) = (
-            build_localnet_report(base_dir, manifest),
-            build_structural_report(manifest),
+            build_localnet_report(base_dir, &manifest),
+            build_structural_report(&manifest),
         ) {
-            if structural_report.same_chain_count == manifest.node_configs.len()
-                && structural_report.all_parent_ok
-                && structural_report.all_tips_match
-                && structural_report.all_stderr_clean
+            if scenario_expectations_met(scenario, &manifest, &localnet_report, &structural_report)
             {
                 return Ok((localnet_report, structural_report));
             }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        if std::time::Instant::now() >= deadline {
+            let localnet_report = build_localnet_report(base_dir, &manifest)?;
+            let structural_report = build_structural_report(&manifest)?;
+            return Ok((localnet_report, structural_report));
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn scenario_expectations_met(
+    scenario: &MatrixScenario,
+    manifest: &LocalnetManifest,
+    localnet_report: &LocalnetReport,
+    structural_report: &StructuralReport,
+) -> bool {
+    if structural_report.same_chain_count != manifest.node_configs.len()
+        || !structural_report.all_parent_ok
+        || !structural_report.all_tips_match
+        || !structural_report.all_stderr_clean
+    {
+        return false;
     }
 
-    let localnet_report = build_localnet_report(base_dir, manifest)?;
-    let structural_report = build_structural_report(manifest)?;
-    Ok((localnet_report, structural_report))
+    if let Some(expected_validator) = scenario.expected_lowest_validator {
+        if localnet_report
+            .lowest_score
+            .map(|(validator_id, _)| validator_id)
+            != Some(expected_validator)
+        {
+            return false;
+        }
+    }
+
+    if let Some(max_score) = scenario.max_lowest_score {
+        if localnet_report
+            .lowest_score
+            .map(|(_, score)| score > max_score)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+
+    if let Some((validator_id, minimum)) = scenario.min_validator_gating_rejections {
+        if localnet_report
+            .validators
+            .iter()
+            .find(|validator| validator.validator_id == validator_id)
+            .map(|validator| validator.service_gating_rejections < minimum)
+            .unwrap_or(true)
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
@@ -541,6 +595,9 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 12,
             settle_secs,
+            expected_lowest_validator: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: None,
         },
         MatrixScenario {
             name: "baseline-6-bursty",
@@ -559,6 +616,9 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_scenario: LoadScenario::Bursty,
             load_duration_secs: 18,
             settle_secs,
+            expected_lowest_validator: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: None,
         },
         MatrixScenario {
             name: "gated-drop85",
@@ -577,6 +637,9 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 18,
             settle_secs,
+            expected_lowest_validator: Some(4),
+            max_lowest_score: Some(0.85),
+            min_validator_gating_rejections: None,
         },
         MatrixScenario {
             name: "gated-drop95",
@@ -588,13 +651,16 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
-            degraded_validator: Some(4),
+            degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 20,
             settle_secs,
+            expected_lowest_validator: Some(3),
+            max_lowest_score: Some(0.20),
+            min_validator_gating_rejections: Some((3, 1)),
         },
         MatrixScenario {
             name: "gated-outbound-disabled",
@@ -606,36 +672,18 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
-            degraded_validator: Some(4),
+            degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
             degraded_disable_outbound: true,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 20,
             settle_secs,
+            expected_lowest_validator: Some(3),
+            max_lowest_score: Some(0.05),
+            min_validator_gating_rejections: Some((3, 1)),
         },
     ]
-}
-
-async fn wait_for_convergence(base_dir: &Path, max_settle_secs: u64) -> Result<()> {
-    let manifest = read_manifest(base_dir)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(max_settle_secs);
-    loop {
-        if let Ok(structural_report) = build_structural_report(&manifest) {
-            if structural_report.same_chain_count == manifest.node_configs.len()
-                && structural_report.all_parent_ok
-                && structural_report.all_tips_match
-                && structural_report.all_stderr_clean
-            {
-                return Ok(());
-            }
-        }
-
-        if std::time::Instant::now() >= deadline {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
 }
 
 fn write_transaction_for_validator(
@@ -818,6 +866,9 @@ struct MatrixScenarioResult {
     settle_secs: u64,
     gating_enabled: bool,
     gating_threshold: f64,
+    expected_lowest_validator: Option<u64>,
+    max_lowest_score: Option<f64>,
+    min_validator_gating_rejections: Option<(u64, u64)>,
     localnet_report: LocalnetReport,
     structural_report: StructuralReport,
 }
@@ -882,6 +933,25 @@ impl MatrixScenarioResult {
             && self.structural_report.all_parent_ok
             && self.structural_report.all_tips_match
             && self.structural_report.all_stderr_clean
+            && self.expected_lowest_validator.is_none_or(|validator_id| {
+                self.localnet_report.lowest_score.map(|(actual, _)| actual) == Some(validator_id)
+            })
+            && self.max_lowest_score.is_none_or(|max_score| {
+                self.localnet_report
+                    .lowest_score
+                    .map(|(_, score)| score <= max_score)
+                    .unwrap_or(false)
+            })
+            && self
+                .min_validator_gating_rejections
+                .is_none_or(|(validator_id, minimum)| {
+                    self.localnet_report
+                        .validators
+                        .iter()
+                        .find(|validator| validator.validator_id == validator_id)
+                        .map(|validator| validator.service_gating_rejections >= minimum)
+                        .unwrap_or(false)
+                })
     }
 }
 
@@ -1461,6 +1531,9 @@ mod tests {
                 settle_secs: 10,
                 gating_enabled: true,
                 gating_threshold: 0.40,
+                expected_lowest_validator: Some(4),
+                max_lowest_score: Some(0.30),
+                min_validator_gating_rejections: Some((4, 1)),
                 localnet_report: LocalnetReport {
                     base_dir: "var/localnet-matrix/demo".into(),
                     configured_validators: 4,
@@ -1471,7 +1544,19 @@ mod tests {
                     total_duplicate_receipts_ignored: 0,
                     lowest_score: Some((4, 0.25)),
                     highest_score: Some((1, 1.0)),
-                    validators: vec![],
+                    validators: vec![ValidatorReport {
+                        validator_id: 4,
+                        current_epoch: 4,
+                        current_slot: 19,
+                        last_local_service_score: 0.25,
+                        service_gating_rejections: 2,
+                        missed_proposer_slots: 2,
+                        duplicate_receipts_ignored: 0,
+                        blocks_proposed: 1,
+                        blocks_validated: 6,
+                        tx_ingress: 8,
+                        receipts_created: 7,
+                    }],
                 },
                 structural_report: StructuralReport {
                     same_chain_count: 4,
@@ -1490,6 +1575,56 @@ mod tests {
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
         assert!(markdown.contains("| Scenario | Status | Validators |"));
+    }
+
+    #[test]
+    fn matrix_result_fails_when_expectations_are_not_met() {
+        let scenario = MatrixScenarioResult {
+            name: "demo".into(),
+            base_dir: "var/localnet-matrix/demo".into(),
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 12,
+            settle_secs: 10,
+            gating_enabled: true,
+            gating_threshold: 0.40,
+            expected_lowest_validator: Some(4),
+            max_lowest_score: Some(0.30),
+            min_validator_gating_rejections: Some((4, 1)),
+            localnet_report: LocalnetReport {
+                base_dir: "var/localnet-matrix/demo".into(),
+                configured_validators: 4,
+                validators_with_metrics: 4,
+                total_blocks_proposed: 8,
+                total_missed_slots: 0,
+                total_gating_rejections: 0,
+                total_duplicate_receipts_ignored: 0,
+                lowest_score: Some((4, 0.35)),
+                highest_score: Some((1, 1.0)),
+                validators: vec![ValidatorReport {
+                    validator_id: 4,
+                    current_epoch: 4,
+                    current_slot: 19,
+                    last_local_service_score: 0.35,
+                    service_gating_rejections: 0,
+                    missed_proposer_slots: 0,
+                    duplicate_receipts_ignored: 0,
+                    blocks_proposed: 1,
+                    blocks_validated: 6,
+                    tx_ingress: 8,
+                    receipts_created: 7,
+                }],
+            },
+            structural_report: StructuralReport {
+                same_chain_count: 4,
+                canonical_height: 20,
+                all_parent_ok: true,
+                all_tips_match: true,
+                all_stderr_clean: true,
+                nodes: vec![],
+            },
+        };
+
+        assert!(!scenario.passed());
     }
 
     #[test]

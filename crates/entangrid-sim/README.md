@@ -114,6 +114,7 @@ For each scenario it:
 - runs the configured load
 - waits for convergence during a bounded settle window
 - captures the structural/localnet report at that converged moment
+- checks scenario-specific expectations such as "the degraded validator had the lowest score" and, in the harshest cases, "that validator was actually gated"
 - shuts the nodes down
 - verifies structural chain health
 - writes Markdown and JSON summaries under the chosen output directory

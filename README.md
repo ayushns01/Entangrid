@@ -168,7 +168,7 @@ cargo run -p entangrid-sim -- matrix \
   --settle-secs 18
 ```
 
-The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking.
+The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking.
 
 Then inspect:
 
