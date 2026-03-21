@@ -147,6 +147,7 @@ cargo run -p entangrid-sim -- init-localnet \
   --slots-per-epoch 5 \
   --enable-service-gating \
   --service-gating-start-epoch 3 \
+  --service-gating-threshold 0.40 \
   --service-score-window-epochs 4 \
   --degraded-validator 4 \
   --degraded-drop-probability 0.85
@@ -157,6 +158,17 @@ cargo run -p entangrid-sim -- load --base-dir var/localnet-gated --scenario stea
 
 cargo run -p entangrid-sim -- report --base-dir var/localnet-gated
 ```
+
+Run the built-in rigorous localnet matrix and write reports into `test-results/`:
+
+```bash
+cargo run -p entangrid-sim -- matrix \
+  --base-dir var/localnet-matrix \
+  --output-dir test-results \
+  --settle-secs 18
+```
+
+The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking.
 
 Then inspect:
 

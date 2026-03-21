@@ -11,9 +11,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash, empty_hash,
-    now_unix_millis, validator_account,
+    PeerConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash,
+    default_service_gating_threshold, empty_hash, now_unix_millis, validator_account,
 };
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 use tracing::info;
 
@@ -42,6 +43,8 @@ enum Commands {
         enable_service_gating: bool,
         #[arg(long, default_value_t = 2)]
         service_gating_start_epoch: u64,
+        #[arg(long, default_value_t = default_service_gating_threshold())]
+        service_gating_threshold: f64,
         #[arg(long, default_value_t = 4)]
         service_score_window_epochs: u64,
         #[arg(long)]
@@ -69,14 +72,42 @@ enum Commands {
         #[arg(long, default_value = "var/localnet")]
         base_dir: PathBuf,
     },
+    Matrix {
+        #[arg(long, default_value = "var/localnet-matrix")]
+        base_dir: PathBuf,
+        #[arg(long, default_value = "test-results")]
+        output_dir: PathBuf,
+        #[arg(long, default_value_t = 18)]
+        settle_secs: u64,
+    },
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, ValueEnum)]
 pub enum LoadScenario {
     Idle,
     Steady,
     Bursty,
     LargeBlock,
+}
+
+#[derive(Clone, Debug)]
+struct MatrixScenario {
+    name: &'static str,
+    validators: usize,
+    slot_duration_millis: u64,
+    slots_per_epoch: u64,
+    start_delay_millis: u64,
+    enable_service_gating: bool,
+    service_gating_start_epoch: u64,
+    service_gating_threshold: f64,
+    service_score_window_epochs: u64,
+    degraded_validator: Option<u64>,
+    degraded_delay_ms: u64,
+    degraded_drop_probability: f64,
+    degraded_disable_outbound: bool,
+    load_scenario: LoadScenario,
+    load_duration_secs: u64,
+    settle_secs: u64,
 }
 
 pub async fn cli_main() -> Result<()> {
@@ -94,6 +125,7 @@ pub async fn cli_main() -> Result<()> {
             start_delay_millis,
             enable_service_gating,
             service_gating_start_epoch,
+            service_gating_threshold,
             service_score_window_epochs,
             degraded_validator,
             degraded_delay_ms,
@@ -107,6 +139,7 @@ pub async fn cli_main() -> Result<()> {
             start_delay_millis,
             enable_service_gating,
             service_gating_start_epoch,
+            service_gating_threshold,
             service_score_window_epochs,
             degraded_validator,
             degraded_delay_ms,
@@ -120,6 +153,11 @@ pub async fn cli_main() -> Result<()> {
             duration_secs,
         } => load_scenario(&base_dir, scenario, duration_secs).await,
         Commands::Report { base_dir } => report_localnet(&base_dir),
+        Commands::Matrix {
+            base_dir,
+            output_dir,
+            settle_secs,
+        } => run_rigorous_matrix(&base_dir, &output_dir, settle_secs).await,
     }
 }
 
@@ -131,6 +169,7 @@ pub fn init_localnet(
     start_delay_millis: u64,
     enable_service_gating: bool,
     service_gating_start_epoch: u64,
+    service_gating_threshold: f64,
     service_score_window_epochs: u64,
     degraded_validator: Option<u64>,
     degraded_delay_ms: u64,
@@ -211,6 +250,7 @@ pub fn init_localnet(
                 enable_receipts: true,
                 enable_service_gating,
                 service_gating_start_epoch,
+                service_gating_threshold,
                 service_score_window_epochs,
             },
             fault_profile,
@@ -231,6 +271,14 @@ pub fn init_localnet(
 }
 
 pub async fn up_localnet(base_dir: &Path) -> Result<()> {
+    let mut children = spawn_localnet_children(base_dir).await?;
+
+    tokio::signal::ctrl_c().await?;
+    shutdown_children(&mut children).await;
+    Ok(())
+}
+
+async fn spawn_localnet_children(base_dir: &Path) -> Result<Vec<Child>> {
     let manifest = read_manifest(base_dir)?;
     ensure_node_binary_built().await?;
     refresh_genesis_time_for_fresh_localnet(&manifest)?;
@@ -259,11 +307,31 @@ pub async fn up_localnet(base_dir: &Path) -> Result<()> {
         children.push(command.spawn()?);
     }
 
-    tokio::signal::ctrl_c().await?;
-    for child in &mut children {
-        let _ = child.kill().await;
+    Ok(children)
+}
+
+async fn shutdown_children(children: &mut [Child]) {
+    #[cfg(unix)]
+    for child in children.iter_mut() {
+        if let Some(pid) = child.id() {
+            let _ = Command::new("kill")
+                .arg("-INT")
+                .arg(pid.to_string())
+                .status()
+                .await;
+        }
     }
-    Ok(())
+
+    for child in children {
+        let exited_cleanly = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_ok();
+
+        if !exited_cleanly {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
 }
 
 pub async fn load_scenario(
@@ -343,6 +411,231 @@ pub fn report_localnet(base_dir: &Path) -> Result<()> {
     let report = build_localnet_report(base_dir, &manifest)?;
     println!("{}", report.render_text());
     Ok(())
+}
+
+pub async fn run_rigorous_matrix(
+    base_dir: &Path,
+    output_dir: &Path,
+    settle_secs: u64,
+) -> Result<()> {
+    fs::create_dir_all(base_dir)?;
+    fs::create_dir_all(output_dir)?;
+
+    let run_id = now_unix_millis();
+    let mut scenario_results = Vec::new();
+    for scenario in rigorous_matrix_scenarios(settle_secs) {
+        let scenario_base_dir = base_dir.join(format!("{}-{run_id}", scenario.name));
+        info!("running rigorous scenario {}", scenario.name);
+        scenario_results.push(run_matrix_scenario(&scenario_base_dir, &scenario).await?);
+    }
+
+    let report = MatrixReport {
+        generated_at_unix_millis: now_unix_millis(),
+        base_dir: base_dir.to_string_lossy().to_string(),
+        output_dir: output_dir.to_string_lossy().to_string(),
+        scenarios: scenario_results,
+    };
+
+    let json_path = output_dir.join(format!("rigorous-matrix-{run_id}.json"));
+    let markdown_path = output_dir.join(format!("rigorous-matrix-{run_id}.md"));
+    fs::write(&json_path, serde_json::to_vec_pretty(&report)?)?;
+    fs::write(&markdown_path, report.render_markdown())?;
+
+    println!("{}", report.render_text());
+    println!("wrote {}", markdown_path.display());
+    println!("wrote {}", json_path.display());
+    Ok(())
+}
+
+async fn run_matrix_scenario(
+    base_dir: &Path,
+    scenario: &MatrixScenario,
+) -> Result<MatrixScenarioResult> {
+    init_localnet(
+        scenario.validators,
+        base_dir,
+        scenario.slot_duration_millis,
+        scenario.slots_per_epoch,
+        scenario.start_delay_millis,
+        scenario.enable_service_gating,
+        scenario.service_gating_start_epoch,
+        scenario.service_gating_threshold,
+        scenario.service_score_window_epochs,
+        scenario.degraded_validator,
+        scenario.degraded_delay_ms,
+        scenario.degraded_drop_probability,
+        scenario.degraded_disable_outbound,
+    )?;
+
+    let mut children = spawn_localnet_children(base_dir).await?;
+    let run_result = async {
+        load_scenario(
+            base_dir,
+            scenario.load_scenario,
+            scenario.load_duration_secs,
+        )
+        .await?;
+        wait_for_convergence(base_dir, scenario.settle_secs).await?;
+        let manifest = read_manifest(base_dir)?;
+        let (localnet_report, structural_report) =
+            capture_converged_reports(base_dir, &manifest).await?;
+        Ok::<_, anyhow::Error>((localnet_report, structural_report))
+    }
+    .await;
+    shutdown_children(&mut children).await;
+    let (localnet_report, structural_report) = run_result?;
+    Ok(MatrixScenarioResult {
+        name: scenario.name.to_string(),
+        base_dir: base_dir.to_string_lossy().to_string(),
+        load_scenario: scenario.load_scenario,
+        load_duration_secs: scenario.load_duration_secs,
+        settle_secs: scenario.settle_secs,
+        gating_enabled: scenario.enable_service_gating,
+        gating_threshold: scenario.service_gating_threshold,
+        localnet_report,
+        structural_report,
+    })
+}
+
+async fn capture_converged_reports(
+    base_dir: &Path,
+    manifest: &LocalnetManifest,
+) -> Result<(LocalnetReport, StructuralReport)> {
+    for _ in 0..10 {
+        if let (Ok(localnet_report), Ok(structural_report)) = (
+            build_localnet_report(base_dir, manifest),
+            build_structural_report(manifest),
+        ) {
+            if structural_report.same_chain_count == manifest.node_configs.len()
+                && structural_report.all_parent_ok
+                && structural_report.all_tips_match
+                && structural_report.all_stderr_clean
+            {
+                return Ok((localnet_report, structural_report));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let localnet_report = build_localnet_report(base_dir, manifest)?;
+    let structural_report = build_structural_report(manifest)?;
+    Ok((localnet_report, structural_report))
+}
+
+fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
+    vec![
+        MatrixScenario {
+            name: "baseline-4-steady",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: false,
+            service_gating_start_epoch: 2,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: None,
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.0,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 12,
+            settle_secs,
+        },
+        MatrixScenario {
+            name: "baseline-6-bursty",
+            validators: 6,
+            slot_duration_millis: 800,
+            slots_per_epoch: 6,
+            start_delay_millis: 1_000,
+            enable_service_gating: false,
+            service_gating_start_epoch: 2,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: None,
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.0,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Bursty,
+            load_duration_secs: 18,
+            settle_secs,
+        },
+        MatrixScenario {
+            name: "gated-drop85",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: Some(4),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.85,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 18,
+            settle_secs,
+        },
+        MatrixScenario {
+            name: "gated-drop95",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: Some(4),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
+            settle_secs,
+        },
+        MatrixScenario {
+            name: "gated-outbound-disabled",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: Some(4),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.0,
+            degraded_disable_outbound: true,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
+            settle_secs,
+        },
+    ]
+}
+
+async fn wait_for_convergence(base_dir: &Path, max_settle_secs: u64) -> Result<()> {
+    let manifest = read_manifest(base_dir)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(max_settle_secs);
+    loop {
+        if let Ok(structural_report) = build_structural_report(&manifest) {
+            if structural_report.same_chain_count == manifest.node_configs.len()
+                && structural_report.all_parent_ok
+                && structural_report.all_tips_match
+                && structural_report.all_stderr_clean
+            {
+                return Ok(());
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 fn write_transaction_for_validator(
@@ -468,7 +761,7 @@ fn read_manifest(base_dir: &Path) -> Result<LocalnetManifest> {
     Ok(toml::from_str(&contents)?)
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct ValidatorReport {
     validator_id: u64,
     current_epoch: u64,
@@ -483,7 +776,7 @@ struct ValidatorReport {
     receipts_created: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 struct LocalnetReport {
     base_dir: String,
     configured_validators: usize,
@@ -495,6 +788,46 @@ struct LocalnetReport {
     lowest_score: Option<(u64, f64)>,
     highest_score: Option<(u64, f64)>,
     validators: Vec<ValidatorReport>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+struct StructuralNodeReport {
+    validator_id: u64,
+    blocks: usize,
+    parent_ok: bool,
+    tip_matches_snapshot: bool,
+    stderr_clean: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct StructuralReport {
+    same_chain_count: usize,
+    canonical_height: usize,
+    all_parent_ok: bool,
+    all_tips_match: bool,
+    all_stderr_clean: bool,
+    nodes: Vec<StructuralNodeReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct MatrixScenarioResult {
+    name: String,
+    base_dir: String,
+    load_scenario: LoadScenario,
+    load_duration_secs: u64,
+    settle_secs: u64,
+    gating_enabled: bool,
+    gating_threshold: f64,
+    localnet_report: LocalnetReport,
+    structural_report: StructuralReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct MatrixReport {
+    generated_at_unix_millis: u64,
+    base_dir: String,
+    output_dir: String,
+    scenarios: Vec<MatrixScenarioResult>,
 }
 
 impl LocalnetReport {
@@ -539,6 +872,132 @@ impl LocalnetReport {
                 validator.duplicate_receipts_ignored
             ));
         }
+        lines.join("\n")
+    }
+}
+
+impl MatrixScenarioResult {
+    fn passed(&self) -> bool {
+        self.structural_report.same_chain_count == self.localnet_report.configured_validators
+            && self.structural_report.all_parent_ok
+            && self.structural_report.all_tips_match
+            && self.structural_report.all_stderr_clean
+    }
+}
+
+impl MatrixReport {
+    fn render_text(&self) -> String {
+        let passed = self
+            .scenarios
+            .iter()
+            .filter(|scenario| scenario.passed())
+            .count();
+        let mut lines = vec![
+            "Rigorous Entangrid localnet matrix".to_string(),
+            format!("scenarios passed: {passed}/{}", self.scenarios.len()),
+        ];
+        for scenario in &self.scenarios {
+            lines.push(format!(
+                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {}",
+                scenario.name,
+                if scenario.passed() { "PASS" } else { "FAIL" },
+                scenario.structural_report.same_chain_count,
+                scenario.localnet_report.configured_validators,
+                scenario.structural_report.all_parent_ok,
+                scenario.structural_report.all_tips_match,
+                scenario.structural_report.all_stderr_clean,
+                scenario
+                    .localnet_report
+                    .lowest_score
+                    .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                scenario.localnet_report.total_gating_rejections
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn render_markdown(&self) -> String {
+        let passed = self
+            .scenarios
+            .iter()
+            .filter(|scenario| scenario.passed())
+            .count();
+        let mut lines = vec![
+            "# Entangrid Rigorous Matrix".to_string(),
+            String::new(),
+            format!(
+                "Generated at unix millis `{}`. Scenarios passed: `{}/{}`.",
+                self.generated_at_unix_millis,
+                passed,
+                self.scenarios.len()
+            ),
+            String::new(),
+            "| Scenario | Status | Validators | Same Chain | Parent Hashes | Snapshots | Clean stderr | Lowest Score | Gating Rejections |".to_string(),
+            "|---|---|---|---|---|---|---|---|---|".to_string(),
+        ];
+
+        for scenario in &self.scenarios {
+            let lowest_score = scenario
+                .localnet_report
+                .lowest_score
+                .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
+                .unwrap_or_else(|| "n/a".into());
+            lines.push(format!(
+                "| {} | {} | {} | {}/{} | {} | {} | {} | {} | {} |",
+                scenario.name,
+                if scenario.passed() { "PASS" } else { "FAIL" },
+                scenario.localnet_report.configured_validators,
+                scenario.structural_report.same_chain_count,
+                scenario.localnet_report.configured_validators,
+                scenario.structural_report.all_parent_ok,
+                scenario.structural_report.all_tips_match,
+                scenario.structural_report.all_stderr_clean,
+                lowest_score,
+                scenario.localnet_report.total_gating_rejections
+            ));
+        }
+
+        for scenario in &self.scenarios {
+            lines.push(String::new());
+            lines.push(format!("## {}", scenario.name));
+            lines.push(String::new());
+            lines.push(format!(
+                "- Load: `{:?}` for {}s, settle {}s",
+                scenario.load_scenario, scenario.load_duration_secs, scenario.settle_secs
+            ));
+            lines.push(format!(
+                "- Gating: `{}` threshold `{:.3}`",
+                scenario.gating_enabled, scenario.gating_threshold
+            ));
+            lines.push(format!(
+                "- Structural: same chain `{}/{}`, parent hashes `{}`, snapshots `{}`, clean stderr `{}`",
+                scenario.structural_report.same_chain_count,
+                scenario.localnet_report.configured_validators,
+                scenario.structural_report.all_parent_ok,
+                scenario.structural_report.all_tips_match,
+                scenario.structural_report.all_stderr_clean
+            ));
+            lines.push(String::new());
+            lines.push(
+                "| Validator | Score | Proposed | Validated | Missed | Gated | Receipts |"
+                    .to_string(),
+            );
+            lines.push("|---|---|---|---|---|---|---|".to_string());
+            for validator in &scenario.localnet_report.validators {
+                lines.push(format!(
+                    "| {} | {:.3} | {} | {} | {} | {} | {} |",
+                    validator.validator_id,
+                    validator.last_local_service_score,
+                    validator.blocks_proposed,
+                    validator.blocks_validated,
+                    validator.missed_proposer_slots,
+                    validator.service_gating_rejections,
+                    validator.receipts_created
+                ));
+            }
+        }
+
         lines.join("\n")
     }
 }
@@ -599,6 +1058,106 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
         highest_score,
         validators,
     })
+}
+
+fn build_structural_report(manifest: &LocalnetManifest) -> Result<StructuralReport> {
+    let mut nodes = Vec::new();
+    let mut chains: Vec<Vec<[u8; 32]>> = Vec::new();
+
+    for config_path in &manifest.node_configs {
+        let contents = fs::read_to_string(config_path)?;
+        let config: NodeConfig = toml::from_str(&contents)?;
+        let node_dir = PathBuf::from(&config.data_dir);
+        let blocks: Vec<entangrid_types::Block> = read_json_lines(&node_dir.join("blocks.jsonl"))?;
+        let snapshot: entangrid_types::StateSnapshot =
+            serde_json::from_str(&fs::read_to_string(node_dir.join("state_snapshot.json"))?)?;
+
+        let mut parent_ok = true;
+        let mut previous_hash = empty_hash();
+        for (index, block) in blocks.iter().enumerate() {
+            if block.header.block_number != (index as u64 + 1)
+                || block.header.parent_hash != previous_hash
+            {
+                parent_ok = false;
+                break;
+            }
+            previous_hash = block.block_hash;
+        }
+
+        let last_hash = blocks
+            .last()
+            .map(|block| block.block_hash)
+            .unwrap_or_else(empty_hash);
+        let tip_matches_snapshot =
+            snapshot.tip_hash == last_hash && snapshot.height == blocks.len() as u64;
+        let stderr_path = node_dir.join("stderr.log");
+        let stderr_clean = if stderr_path.exists() {
+            fs::read_to_string(stderr_path)?.trim().is_empty()
+        } else {
+            true
+        };
+
+        chains.push(blocks.iter().map(|block| block.block_hash).collect());
+        nodes.push(StructuralNodeReport {
+            validator_id: config.validator_id,
+            blocks: blocks.len(),
+            parent_ok,
+            tip_matches_snapshot,
+            stderr_clean,
+        });
+    }
+
+    nodes.sort_by_key(|node| node.validator_id);
+    let canonical_chain = chains
+        .iter()
+        .max_by_key(|chain| chain.len())
+        .cloned()
+        .unwrap_or_default();
+    let same_chain_count = chains
+        .iter()
+        .filter(|chain| **chain == canonical_chain)
+        .count();
+
+    Ok(StructuralReport {
+        same_chain_count,
+        canonical_height: canonical_chain.len(),
+        all_parent_ok: nodes.iter().all(|node| node.parent_ok),
+        all_tips_match: nodes.iter().all(|node| node.tip_matches_snapshot),
+        all_stderr_clean: nodes.iter().all(|node| node.stderr_clean),
+        nodes,
+    })
+}
+
+fn read_json_lines<T>(path: &Path) -> Result<Vec<T>>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let mut values = Vec::new();
+    if !path.exists() {
+        return Ok(values);
+    }
+    let contents = fs::read_to_string(path)?;
+    let lines: Vec<&str> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    for (index, line) in lines.iter().enumerate() {
+        match serde_json::from_str(line) {
+            Ok(value) => values.push(value),
+            Err(error)
+                if index + 1 == lines.len()
+                    && error.classify() == serde_json::error::Category::Eof =>
+            {
+                info!(
+                    "ignoring truncated trailing JSONL entry while reading {}",
+                    path.display()
+                );
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(values)
 }
 
 fn node_binary_path() -> Result<PathBuf> {
@@ -690,6 +1249,7 @@ mod tests {
             1_000,
             false,
             2,
+            0.40,
             4,
             None,
             0,
@@ -743,6 +1303,7 @@ mod tests {
             1_000,
             true,
             3,
+            0.35,
             6,
             Some(3),
             0,
@@ -755,6 +1316,7 @@ mod tests {
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.enable_service_gating);
         assert_eq!(node_config.feature_flags.service_gating_start_epoch, 3);
+        assert!((node_config.feature_flags.service_gating_threshold - 0.35).abs() < f64::EPSILON);
         assert_eq!(node_config.feature_flags.service_score_window_epochs, 6);
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
     }
@@ -771,6 +1333,7 @@ mod tests {
             1_000,
             true,
             3,
+            0.40,
             4,
             None,
             0,
@@ -839,7 +1402,22 @@ mod tests {
             "entangrid-sim-genesis-refresh-test-{}",
             now_unix_millis()
         ));
-        init_localnet(4, &unique_dir, 1_000, 5, 1, true, 3, 4, None, 0, 0.0, false).unwrap();
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1,
+            true,
+            3,
+            0.40,
+            4,
+            None,
+            0,
+            0.0,
+            false,
+        )
+        .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         let manifest = read_manifest(&unique_dir).unwrap();
@@ -851,5 +1429,94 @@ mod tests {
 
         assert!(localnet_is_fresh(&manifest).unwrap());
         assert!(after.genesis_time_unix_millis > before.genesis_time_unix_millis);
+    }
+
+    #[test]
+    fn rigorous_matrix_scenarios_cover_expected_cases() {
+        let scenarios = rigorous_matrix_scenarios(12);
+        let names: Vec<_> = scenarios.iter().map(|scenario| scenario.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "baseline-4-steady",
+                "baseline-6-bursty",
+                "gated-drop85",
+                "gated-drop95",
+                "gated-outbound-disabled",
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_report_renders_pass_fail_summary() {
+        let report = MatrixReport {
+            generated_at_unix_millis: 1,
+            base_dir: "var/localnet-matrix".into(),
+            output_dir: "test-results".into(),
+            scenarios: vec![MatrixScenarioResult {
+                name: "demo".into(),
+                base_dir: "var/localnet-matrix/demo".into(),
+                load_scenario: LoadScenario::Steady,
+                load_duration_secs: 12,
+                settle_secs: 10,
+                gating_enabled: true,
+                gating_threshold: 0.40,
+                localnet_report: LocalnetReport {
+                    base_dir: "var/localnet-matrix/demo".into(),
+                    configured_validators: 4,
+                    validators_with_metrics: 4,
+                    total_blocks_proposed: 8,
+                    total_missed_slots: 2,
+                    total_gating_rejections: 2,
+                    total_duplicate_receipts_ignored: 0,
+                    lowest_score: Some((4, 0.25)),
+                    highest_score: Some((1, 1.0)),
+                    validators: vec![],
+                },
+                structural_report: StructuralReport {
+                    same_chain_count: 4,
+                    canonical_height: 20,
+                    all_parent_ok: true,
+                    all_tips_match: true,
+                    all_stderr_clean: true,
+                    nodes: vec![],
+                },
+            }],
+        };
+
+        let rendered = report.render_text();
+        assert!(rendered.contains("scenarios passed: 1/1"));
+        assert!(rendered.contains("demo: PASS"));
+        let markdown = report.render_markdown();
+        assert!(markdown.contains("# Entangrid Rigorous Matrix"));
+        assert!(markdown.contains("| Scenario | Status | Validators |"));
+    }
+
+    #[test]
+    fn read_json_lines_ignores_truncated_trailing_entry() {
+        let unique_dir =
+            std::env::temp_dir().join(format!("entangrid-sim-jsonl-test-{}", now_unix_millis()));
+        fs::create_dir_all(&unique_dir).unwrap();
+        let path = unique_dir.join("structural.jsonl");
+        let valid = serde_json::json!({
+            "validator_id": 1,
+            "blocks": 3,
+            "parent_ok": true,
+            "tip_matches_snapshot": true,
+            "stderr_clean": true
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}",
+                serde_json::to_string(&valid).unwrap(),
+                "{\"validator_id\":2,\"blocks\":3,\"parent_ok\":true,\"tip_matches_snapshot\":true,\"stderr_clean\":tr"
+            ),
+        )
+        .unwrap();
+
+        let reports = read_json_lines::<StructuralNodeReport>(&path).unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].validator_id, 1);
     }
 }

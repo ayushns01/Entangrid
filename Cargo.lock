@@ -267,6 +267,7 @@ dependencies = [
  "entangrid-crypto",
  "entangrid-types",
  "rand",
+ "serde",
  "serde_json",
  "tokio",
  "toml",
