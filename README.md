@@ -176,11 +176,12 @@ Recent hardening also tightened two protocol-surface issues found during adversa
 - sync snapshot adoption now validates incoming receipt bundles before they can affect local service scoring
 - inbound network frames now have a fixed maximum size to avoid unbounded allocation on a malicious length prefix
 - sync now uses `SyncStatus` plus incremental block segments for same-chain peers, with per-peer request throttling and full snapshots kept as the safe fallback
+- inbound session handling is now capped, and nodes apply per-peer rate limits to spam-prone sync/receipt/tx gossip before that traffic reaches more expensive logic
 
 Then inspect:
 
 - `node-4/events.log` for missed slots due to low service score
-- `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `service_gating_start_epoch`, the latest local score, and the latest local service counters, including any failed-session or invalid-receipt penalties that contributed to that score
+- `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `peer_rate_limit_drops`, `inbound_session_drops`, `service_gating_start_epoch`, the latest local score, and the latest local service counters, including any failed-session or invalid-receipt penalties that contributed to that score
 
 ## Guiding Principle
 

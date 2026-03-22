@@ -277,6 +277,8 @@ pub struct NodeMetrics {
     pub last_local_service_counters: ServiceCounters,
     pub relay_scores: BTreeMap<ValidatorId, f64>,
     pub sync_requests_throttled: u64,
+    pub peer_rate_limit_drops: u64,
+    pub inbound_session_drops: u64,
     pub incremental_sync_served: u64,
     pub incremental_sync_applied: u64,
     pub full_sync_served: u64,

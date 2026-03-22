@@ -152,6 +152,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - when a peer is on the same branch but behind, the node now prefers an incremental block segment over a full snapshot
 - when a peer is unknown, diverged, or cannot advertise its stale state, the node falls back to a full snapshot so recovery still works
 - repeated sync requests from the same peer are throttled, which makes the prototype harder to abuse without breaking recovery
+- spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 
 But it is still intentionally early-stage.

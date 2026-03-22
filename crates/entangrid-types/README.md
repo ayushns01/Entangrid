@@ -72,7 +72,7 @@ Right now this crate is intentionally simple and very central.
   - the latest local service score
   - the latest local service counters used to explain that score
   - duplicate receipt counts that were ignored by the node
-  - sync-throttle and sync-mode counters so recovery behavior is visible in reports
+  - sync-throttle, peer-rate-limit, inbound-session-drop, and sync-mode counters so recovery behavior is visible in reports
 
 This crate also provides a few shared helpers:
 

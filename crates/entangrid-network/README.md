@@ -67,6 +67,7 @@ Recent hardening:
 
 - inbound frames now have a fixed maximum size before allocation
 - oversized frames are rejected early instead of letting an attacker force unbounded memory growth through a large declared frame length
+- concurrent inbound session handling is now capped, so one noisy peer cannot force unbounded task fan-out on the listener side
 
 ### Session observations
 

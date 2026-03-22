@@ -13,10 +13,11 @@ use entangrid_types::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
 };
 
 const MAX_FRAME_SIZE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CONCURRENT_INBOUND_SESSIONS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
@@ -31,6 +32,9 @@ pub enum NetworkEvent {
     },
     SessionFailed {
         peer_validator_id: Option<ValidatorId>,
+        detail: String,
+    },
+    InboundSessionDropped {
         detail: String,
     },
 }
@@ -84,6 +88,7 @@ pub async fn spawn_network(
     let listener_crypto = Arc::clone(&crypto);
     let listener_metrics = Arc::clone(&metrics);
     let listener_events = event_tx.clone();
+    let inbound_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_SESSIONS));
 
     tokio::spawn(async move {
         loop {
@@ -92,7 +97,21 @@ pub async fn spawn_network(
                     let crypto = Arc::clone(&listener_crypto);
                     let metrics = Arc::clone(&listener_metrics);
                     let event_tx = listener_events.clone();
+                    let inbound_limit = Arc::clone(&inbound_limit);
+                    let Ok(permit) = inbound_limit.try_acquire_owned() else {
+                        update_metrics(&metrics, |metrics| {
+                            metrics.inbound_session_drops += 1;
+                        });
+                        let _ = event_tx.send(NetworkEvent::InboundSessionDropped {
+                            detail: format!(
+                                "max concurrent inbound sessions {} reached",
+                                MAX_CONCURRENT_INBOUND_SESSIONS
+                            ),
+                        });
+                        continue;
+                    };
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(error) = handle_inbound(
                             stream,
                             local_validator_id,

@@ -837,6 +837,8 @@ struct ValidatorReport {
     service_gating_rejections: u64,
     missed_proposer_slots: u64,
     duplicate_receipts_ignored: u64,
+    peer_rate_limit_drops: u64,
+    inbound_session_drops: u64,
     blocks_proposed: u64,
     blocks_validated: u64,
     tx_ingress: u64,
@@ -852,6 +854,8 @@ struct LocalnetReport {
     total_missed_slots: u64,
     total_gating_rejections: u64,
     total_duplicate_receipts_ignored: u64,
+    total_peer_rate_limit_drops: u64,
+    total_inbound_session_drops: u64,
     lowest_score: Option<(u64, f64)>,
     highest_score: Option<(u64, f64)>,
     validators: Vec<ValidatorReport>,
@@ -916,6 +920,14 @@ impl LocalnetReport {
                 "total duplicate receipts ignored: {}",
                 self.total_duplicate_receipts_ignored
             ),
+            format!(
+                "total peer rate-limit drops: {}",
+                self.total_peer_rate_limit_drops
+            ),
+            format!(
+                "total inbound session drops: {}",
+                self.total_inbound_session_drops
+            ),
         ];
         if let Some((validator_id, score)) = self.highest_score {
             lines.push(format!(
@@ -929,7 +941,7 @@ impl LocalnetReport {
         }
         for validator in &self.validators {
             lines.push(format!(
-                "validator {}: epoch {} slot {} score {:.3} failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {}",
+                "validator {}: epoch {} slot {} score {:.3} failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {} peer_rate_limited {} inbound_session_drops {}",
                 validator.validator_id,
                 validator.current_epoch,
                 validator.current_slot,
@@ -942,7 +954,9 @@ impl LocalnetReport {
                 validator.receipts_created,
                 validator.missed_proposer_slots,
                 validator.service_gating_rejections,
-                validator.duplicate_receipts_ignored
+                validator.duplicate_receipts_ignored,
+                validator.peer_rate_limit_drops,
+                validator.inbound_session_drops
             ));
         }
         lines.join("\n")
@@ -1077,11 +1091,11 @@ impl MatrixReport {
                 scenario.structural_report.all_stderr_clean
             ));
             lines.push(String::new());
-            lines.push("| Validator | Score | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts |".to_string());
-            lines.push("|---|---|---|---|---|---|---|---|---|".to_string());
+            lines.push("| Validator | Score | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts | Rate-Limited | Inbound Drops |".to_string());
+            lines.push("|---|---|---|---|---|---|---|---|---|---|---|".to_string());
             for validator in &scenario.localnet_report.validators {
                 lines.push(format!(
-                    "| {} | {:.3} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     validator.validator_id,
                     validator.last_local_service_score,
                     validator.failed_sessions,
@@ -1090,7 +1104,9 @@ impl MatrixReport {
                     validator.blocks_validated,
                     validator.missed_proposer_slots,
                     validator.service_gating_rejections,
-                    validator.receipts_created
+                    validator.receipts_created,
+                    validator.peer_rate_limit_drops,
+                    validator.inbound_session_drops
                 ));
             }
         }
@@ -1105,6 +1121,8 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
     let mut total_missed_slots = 0;
     let mut total_gating_rejections = 0;
     let mut total_duplicate_receipts_ignored = 0;
+    let mut total_peer_rate_limit_drops = 0;
+    let mut total_inbound_session_drops = 0;
 
     for config_path in &manifest.node_configs {
         let contents = fs::read_to_string(config_path)?;
@@ -1118,6 +1136,8 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
         total_missed_slots += metrics.missed_proposer_slots;
         total_gating_rejections += metrics.service_gating_rejections;
         total_duplicate_receipts_ignored += metrics.duplicate_receipts_ignored;
+        total_peer_rate_limit_drops += metrics.peer_rate_limit_drops;
+        total_inbound_session_drops += metrics.inbound_session_drops;
         validators.push(ValidatorReport {
             validator_id: metrics.validator_id,
             current_epoch: metrics.current_epoch,
@@ -1128,6 +1148,8 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
             service_gating_rejections: metrics.service_gating_rejections,
             missed_proposer_slots: metrics.missed_proposer_slots,
             duplicate_receipts_ignored: metrics.duplicate_receipts_ignored,
+            peer_rate_limit_drops: metrics.peer_rate_limit_drops,
+            inbound_session_drops: metrics.inbound_session_drops,
             blocks_proposed: metrics.blocks_proposed,
             blocks_validated: metrics.blocks_validated,
             tx_ingress: metrics.tx_ingress,
@@ -1153,6 +1175,8 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
         total_missed_slots,
         total_gating_rejections,
         total_duplicate_receipts_ignored,
+        total_peer_rate_limit_drops,
+        total_inbound_session_drops,
         lowest_score,
         highest_score,
         validators,
@@ -1582,6 +1606,8 @@ mod tests {
                     total_missed_slots: 2,
                     total_gating_rejections: 2,
                     total_duplicate_receipts_ignored: 0,
+                    total_peer_rate_limit_drops: 0,
+                    total_inbound_session_drops: 0,
                     lowest_score: Some((4, 0.25)),
                     highest_score: Some((1, 1.0)),
                     validators: vec![ValidatorReport {
@@ -1594,6 +1620,8 @@ mod tests {
                         service_gating_rejections: 2,
                         missed_proposer_slots: 2,
                         duplicate_receipts_ignored: 0,
+                        peer_rate_limit_drops: 0,
+                        inbound_session_drops: 0,
                         blocks_proposed: 1,
                         blocks_validated: 6,
                         tx_ingress: 8,
@@ -1641,6 +1669,8 @@ mod tests {
                 total_missed_slots: 0,
                 total_gating_rejections: 0,
                 total_duplicate_receipts_ignored: 0,
+                total_peer_rate_limit_drops: 0,
+                total_inbound_session_drops: 0,
                 lowest_score: Some((4, 0.35)),
                 highest_score: Some((1, 1.0)),
                 validators: vec![ValidatorReport {
@@ -1653,6 +1683,8 @@ mod tests {
                     service_gating_rejections: 0,
                     missed_proposer_slots: 0,
                     duplicate_receipts_ignored: 0,
+                    peer_rate_limit_drops: 0,
+                    inbound_session_drops: 0,
                     blocks_proposed: 1,
                     blocks_validated: 6,
                     tx_ingress: 8,

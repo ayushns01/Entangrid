@@ -93,6 +93,7 @@ It is useful for quickly checking:
 - missed proposer slots
 - gating rejections
 - duplicate receipts that were ignored
+- peer rate-limit drops and inbound session drops from the latest run
 - failed-session and invalid-receipt penalties from the latest local score window
 - high-level proposer and validation activity
 
@@ -125,6 +126,7 @@ Recent improvement:
 - matrix shutdown now interrupts all validators together before a hard kill, which makes the generated reports much less likely to trip over truncated final JSONL appends or shutdown-induced chain skew
 - matrix/report JSONL readers now ignore only a truncated trailing line, so interrupted runs are easier to inspect without hiding mid-file corruption
 - localnet and matrix summaries now expose the penalty counters behind each validator's current score, which makes threshold and score-window tuning much easier to compare across runs
+- localnet and matrix summaries now also expose peer-rate-limit drops and inbound-session drops, which makes abuse-control tuning visible without digging into raw metrics files
 
 ### Fault and degradation controls
 

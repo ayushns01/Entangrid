@@ -28,6 +28,10 @@ const RECEIPTS_FILE: &str = "receipts.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
 const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
 const SYNC_REQUEST_COOLDOWN_MILLIS: u64 = 1_500;
+const PEER_MESSAGE_WINDOW_MILLIS: u64 = 5_000;
+const MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW: u64 = 24;
+const MAX_TRANSACTION_GOSSIP_MESSAGES_PER_WINDOW: u64 = 256;
+const MAX_RECEIPT_GOSSIP_MESSAGES_PER_WINDOW: u64 = 512;
 
 #[derive(Parser)]
 #[command(name = "entangrid-node")]
@@ -127,6 +131,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         observed_invalid_receipts: BTreeMap::new(),
         last_sync_request_served_at: BTreeMap::new(),
         peer_sync_status: BTreeMap::new(),
+        peer_message_windows: BTreeMap::new(),
     };
     runner.rebuild_seen_sets();
     runner.run().await
@@ -162,6 +167,22 @@ struct NodeRunner {
     observed_invalid_receipts: BTreeMap<(Epoch, ValidatorId), u64>,
     last_sync_request_served_at: BTreeMap<ValidatorId, u64>,
     peer_sync_status: BTreeMap<ValidatorId, (u64, HashBytes)>,
+    peer_message_windows: BTreeMap<ValidatorId, PeerMessageWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerMessageClass {
+    SyncControl,
+    TransactionGossip,
+    ReceiptGossip,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PeerMessageWindow {
+    started_at_unix_millis: u64,
+    sync_control_messages: u64,
+    transaction_gossip_messages: u64,
+    receipt_gossip_messages: u64,
 }
 
 impl NodeRunner {
@@ -514,6 +535,9 @@ impl NodeRunner {
                     format!("peer {:?} detail {detail}", peer_validator_id),
                 )?;
             }
+            NetworkEvent::InboundSessionDropped { detail } => {
+                self.log_event("inbound-session-dropped", detail)?;
+            }
         }
         Ok(())
     }
@@ -523,6 +547,22 @@ impl NodeRunner {
         from_validator_id: ValidatorId,
         payload: ProtocolMessage,
     ) -> Result<()> {
+        if let Some(message_class) = classify_peer_message(&payload) {
+            if !self.allow_peer_message(from_validator_id, message_class, now_unix_millis()) {
+                self.update_metrics(|metrics| {
+                    metrics.peer_rate_limit_drops += 1;
+                });
+                self.log_event(
+                    "peer-rate-limited",
+                    format!(
+                        "from {from_validator_id} class {}",
+                        peer_message_class_label(message_class)
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+
         match payload {
             ProtocolMessage::TransactionBroadcast(transaction) => {
                 if let Err(error) = self
@@ -1417,6 +1457,16 @@ impl NodeRunner {
             .insert(validator_id, (height, tip_hash));
     }
 
+    fn allow_peer_message(
+        &mut self,
+        validator_id: ValidatorId,
+        message_class: PeerMessageClass,
+        now_unix_millis: u64,
+    ) -> bool {
+        let window = self.peer_message_windows.entry(validator_id).or_default();
+        allow_peer_message_in_window(window, message_class, now_unix_millis)
+    }
+
     fn snapshot_metrics(&self) -> NodeMetrics {
         self.metrics
             .lock()
@@ -1571,6 +1621,65 @@ fn receipt_event_hash(receipt: &RelayReceipt) -> HashBytes {
         receipt.message_class.clone(),
         receipt.sequence_number,
     ))
+}
+
+fn classify_peer_message(payload: &ProtocolMessage) -> Option<PeerMessageClass> {
+    match payload {
+        ProtocolMessage::SyncStatus { .. }
+        | ProtocolMessage::SyncRequest { .. }
+        | ProtocolMessage::ReceiptFetch { .. } => Some(PeerMessageClass::SyncControl),
+        ProtocolMessage::TransactionBroadcast(_) => Some(PeerMessageClass::TransactionGossip),
+        ProtocolMessage::RelayReceipt(_) => Some(PeerMessageClass::ReceiptGossip),
+        ProtocolMessage::BlockProposal(_)
+        | ProtocolMessage::SyncResponse { .. }
+        | ProtocolMessage::SyncBlocks { .. }
+        | ProtocolMessage::HeartbeatPulse(_)
+        | ProtocolMessage::ReceiptResponse { .. } => None,
+    }
+}
+
+fn peer_message_class_label(message_class: PeerMessageClass) -> &'static str {
+    match message_class {
+        PeerMessageClass::SyncControl => "sync-control",
+        PeerMessageClass::TransactionGossip => "tx-gossip",
+        PeerMessageClass::ReceiptGossip => "receipt-gossip",
+    }
+}
+
+fn allow_peer_message_in_window(
+    window: &mut PeerMessageWindow,
+    message_class: PeerMessageClass,
+    now_unix_millis: u64,
+) -> bool {
+    if window.started_at_unix_millis == 0
+        || now_unix_millis.saturating_sub(window.started_at_unix_millis)
+            >= PEER_MESSAGE_WINDOW_MILLIS
+    {
+        *window = PeerMessageWindow {
+            started_at_unix_millis: now_unix_millis,
+            ..PeerMessageWindow::default()
+        };
+    }
+
+    let (counter, limit) = match message_class {
+        PeerMessageClass::SyncControl => (
+            &mut window.sync_control_messages,
+            MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW,
+        ),
+        PeerMessageClass::TransactionGossip => (
+            &mut window.transaction_gossip_messages,
+            MAX_TRANSACTION_GOSSIP_MESSAGES_PER_WINDOW,
+        ),
+        PeerMessageClass::ReceiptGossip => (
+            &mut window.receipt_gossip_messages,
+            MAX_RECEIPT_GOSSIP_MESSAGES_PER_WINDOW,
+        ),
+    };
+    if *counter >= limit {
+        return false;
+    }
+    *counter += 1;
+    true
 }
 
 fn build_chain_segment_from_chain(
@@ -2196,5 +2305,50 @@ mod tests {
 
         let segment = build_chain_segment_from_chain(&snapshot, &[block], &[], 4, 0, [9u8; 32]);
         assert!(segment.is_none());
+    }
+
+    #[test]
+    fn peer_message_window_limits_and_resets_sync_control() {
+        let mut window = PeerMessageWindow::default();
+        for _ in 0..MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW {
+            assert!(allow_peer_message_in_window(
+                &mut window,
+                PeerMessageClass::SyncControl,
+                1_000
+            ));
+        }
+        assert!(!allow_peer_message_in_window(
+            &mut window,
+            PeerMessageClass::SyncControl,
+            1_000
+        ));
+        assert!(allow_peer_message_in_window(
+            &mut window,
+            PeerMessageClass::SyncControl,
+            1_000 + PEER_MESSAGE_WINDOW_MILLIS
+        ));
+    }
+
+    #[test]
+    fn classify_peer_message_only_limits_spammable_gossip() {
+        let tx = first_valid_block(&sample_genesis()).transactions[0].clone();
+        assert_eq!(
+            classify_peer_message(&ProtocolMessage::TransactionBroadcast(tx)),
+            Some(PeerMessageClass::TransactionGossip)
+        );
+        assert_eq!(
+            classify_peer_message(&ProtocolMessage::SyncRequest {
+                requester_id: 1,
+                known_height: 0,
+                known_tip_hash: empty_hash(),
+            }),
+            Some(PeerMessageClass::SyncControl)
+        );
+        assert_eq!(
+            classify_peer_message(&ProtocolMessage::BlockProposal(first_valid_block(
+                &sample_genesis()
+            ))),
+            None
+        );
     }
 }
