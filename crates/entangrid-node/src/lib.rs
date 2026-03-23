@@ -345,9 +345,13 @@ impl NodeRunner {
                 self.log_event(
                     "service-gating-check",
                     format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                        "slot {slot} local_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                         self.service_gating_threshold(),
                         self.config.feature_flags.service_score_window_epochs,
+                        self.config.feature_flags.service_score_weights.uptime_weight,
+                        self.config.feature_flags.service_score_weights.delivery_weight,
+                        self.config.feature_flags.service_score_weights.diversity_weight,
+                        self.config.feature_flags.service_score_weights.penalty_weight,
                         counters.uptime_windows,
                         counters.total_windows,
                         counters.timely_deliveries,
@@ -369,9 +373,13 @@ impl NodeRunner {
                     self.log_event(
                         "missed-slot",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                             self.service_gating_threshold(),
                             self.config.feature_flags.service_score_window_epochs,
+                            self.config.feature_flags.service_score_weights.uptime_weight,
+                            self.config.feature_flags.service_score_weights.delivery_weight,
+                            self.config.feature_flags.service_score_weights.diversity_weight,
+                            self.config.feature_flags.service_score_weights.penalty_weight,
                             counters.uptime_windows,
                             counters.total_windows,
                             counters.timely_deliveries,
@@ -396,12 +404,13 @@ impl NodeRunner {
                     epoch - 1,
                     &self.receipts,
                 );
-                let commitment = self.consensus.commitment_from_receipts(
+                let commitment = self.consensus.commitment_from_receipts_with_weights(
                     self.config.validator_id,
                     epoch - 1,
                     &commitment_receipts,
                     0,
                     0,
+                    &self.config.feature_flags.service_score_weights,
                 );
                 (Some(commitment), commitment_receipts)
             } else {
@@ -1108,6 +1117,7 @@ impl NodeRunner {
             self.crypto.as_ref(),
             commitment,
             commitment_receipts,
+            &self.config.feature_flags.service_score_weights,
         )
     }
 
@@ -1253,6 +1263,8 @@ impl NodeRunner {
                     self.config.feature_flags.service_gating_start_epoch;
                 metrics.service_score_window_epochs =
                     self.config.feature_flags.service_score_window_epochs;
+                metrics.service_score_weights =
+                    self.config.feature_flags.service_score_weights.clone();
                 metrics.last_local_service_counters = local_counters;
             });
             return;
@@ -1276,7 +1288,10 @@ impl NodeRunner {
                 let weight = epoch.saturating_sub(earliest_epoch) + 1;
                 accumulate_weighted_counters(&mut aggregate, &counters, weight);
             }
-            let score = self.consensus.compute_service_score(&aggregate);
+            let score = self.consensus.compute_service_score_with_weights(
+                &aggregate,
+                &self.config.feature_flags.service_score_weights,
+            );
             self.latest_service_scores.insert(validator_id, score);
             self.latest_service_counters.insert(validator_id, aggregate);
         }
@@ -1295,6 +1310,7 @@ impl NodeRunner {
                 self.config.feature_flags.service_gating_start_epoch;
             metrics.service_score_window_epochs =
                 self.config.feature_flags.service_score_window_epochs;
+            metrics.service_score_weights = self.config.feature_flags.service_score_weights.clone();
             metrics.last_local_service_counters = local_counters;
         });
     }
@@ -1568,11 +1584,15 @@ impl NodeRunner {
             return self.log_event(
                 "service-score",
                 format!(
-                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                    "epoch {epoch} warmup until epoch {} local_score {:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                     self.config.feature_flags.service_gating_start_epoch,
                     self.service_score_for_validator(self.config.validator_id),
                     self.service_gating_threshold(),
                     self.config.feature_flags.service_score_window_epochs,
+                    self.config.feature_flags.service_score_weights.uptime_weight,
+                    self.config.feature_flags.service_score_weights.delivery_weight,
+                    self.config.feature_flags.service_score_weights.diversity_weight,
+                    self.config.feature_flags.service_score_weights.penalty_weight,
                     counters.uptime_windows,
                     counters.total_windows,
                     counters.timely_deliveries,
@@ -1588,11 +1608,15 @@ impl NodeRunner {
         self.log_event(
             "service-score",
             format!(
-                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                 epoch.saturating_sub(1),
                 self.service_score_for_validator(self.config.validator_id),
                 self.service_gating_threshold(),
                 self.config.feature_flags.service_score_window_epochs,
+                self.config.feature_flags.service_score_weights.uptime_weight,
+                self.config.feature_flags.service_score_weights.delivery_weight,
+                self.config.feature_flags.service_score_weights.diversity_weight,
+                self.config.feature_flags.service_score_weights.penalty_weight,
                 counters.uptime_windows,
                 counters.total_windows,
                 counters.timely_deliveries,
@@ -1846,7 +1870,13 @@ fn validate_snapshot_block(
         return Err(anyhow!("commitment receipts present without commitment"));
     }
     if let Some(commitment) = &block.commitment {
-        validate_commitment_bundle(consensus, crypto, commitment, &block.commitment_receipts)?;
+        validate_commitment_bundle(
+            consensus,
+            crypto,
+            commitment,
+            &block.commitment_receipts,
+            &entangrid_types::default_service_score_weights(),
+        )?;
     }
 
     Ok(())
@@ -1857,6 +1887,7 @@ fn validate_commitment_bundle(
     crypto: &dyn CryptoBackend,
     commitment: &TopologyCommitment,
     commitment_receipts: &[RelayReceipt],
+    weights: &entangrid_types::ServiceScoreWeights,
 ) -> Result<()> {
     let mut exact_hashes = BTreeSet::new();
     let mut event_hashes = BTreeSet::new();
@@ -1888,12 +1919,13 @@ fn validate_commitment_bundle(
             return Err(anyhow!("duplicate receipt event in commitment"));
         }
     }
-    let expected = consensus.commitment_from_receipts(
+    let expected = consensus.commitment_from_receipts_with_weights(
         commitment.validator_id,
         commitment.epoch,
         commitment_receipts,
         0,
         0,
+        weights,
     );
     if expected != *commitment {
         return Err(anyhow!("receipt root mismatch"));

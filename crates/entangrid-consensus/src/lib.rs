@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use entangrid_types::{
     Block, CommitmentSummary, Epoch, EpochAssignment, GenesisConfig, HashBytes, MessageClass,
-    RelayReceipt, ServiceCounters, Slot, TopologyCommitment, ValidatorId, canonical_hash,
-    hash_many, now_unix_millis,
+    RelayReceipt, ServiceCounters, ServiceScoreWeights, Slot, TopologyCommitment, ValidatorId,
+    canonical_hash, default_service_score_weights, hash_many, now_unix_millis,
 };
 
 #[derive(Clone, Debug)]
@@ -168,6 +168,14 @@ impl ConsensusEngine {
     }
 
     pub fn compute_service_score(&self, counters: &ServiceCounters) -> f64 {
+        self.compute_service_score_with_weights(counters, &default_service_score_weights())
+    }
+
+    pub fn compute_service_score_with_weights(
+        &self,
+        counters: &ServiceCounters,
+        weights: &ServiceScoreWeights,
+    ) -> f64 {
         let uptime_ratio = capped_ratio(counters.uptime_windows, counters.total_windows);
         let delivery_ratio = capped_ratio(counters.timely_deliveries, counters.expected_deliveries);
         let diversity_ratio = capped_ratio(counters.distinct_peers, counters.expected_peers);
@@ -176,7 +184,10 @@ impl ConsensusEngine {
                 .min(counters.total_windows.max(1)),
             counters.total_windows.max(1),
         );
-        (0.25 * uptime_ratio + 0.50 * delivery_ratio + 0.25 * diversity_ratio - penalty_ratio)
+        (weights.uptime_weight * uptime_ratio
+            + weights.delivery_weight * delivery_ratio
+            + weights.diversity_weight * diversity_ratio
+            - weights.penalty_weight * penalty_ratio)
             .clamp(0.0, 1.0)
     }
 
@@ -249,13 +260,33 @@ impl ConsensusEngine {
         failed_sessions: u64,
         invalid_receipts: u64,
     ) -> TopologyCommitment {
+        self.commitment_for_validator_with_weights(
+            validator_id,
+            epoch,
+            receipts,
+            failed_sessions,
+            invalid_receipts,
+            &default_service_score_weights(),
+        )
+    }
+
+    pub fn commitment_for_validator_with_weights(
+        &self,
+        validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+        failed_sessions: u64,
+        invalid_receipts: u64,
+        weights: &ServiceScoreWeights,
+    ) -> TopologyCommitment {
         let relevant = self.receipts_for_validator(validator_id, epoch, receipts);
-        self.commitment_from_receipts(
+        self.commitment_from_receipts_with_weights(
             validator_id,
             epoch,
             &relevant,
             failed_sessions,
             invalid_receipts,
+            weights,
         )
     }
 
@@ -267,6 +298,25 @@ impl ConsensusEngine {
         failed_sessions: u64,
         invalid_receipts: u64,
     ) -> TopologyCommitment {
+        self.commitment_from_receipts_with_weights(
+            validator_id,
+            epoch,
+            receipts,
+            failed_sessions,
+            invalid_receipts,
+            &default_service_score_weights(),
+        )
+    }
+
+    pub fn commitment_from_receipts_with_weights(
+        &self,
+        validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+        failed_sessions: u64,
+        invalid_receipts: u64,
+        weights: &ServiceScoreWeights,
+    ) -> TopologyCommitment {
         let counters = self.counters_from_receipts(
             validator_id,
             epoch,
@@ -274,7 +324,7 @@ impl ConsensusEngine {
             failed_sessions,
             invalid_receipts,
         );
-        let relay_score = self.compute_service_score(&counters);
+        let relay_score = self.compute_service_score_with_weights(&counters, weights);
         let mut by_message_class = BTreeMap::new();
         let mut peers = BTreeSet::new();
         for receipt in receipts {
@@ -333,7 +383,9 @@ fn capped_ratio(numerator: u64, denominator: u64) -> f64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use entangrid_types::{GenesisConfig, MessageClass, RelayReceipt, ValidatorConfig, empty_hash};
+    use entangrid_types::{
+        GenesisConfig, MessageClass, RelayReceipt, ServiceScoreWeights, ValidatorConfig, empty_hash,
+    };
 
     use super::*;
 
@@ -419,6 +471,36 @@ mod tests {
             invalid_receipts: 0,
         });
         assert!((score - 0.675).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn service_score_respects_penalty_weight() {
+        let engine = ConsensusEngine::new(sample_genesis());
+        let counters = ServiceCounters {
+            uptime_windows: 5,
+            total_windows: 5,
+            timely_deliveries: 5,
+            expected_deliveries: 5,
+            distinct_peers: 2,
+            expected_peers: 2,
+            failed_sessions: 1,
+            invalid_receipts: 0,
+        };
+        let lower_penalty = engine.compute_service_score_with_weights(
+            &counters,
+            &ServiceScoreWeights {
+                penalty_weight: 0.5,
+                ..Default::default()
+            },
+        );
+        let higher_penalty = engine.compute_service_score_with_weights(
+            &counters,
+            &ServiceScoreWeights {
+                penalty_weight: 1.5,
+                ..Default::default()
+            },
+        );
+        assert!(lower_penalty > higher_penalty);
     }
 
     #[test]

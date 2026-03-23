@@ -25,6 +25,8 @@ pub struct FeatureFlags {
     pub service_gating_threshold: f64,
     #[serde(default = "default_service_score_window_epochs")]
     pub service_score_window_epochs: u64,
+    #[serde(default = "default_service_score_weights")]
+    pub service_score_weights: ServiceScoreWeights,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -249,6 +251,24 @@ pub struct ServiceCounters {
     pub invalid_receipts: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ServiceScoreWeights {
+    #[serde(default = "default_service_uptime_weight")]
+    pub uptime_weight: f64,
+    #[serde(default = "default_service_delivery_weight")]
+    pub delivery_weight: f64,
+    #[serde(default = "default_service_diversity_weight")]
+    pub diversity_weight: f64,
+    #[serde(default = "default_service_penalty_weight")]
+    pub penalty_weight: f64,
+}
+
+impl Default for ServiceScoreWeights {
+    fn default() -> Self {
+        default_service_score_weights()
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct NodeMetrics {
@@ -258,6 +278,7 @@ pub struct NodeMetrics {
     pub last_completed_service_epoch: Epoch,
     pub service_gating_start_epoch: Epoch,
     pub service_score_window_epochs: u64,
+    pub service_score_weights: ServiceScoreWeights,
     pub active_sessions: u64,
     pub handshake_attempts: u64,
     pub handshake_failures: u64,
@@ -328,6 +349,31 @@ pub fn default_service_gating_threshold() -> f64 {
 
 pub fn default_service_score_window_epochs() -> u64 {
     4
+}
+
+pub fn default_service_uptime_weight() -> f64 {
+    0.25
+}
+
+pub fn default_service_delivery_weight() -> f64 {
+    0.50
+}
+
+pub fn default_service_diversity_weight() -> f64 {
+    0.25
+}
+
+pub fn default_service_penalty_weight() -> f64 {
+    1.0
+}
+
+pub fn default_service_score_weights() -> ServiceScoreWeights {
+    ServiceScoreWeights {
+        uptime_weight: default_service_uptime_weight(),
+        delivery_weight: default_service_delivery_weight(),
+        diversity_weight: default_service_diversity_weight(),
+        penalty_weight: default_service_penalty_weight(),
+    }
 }
 
 pub fn validator_account(validator_id: ValidatorId) -> AccountId {

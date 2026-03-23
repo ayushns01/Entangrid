@@ -84,6 +84,12 @@ Current runtime detail:
 - failed outbound session attempts penalize the local validator only when an assigned relay target could not be reached, and only once per target per epoch
 - invalid receipts penalize the witness validator that signed them
 - so the `minus penalties` part of the formula is now active in the running prototype, not just present in the math
+- the score weights are now configurable through shared config, so localnet experiments can tune the same consensus formula without recompiling the crate
+- the default profile still matches the current prototype:
+  - uptime `0.25`
+  - delivery `0.50`
+  - diversity `0.25`
+  - penalty `1.00`
 
 ### Commitments
 
@@ -120,6 +126,7 @@ Important detail:
 - the node runtime decides **when** service gating starts for a given network through config
 - the node runtime also decides **what threshold** service gating uses for a given network through config
 - the node runtime also decides how many recent epochs are included in the rolling score window
+- the node runtime now also decides which score-weight profile is applied to those counters before the final service score is computed
 - that start epoch is now configurable instead of being hard-coded in the runtime
 
 ## What this consensus is today

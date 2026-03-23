@@ -43,6 +43,7 @@ It also:
 - can set the epoch where service gating should start
 - can set the service-gating threshold
 - can set how many epochs are included in the rolling service-score window
+- can set the service-score weight profile, including how strongly penalties affect the final score
 - can mark one validator as degraded
 
 ### `up`
@@ -112,6 +113,8 @@ Current built-in scenarios include:
 - threshold sweep with a stricter gating threshold
 - score-window sweep with a short window
 - score-window sweep with a long window
+- penalty-weight sweep with a lighter penalty profile
+- penalty-weight sweep with a harsher penalty profile
 - sync-control flood against one validator
 - inbound connection flood against one validator
 
@@ -134,6 +137,7 @@ Recent improvement:
 - matrix shutdown now interrupts all validators together before a hard kill, which makes the generated reports much less likely to trip over truncated final JSONL appends or shutdown-induced chain skew
 - matrix/report JSONL readers now ignore only a truncated trailing line, so interrupted runs are easier to inspect without hiding mid-file corruption
 - localnet and matrix summaries now expose the penalty counters behind each validator's current score, which makes threshold and score-window tuning much easier to compare across runs
+- localnet and matrix summaries now also expose the active score-weight profile, which makes penalty-weight tuning comparable from one run to the next
 - localnet and matrix summaries now also expose peer-rate-limit drops and inbound-session drops, which makes abuse-control tuning visible without digging into raw metrics files
 - the matrix can now generate protocol-level abuse traffic itself, so we can regression-test the new per-peer rate limits and inbound listener caps without needing manual socket scripts
 - the matrix now also exposes non-target below-threshold counts and non-target gating rejections, so threshold/window sweeps tell us whether a policy is only punishing the degraded validator or harming honest ones too
@@ -153,10 +157,11 @@ Recent improvement:
 - `init-localnet` now accepts `--service-gating-start-epoch`
 - `init-localnet` now accepts `--service-gating-threshold`
 - `init-localnet` now accepts `--service-score-window-epochs`
+- `init-localnet` now accepts score-weight flags like `--service-score-penalty-weight`
 - `matrix` now gives us a repeatable test harness for the harsh baseline and degraded-validator cases we were previously running by hand
 - this makes it easier to keep the first few epochs as warmup before proposer gating is enforced
 - this also makes it possible to tune how strict gating should be without recompiling the node
-- this also makes it easier to trade off score stability versus responsiveness in local experiments
+- this also makes it easier to trade off score stability, responsiveness, and penalty harshness in local experiments
 
 ## What it is today
 

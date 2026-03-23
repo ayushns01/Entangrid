@@ -11,9 +11,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, ProtocolMessage, SignedEnvelope, SignedTransaction, Transaction, ValidatorConfig,
-    canonical_hash, default_service_gating_threshold, empty_hash, now_unix_millis,
-    validator_account,
+    PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
+    Transaction, ValidatorConfig, canonical_hash, default_service_delivery_weight,
+    default_service_diversity_weight, default_service_gating_threshold,
+    default_service_penalty_weight, default_service_score_weights, default_service_uptime_weight,
+    empty_hash, now_unix_millis, validator_account,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -52,6 +54,14 @@ enum Commands {
         service_gating_threshold: f64,
         #[arg(long, default_value_t = 4)]
         service_score_window_epochs: u64,
+        #[arg(long, default_value_t = default_service_uptime_weight())]
+        service_score_uptime_weight: f64,
+        #[arg(long, default_value_t = default_service_delivery_weight())]
+        service_score_delivery_weight: f64,
+        #[arg(long, default_value_t = default_service_diversity_weight())]
+        service_score_diversity_weight: f64,
+        #[arg(long, default_value_t = default_service_penalty_weight())]
+        service_score_penalty_weight: f64,
         #[arg(long)]
         degraded_validator: Option<u64>,
         #[arg(long, default_value_t = 0)]
@@ -106,6 +116,7 @@ struct MatrixScenario {
     service_gating_start_epoch: u64,
     service_gating_threshold: f64,
     service_score_window_epochs: u64,
+    service_score_weights: ServiceScoreWeights,
     degraded_validator: Option<u64>,
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
@@ -156,6 +167,10 @@ pub async fn cli_main() -> Result<()> {
             service_gating_start_epoch,
             service_gating_threshold,
             service_score_window_epochs,
+            service_score_uptime_weight,
+            service_score_delivery_weight,
+            service_score_diversity_weight,
+            service_score_penalty_weight,
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -170,6 +185,12 @@ pub async fn cli_main() -> Result<()> {
             service_gating_start_epoch,
             service_gating_threshold,
             service_score_window_epochs,
+            ServiceScoreWeights {
+                uptime_weight: service_score_uptime_weight,
+                delivery_weight: service_score_delivery_weight,
+                diversity_weight: service_score_diversity_weight,
+                penalty_weight: service_score_penalty_weight,
+            },
             degraded_validator,
             degraded_delay_ms,
             degraded_drop_probability,
@@ -200,6 +221,7 @@ pub fn init_localnet(
     service_gating_start_epoch: u64,
     service_gating_threshold: f64,
     service_score_window_epochs: u64,
+    service_score_weights: ServiceScoreWeights,
     degraded_validator: Option<u64>,
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
@@ -281,6 +303,7 @@ pub fn init_localnet(
                 service_gating_start_epoch,
                 service_gating_threshold,
                 service_score_window_epochs,
+                service_score_weights: service_score_weights.clone(),
             },
             fault_profile,
             sync_on_startup: true,
@@ -490,6 +513,7 @@ async fn run_matrix_scenario(
         scenario.service_gating_start_epoch,
         scenario.service_gating_threshold,
         scenario.service_score_window_epochs,
+        scenario.service_score_weights.clone(),
         scenario.degraded_validator,
         scenario.degraded_delay_ms,
         scenario.degraded_drop_probability,
@@ -532,6 +556,7 @@ async fn run_matrix_scenario(
         gating_enabled: scenario.enable_service_gating,
         gating_threshold: scenario.service_gating_threshold,
         score_window_epochs: scenario.service_score_window_epochs,
+        score_weights: scenario.service_score_weights.clone(),
         policy_target_validator,
         expected_lowest_validator: scenario.expected_lowest_validator,
         min_lowest_score: scenario.min_lowest_score,
@@ -820,6 +845,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 2,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
@@ -847,6 +873,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 2,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
@@ -874,6 +901,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(4),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.85,
@@ -901,6 +929,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
@@ -928,6 +957,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
@@ -955,6 +985,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: 0.25,
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
@@ -982,6 +1013,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: 0.55,
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
@@ -1009,6 +1041,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 1,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
@@ -1036,12 +1069,75 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 3,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 8,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.95,
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 24,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-penalty-050",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            service_score_weights: ServiceScoreWeights {
+                penalty_weight: 0.50,
+                ..default_service_score_weights()
+            },
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-penalty-150",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            service_score_weights: ServiceScoreWeights {
+                penalty_weight: 1.50,
+                ..default_service_score_weights()
+            },
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
             abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: Some(3),
@@ -1063,6 +1159,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 2,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
@@ -1094,6 +1191,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             service_gating_start_epoch: 2,
             service_gating_threshold: default_service_gating_threshold(),
             service_score_window_epochs: 4,
+            service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
             degraded_drop_probability: 0.0,
@@ -1248,6 +1346,7 @@ struct ValidatorReport {
     current_epoch: u64,
     current_slot: u64,
     last_local_service_score: f64,
+    service_score_weights: ServiceScoreWeights,
     failed_sessions: u64,
     invalid_receipts: u64,
     service_gating_rejections: u64,
@@ -1307,6 +1406,7 @@ struct MatrixScenarioResult {
     gating_enabled: bool,
     gating_threshold: f64,
     score_window_epochs: u64,
+    score_weights: ServiceScoreWeights,
     policy_target_validator: Option<u64>,
     expected_lowest_validator: Option<u64>,
     min_lowest_score: Option<f64>,
@@ -1366,11 +1466,15 @@ impl LocalnetReport {
         }
         for validator in &self.validators {
             lines.push(format!(
-                "validator {}: epoch {} slot {} score {:.3} failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {} peer_rate_limited {} inbound_session_drops {}",
+                "validator {}: epoch {} slot {} score {:.3} weights [{:.2},{:.2},{:.2},-{:.2}] failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {} peer_rate_limited {} inbound_session_drops {}",
                 validator.validator_id,
                 validator.current_epoch,
                 validator.current_slot,
                 validator.last_local_service_score,
+                validator.service_score_weights.uptime_weight,
+                validator.service_score_weights.delivery_weight,
+                validator.service_score_weights.diversity_weight,
+                validator.service_score_weights.penalty_weight,
                 validator.failed_sessions,
                 validator.invalid_receipts,
                 validator.blocks_proposed,
@@ -1447,7 +1551,7 @@ impl MatrixReport {
         ];
         for scenario in &self.scenarios {
             lines.push(format!(
-                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} honest_below_threshold {} honest_gating_rejections {} rate_limit_drops {} inbound_drops {}",
+                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} honest_below_threshold {} honest_gating_rejections {} weights [{:.2},{:.2},{:.2},-{:.2}] rate_limit_drops {} inbound_drops {}",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
                 scenario.structural_report.same_chain_count,
@@ -1463,6 +1567,10 @@ impl MatrixReport {
                 scenario.localnet_report.total_gating_rejections,
                 scenario.non_target_below_threshold_count,
                 scenario.non_target_gating_rejections,
+                scenario.score_weights.uptime_weight,
+                scenario.score_weights.delivery_weight,
+                scenario.score_weights.diversity_weight,
+                scenario.score_weights.penalty_weight,
                 scenario.localnet_report.total_peer_rate_limit_drops,
                 scenario.localnet_report.total_inbound_session_drops
             ));
@@ -1525,8 +1633,14 @@ impl MatrixReport {
                 lines.push(format!("- Abuse: `{abuse_pattern}`"));
             }
             lines.push(format!(
-                "- Gating: `{}` threshold `{:.3}` score window `{}` epochs",
-                scenario.gating_enabled, scenario.gating_threshold, scenario.score_window_epochs
+                "- Gating: `{}` threshold `{:.3}` score window `{}` epochs weights `[{:.2}, {:.2}, {:.2}, -{:.2}]`",
+                scenario.gating_enabled,
+                scenario.gating_threshold,
+                scenario.score_window_epochs,
+                scenario.score_weights.uptime_weight,
+                scenario.score_weights.delivery_weight,
+                scenario.score_weights.diversity_weight,
+                scenario.score_weights.penalty_weight
             ));
             if let Some(target_validator) = scenario.policy_target_validator {
                 lines.push(format!(
@@ -1550,13 +1664,14 @@ impl MatrixReport {
                 scenario.localnet_report.total_inbound_session_drops
             ));
             lines.push(String::new());
-            lines.push("| Validator | Score | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts | Rate-Limited | Inbound Drops |".to_string());
-            lines.push("|---|---|---|---|---|---|---|---|---|---|---|".to_string());
+            lines.push("| Validator | Score | Penalty Weight | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts | Rate-Limited | Inbound Drops |".to_string());
+            lines.push("|---|---|---|---|---|---|---|---|---|---|---|---|".to_string());
             for validator in &scenario.localnet_report.validators {
                 lines.push(format!(
-                    "| {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    "| {} | {:.3} | {:.2} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                     validator.validator_id,
                     validator.last_local_service_score,
+                    validator.service_score_weights.penalty_weight,
                     validator.failed_sessions,
                     validator.invalid_receipts,
                     validator.blocks_proposed,
@@ -1602,6 +1717,7 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
             current_epoch: metrics.current_epoch,
             current_slot: metrics.current_slot,
             last_local_service_score: metrics.last_local_service_score,
+            service_score_weights: metrics.service_score_weights.clone(),
             failed_sessions: metrics.last_local_service_counters.failed_sessions,
             invalid_receipts: metrics.last_local_service_counters.invalid_receipts,
             service_gating_rejections: metrics.service_gating_rejections,
@@ -1833,6 +1949,7 @@ mod tests {
             2,
             0.40,
             4,
+            default_service_score_weights(),
             None,
             0,
             0.0,
@@ -1887,6 +2004,7 @@ mod tests {
             3,
             0.35,
             6,
+            default_service_score_weights(),
             Some(3),
             0,
             0.75,
@@ -1900,6 +2018,10 @@ mod tests {
         assert_eq!(node_config.feature_flags.service_gating_start_epoch, 3);
         assert!((node_config.feature_flags.service_gating_threshold - 0.35).abs() < f64::EPSILON);
         assert_eq!(node_config.feature_flags.service_score_window_epochs, 6);
+        assert_eq!(
+            node_config.feature_flags.service_score_weights,
+            default_service_score_weights()
+        );
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
     }
 
@@ -1917,6 +2039,7 @@ mod tests {
             3,
             0.40,
             4,
+            default_service_score_weights(),
             None,
             0,
             0.0,
@@ -2004,6 +2127,7 @@ mod tests {
             3,
             0.40,
             4,
+            default_service_score_weights(),
             None,
             0,
             0.0,
@@ -2039,6 +2163,8 @@ mod tests {
                 "policy-threshold-055",
                 "policy-window-1",
                 "policy-window-8",
+                "policy-penalty-050",
+                "policy-penalty-150",
                 "abuse-sync-control-flood",
                 "abuse-inbound-connection-flood",
             ]
@@ -2061,6 +2187,7 @@ mod tests {
                 gating_enabled: true,
                 gating_threshold: 0.40,
                 score_window_epochs: 4,
+                score_weights: default_service_score_weights(),
                 policy_target_validator: Some(4),
                 expected_lowest_validator: Some(4),
                 min_lowest_score: None,
@@ -2089,6 +2216,7 @@ mod tests {
                         current_epoch: 4,
                         current_slot: 19,
                         last_local_service_score: 0.25,
+                        service_score_weights: default_service_score_weights(),
                         failed_sessions: 1,
                         invalid_receipts: 2,
                         service_gating_rejections: 2,
@@ -2133,6 +2261,7 @@ mod tests {
             gating_enabled: true,
             gating_threshold: 0.40,
             score_window_epochs: 4,
+            score_weights: default_service_score_weights(),
             policy_target_validator: Some(4),
             expected_lowest_validator: Some(4),
             min_lowest_score: None,
@@ -2161,6 +2290,7 @@ mod tests {
                     current_epoch: 4,
                     current_slot: 19,
                     last_local_service_score: 0.35,
+                    service_score_weights: default_service_score_weights(),
                     failed_sessions: 0,
                     invalid_receipts: 0,
                     service_gating_rejections: 0,

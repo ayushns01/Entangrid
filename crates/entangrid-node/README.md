@@ -138,9 +138,11 @@ The recent gating-focused improvement in this crate was mostly about observabili
 - service gating start is now configurable per localnet
 - service gating threshold is now configurable per localnet
 - the rolling score window is now configurable per localnet
+- service-score weights are now configurable per localnet
 - proposer checks log the counters behind the score
 - missed slots log the reason more clearly
 - `metrics.json` keeps the latest local service counters alongside the score
+- `metrics.json` now also stores the active score-weight profile so reports can tell you not just what the counters were, but how the node interpreted them
 - `metrics.json` now also tracks how many duplicate receipts were ignored
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking:

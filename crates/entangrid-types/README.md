@@ -63,6 +63,7 @@ Right now this crate is intentionally simple and very central.
   - the epoch where gating should start
   - the score threshold used by service gating
   - the number of epochs included in the rolling service-score window
+  - the shared score-weight profile used to turn counters into a final service score
 - `ServiceCounters` is the shared score-breakdown struct used to describe:
   - uptime windows
   - timely deliveries
@@ -97,8 +98,10 @@ One recent example of that role is service gating:
 
 - the simulator writes `service_gating_start_epoch` into node config through these shared types
 - the simulator also writes the service-score window length through these shared types
+- the simulator now also writes shared `ServiceScoreWeights` through these same config types
 - the node reports score breakdowns back into `NodeMetrics` through these shared types
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
+- `NodeMetrics` now also carries the active score-weight profile so reports can explain not just the counters, but the policy that turned them into a score
 
 One recent example of the type layer evolving with the protocol is block commitments:
 
