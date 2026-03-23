@@ -108,6 +108,10 @@ Current built-in scenarios include:
 - gated `85%` drop on one validator
 - gated `95%` drop on one validator
 - gated outbound-disabled validator
+- threshold sweep with a lower gating threshold
+- threshold sweep with a stricter gating threshold
+- score-window sweep with a short window
+- score-window sweep with a long window
 - sync-control flood against one validator
 - inbound connection flood against one validator
 
@@ -119,6 +123,7 @@ For each scenario it:
 - waits for convergence during a bounded settle window
 - captures the structural/localnet report at that converged moment
 - checks scenario-specific expectations such as "the degraded validator had the lowest score", "that validator was actually gated" in the harshest cases, and "baseline validators stayed above a minimum score floor"
+- checks policy-side expectations such as "how many non-target validators fell below threshold" and "how much honest gating fallout happened" under threshold/window sweeps
 - checks abuse-control expectations such as "peer rate limits were actually triggered" and "inbound session caps were actually exercised" in the dedicated adversarial cases
 - shuts the nodes down
 - verifies structural chain health
@@ -131,6 +136,7 @@ Recent improvement:
 - localnet and matrix summaries now expose the penalty counters behind each validator's current score, which makes threshold and score-window tuning much easier to compare across runs
 - localnet and matrix summaries now also expose peer-rate-limit drops and inbound-session drops, which makes abuse-control tuning visible without digging into raw metrics files
 - the matrix can now generate protocol-level abuse traffic itself, so we can regression-test the new per-peer rate limits and inbound listener caps without needing manual socket scripts
+- the matrix now also exposes non-target below-threshold counts and non-target gating rejections, so threshold/window sweeps tell us whether a policy is only punishing the degraded validator or harming honest ones too
 
 ### Fault and degradation controls
 

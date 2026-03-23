@@ -150,7 +150,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - malformed peer data is rejected locally instead of taking the node down
 - the periodic sync tick now broadcasts lightweight `SyncStatus` instead of a full chain snapshot
 - when a peer is on the same branch but behind, the node now prefers an incremental block segment over a full snapshot
-- when a peer is unknown, diverged, or cannot advertise its stale state, the node falls back to a full snapshot so recovery still works
+- when a peer is unknown, diverged, too far behind, or cannot advertise its stale state accurately, the node falls back to a full snapshot so recovery still works instead of looping on stale incremental sync segments
 - repeated sync requests from the same peer are throttled, which makes the prototype harder to abuse without breaking recovery
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append

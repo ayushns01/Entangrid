@@ -27,6 +27,7 @@ const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
 const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
+const MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS: usize = 12;
 const SYNC_REQUEST_COOLDOWN_MILLIS: u64 = 1_500;
 const PEER_MESSAGE_WINDOW_MILLIS: u64 = 5_000;
 const MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW: u64 = 24;
@@ -1706,7 +1707,10 @@ fn build_chain_segment_from_chain(
     }
 
     let missing_blocks = blocks.get(known_height as usize..)?.to_vec();
-    if missing_blocks.is_empty() || missing_blocks.len() > MAX_INCREMENTAL_SYNC_BLOCKS {
+    if missing_blocks.is_empty()
+        || missing_blocks.len() > MAX_INCREMENTAL_SYNC_BLOCKS
+        || missing_blocks.len() > MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS
+    {
         return None;
     }
 
@@ -2304,6 +2308,24 @@ mod tests {
         .clone();
 
         let segment = build_chain_segment_from_chain(&snapshot, &[block], &[], 4, 0, [9u8; 32]);
+        assert!(segment.is_none());
+    }
+
+    #[test]
+    fn build_chain_segment_prefers_full_snapshot_for_large_gap() {
+        let genesis = sample_genesis();
+        let block = first_valid_block(&genesis);
+        let snapshot = LedgerState::replay_blocks(
+            &genesis,
+            std::slice::from_ref(&block),
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+        let blocks = vec![block; MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS + 1];
+
+        let segment = build_chain_segment_from_chain(&snapshot, &blocks, &[], 4, 0, empty_hash());
         assert!(segment.is_none());
     }
 

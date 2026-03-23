@@ -118,6 +118,8 @@ struct MatrixScenario {
     min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
+    max_non_target_below_threshold_count: Option<usize>,
+    max_non_target_gating_rejections: Option<u64>,
     min_total_peer_rate_limit_drops: Option<u64>,
     min_total_inbound_session_drops: Option<u64>,
 }
@@ -510,6 +512,16 @@ async fn run_matrix_scenario(
     .await;
     shutdown_children(&mut children).await;
     let (localnet_report, structural_report) = run_result?;
+    let policy_target_validator = scenario
+        .degraded_validator
+        .or(scenario.expected_lowest_validator);
+    let non_target_below_threshold_count = count_non_target_below_threshold(
+        &localnet_report,
+        scenario.service_gating_threshold,
+        policy_target_validator,
+    );
+    let non_target_gating_rejections =
+        total_non_target_gating_rejections(&localnet_report, policy_target_validator);
     Ok(MatrixScenarioResult {
         name: scenario.name.to_string(),
         base_dir: base_dir.to_string_lossy().to_string(),
@@ -519,12 +531,18 @@ async fn run_matrix_scenario(
         settle_secs: scenario.settle_secs,
         gating_enabled: scenario.enable_service_gating,
         gating_threshold: scenario.service_gating_threshold,
+        score_window_epochs: scenario.service_score_window_epochs,
+        policy_target_validator,
         expected_lowest_validator: scenario.expected_lowest_validator,
         min_lowest_score: scenario.min_lowest_score,
         max_lowest_score: scenario.max_lowest_score,
         min_validator_gating_rejections: scenario.min_validator_gating_rejections,
+        max_non_target_below_threshold_count: scenario.max_non_target_below_threshold_count,
+        max_non_target_gating_rejections: scenario.max_non_target_gating_rejections,
         min_total_peer_rate_limit_drops: scenario.min_total_peer_rate_limit_drops,
         min_total_inbound_session_drops: scenario.min_total_inbound_session_drops,
+        non_target_below_threshold_count,
+        non_target_gating_rejections,
         localnet_report,
         structural_report,
     })
@@ -740,7 +758,54 @@ fn scenario_expectations_met(
         }
     }
 
+    let policy_target_validator = scenario
+        .degraded_validator
+        .or(scenario.expected_lowest_validator);
+    if let Some(maximum) = scenario.max_non_target_below_threshold_count {
+        if count_non_target_below_threshold(
+            localnet_report,
+            scenario.service_gating_threshold,
+            policy_target_validator,
+        ) > maximum
+        {
+            return false;
+        }
+    }
+
+    if let Some(maximum) = scenario.max_non_target_gating_rejections {
+        if total_non_target_gating_rejections(localnet_report, policy_target_validator) > maximum {
+            return false;
+        }
+    }
+
     true
+}
+
+fn count_non_target_below_threshold(
+    localnet_report: &LocalnetReport,
+    gating_threshold: f64,
+    target_validator: Option<u64>,
+) -> usize {
+    localnet_report
+        .validators
+        .iter()
+        .filter(|validator| {
+            Some(validator.validator_id) != target_validator
+                && validator.last_local_service_score < gating_threshold
+        })
+        .count()
+}
+
+fn total_non_target_gating_rejections(
+    localnet_report: &LocalnetReport,
+    target_validator: Option<u64>,
+) -> u64 {
+    localnet_report
+        .validators
+        .iter()
+        .filter(|validator| Some(validator.validator_id) != target_validator)
+        .map(|validator| validator.service_gating_rejections)
+        .sum()
 }
 
 fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
@@ -767,6 +832,8 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: Some(0.95),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: None,
+            max_non_target_gating_rejections: None,
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
         },
@@ -792,6 +859,8 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: Some(0.45),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: None,
+            max_non_target_gating_rejections: None,
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
         },
@@ -817,6 +886,8 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: None,
             max_lowest_score: Some(0.85),
             min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
         },
@@ -840,8 +911,10 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             settle_secs,
             expected_lowest_validator: Some(3),
             min_lowest_score: None,
-            max_lowest_score: Some(0.20),
+            max_lowest_score: None,
             min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
         },
@@ -867,6 +940,116 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: None,
             max_lowest_score: Some(0.05),
             min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-threshold-025",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: 0.25,
+            service_score_window_epochs: 4,
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-threshold-055",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: 0.55,
+            service_score_window_epochs: 4,
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 20,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-window-1",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 1,
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 22,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(1),
+            max_non_target_gating_rejections: Some(1),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "policy-window-8",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: true,
+            service_gating_start_epoch: 3,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 8,
+            degraded_validator: Some(3),
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.95,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 24,
+            abuse_pattern: None,
+            settle_secs,
+            expected_lowest_validator: Some(3),
+            min_lowest_score: None,
+            max_lowest_score: None,
+            min_validator_gating_rejections: Some((3, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
         },
@@ -896,6 +1079,8 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: Some(0.85),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: None,
+            max_non_target_gating_rejections: None,
             min_total_peer_rate_limit_drops: Some(8),
             min_total_inbound_session_drops: None,
         },
@@ -926,6 +1111,8 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_lowest_score: Some(0.85),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: None,
+            max_non_target_gating_rejections: None,
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: Some(1),
         },
@@ -1119,12 +1306,18 @@ struct MatrixScenarioResult {
     settle_secs: u64,
     gating_enabled: bool,
     gating_threshold: f64,
+    score_window_epochs: u64,
+    policy_target_validator: Option<u64>,
     expected_lowest_validator: Option<u64>,
     min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
+    max_non_target_below_threshold_count: Option<usize>,
+    max_non_target_gating_rejections: Option<u64>,
     min_total_peer_rate_limit_drops: Option<u64>,
     min_total_inbound_session_drops: Option<u64>,
+    non_target_below_threshold_count: usize,
+    non_target_gating_rejections: u64,
     localnet_report: LocalnetReport,
     structural_report: StructuralReport,
 }
@@ -1232,6 +1425,12 @@ impl MatrixScenarioResult {
             && self
                 .min_total_inbound_session_drops
                 .is_none_or(|minimum| self.localnet_report.total_inbound_session_drops >= minimum)
+            && self
+                .max_non_target_below_threshold_count
+                .is_none_or(|maximum| self.non_target_below_threshold_count <= maximum)
+            && self
+                .max_non_target_gating_rejections
+                .is_none_or(|maximum| self.non_target_gating_rejections <= maximum)
     }
 }
 
@@ -1248,7 +1447,7 @@ impl MatrixReport {
         ];
         for scenario in &self.scenarios {
             lines.push(format!(
-                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} rate_limit_drops {} inbound_drops {}",
+                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} honest_below_threshold {} honest_gating_rejections {} rate_limit_drops {} inbound_drops {}",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
                 scenario.structural_report.same_chain_count,
@@ -1262,6 +1461,8 @@ impl MatrixReport {
                     .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
                     .unwrap_or_else(|| "n/a".into()),
                 scenario.localnet_report.total_gating_rejections,
+                scenario.non_target_below_threshold_count,
+                scenario.non_target_gating_rejections,
                 scenario.localnet_report.total_peer_rate_limit_drops,
                 scenario.localnet_report.total_inbound_session_drops
             ));
@@ -1285,8 +1486,8 @@ impl MatrixReport {
                 self.scenarios.len()
             ),
             String::new(),
-            "| Scenario | Status | Validators | Same Chain | Parent Hashes | Snapshots | Clean stderr | Lowest Score | Gating Rejections |".to_string(),
-            "|---|---|---|---|---|---|---|---|---|".to_string(),
+            "| Scenario | Status | Validators | Same Chain | Parent Hashes | Snapshots | Clean stderr | Lowest Score | Gating Rejections | Honest Below Threshold | Honest Gating Rejections |".to_string(),
+            "|---|---|---|---|---|---|---|---|---|---|---|".to_string(),
         ];
 
         for scenario in &self.scenarios {
@@ -1296,7 +1497,7 @@ impl MatrixReport {
                 .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
                 .unwrap_or_else(|| "n/a".into());
             lines.push(format!(
-                "| {} | {} | {} | {}/{} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} |",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
                 scenario.localnet_report.configured_validators,
@@ -1306,7 +1507,9 @@ impl MatrixReport {
                 scenario.structural_report.all_tips_match,
                 scenario.structural_report.all_stderr_clean,
                 lowest_score,
-                scenario.localnet_report.total_gating_rejections
+                scenario.localnet_report.total_gating_rejections,
+                scenario.non_target_below_threshold_count,
+                scenario.non_target_gating_rejections
             ));
         }
 
@@ -1322,9 +1525,17 @@ impl MatrixReport {
                 lines.push(format!("- Abuse: `{abuse_pattern}`"));
             }
             lines.push(format!(
-                "- Gating: `{}` threshold `{:.3}`",
-                scenario.gating_enabled, scenario.gating_threshold
+                "- Gating: `{}` threshold `{:.3}` score window `{}` epochs",
+                scenario.gating_enabled, scenario.gating_threshold, scenario.score_window_epochs
             ));
+            if let Some(target_validator) = scenario.policy_target_validator {
+                lines.push(format!(
+                    "- Policy target validator: `v{}`; non-target validators below threshold `{}`; non-target gating rejections `{}`",
+                    target_validator,
+                    scenario.non_target_below_threshold_count,
+                    scenario.non_target_gating_rejections
+                ));
+            }
             lines.push(format!(
                 "- Structural: same chain `{}/{}`, parent hashes `{}`, snapshots `{}`, clean stderr `{}`",
                 scenario.structural_report.same_chain_count,
@@ -1824,6 +2035,10 @@ mod tests {
                 "gated-drop85",
                 "gated-drop95",
                 "gated-outbound-disabled",
+                "policy-threshold-025",
+                "policy-threshold-055",
+                "policy-window-1",
+                "policy-window-8",
                 "abuse-sync-control-flood",
                 "abuse-inbound-connection-flood",
             ]
@@ -1845,12 +2060,18 @@ mod tests {
                 settle_secs: 10,
                 gating_enabled: true,
                 gating_threshold: 0.40,
+                score_window_epochs: 4,
+                policy_target_validator: Some(4),
                 expected_lowest_validator: Some(4),
                 min_lowest_score: None,
                 max_lowest_score: Some(0.30),
                 min_validator_gating_rejections: Some((4, 1)),
+                max_non_target_below_threshold_count: Some(0),
+                max_non_target_gating_rejections: Some(0),
                 min_total_peer_rate_limit_drops: None,
                 min_total_inbound_session_drops: None,
+                non_target_below_threshold_count: 0,
+                non_target_gating_rejections: 0,
                 localnet_report: LocalnetReport {
                     base_dir: "var/localnet-matrix/demo".into(),
                     configured_validators: 4,
@@ -1911,12 +2132,18 @@ mod tests {
             settle_secs: 10,
             gating_enabled: true,
             gating_threshold: 0.40,
+            score_window_epochs: 4,
+            policy_target_validator: Some(4),
             expected_lowest_validator: Some(4),
             min_lowest_score: None,
             max_lowest_score: Some(0.30),
             min_validator_gating_rejections: Some((4, 1)),
+            max_non_target_below_threshold_count: Some(0),
+            max_non_target_gating_rejections: Some(0),
             min_total_peer_rate_limit_drops: None,
             min_total_inbound_session_drops: None,
+            non_target_below_threshold_count: 0,
+            non_target_gating_rejections: 0,
             localnet_report: LocalnetReport {
                 base_dir: "var/localnet-matrix/demo".into(),
                 configured_validators: 4,
