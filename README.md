@@ -170,6 +170,7 @@ cargo run -p entangrid-sim -- matrix \
 
 The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking. Those expectations now cover both sides of the policy: harsh degraded runs must actually gate the targeted validator, and baseline runs must keep honest validators above a minimum score floor.
 The localnet reports now also surface the penalty inputs behind the latest score, including failed session counts and invalid receipts, so threshold and window tuning is easier to inspect from one run to the next.
+The built-in matrix also includes abuse-control scenarios now, so we can verify that sync-control floods trip peer rate limits and inbound connection floods trip listener session caps without breaking the Entangrid-specific degraded-validator cases.
 Recent hardening also tightened two protocol-surface issues found during adversarial review:
 
 - sync snapshot adoption now validates incoming blocks structurally instead of trusting raw ledger replay alone
@@ -177,6 +178,7 @@ Recent hardening also tightened two protocol-surface issues found during adversa
 - inbound network frames now have a fixed maximum size to avoid unbounded allocation on a malicious length prefix
 - sync now uses `SyncStatus` plus incremental block segments for same-chain peers, with per-peer request throttling and full snapshots kept as the safe fallback
 - inbound session handling is now capped, and nodes apply per-peer rate limits to spam-prone sync/receipt/tx gossip before that traffic reaches more expensive logic
+- the matrix now reports total `peer_rate_limit_drops` and `inbound_session_drops` so abuse-control regressions show up in the same report as convergence and gating outcomes
 
 Then inspect:
 

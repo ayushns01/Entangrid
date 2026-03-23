@@ -11,11 +11,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash,
-    default_service_gating_threshold, empty_hash, now_unix_millis, validator_account,
+    PeerConfig, ProtocolMessage, SignedEnvelope, SignedTransaction, Transaction, ValidatorConfig,
+    canonical_hash, default_service_gating_threshold, empty_hash, now_unix_millis,
+    validator_account,
 };
 use serde::{Deserialize, Serialize};
-use tokio::process::{Child, Command};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    process::{Child, Command},
+};
 use tracing::info;
 
 #[derive(Parser)]
@@ -107,11 +112,29 @@ struct MatrixScenario {
     degraded_disable_outbound: bool,
     load_scenario: LoadScenario,
     load_duration_secs: u64,
+    abuse_pattern: Option<AbusePattern>,
     settle_secs: u64,
     expected_lowest_validator: Option<u64>,
     min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
+    min_total_peer_rate_limit_drops: Option<u64>,
+    min_total_inbound_session_drops: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum AbusePattern {
+    SyncControlFlood {
+        source_validator_id: u64,
+        duration_secs: u64,
+        bursts_per_second: u64,
+    },
+    InboundConnectionFlood {
+        target_validator_id: u64,
+        concurrent_connections: usize,
+        hold_millis: u64,
+        rounds: u64,
+    },
 }
 
 pub async fn cli_main() -> Result<()> {
@@ -473,12 +496,15 @@ async fn run_matrix_scenario(
 
     let mut children = spawn_localnet_children(base_dir).await?;
     let run_result = async {
-        load_scenario(
+        let load_future = load_scenario(
             base_dir,
             scenario.load_scenario,
             scenario.load_duration_secs,
-        )
-        .await?;
+        );
+        let abuse_future = run_abuse_pattern(base_dir, scenario.abuse_pattern.clone());
+        let (load_result, abuse_result) = tokio::join!(load_future, abuse_future);
+        load_result?;
+        abuse_result?;
         wait_for_scenario_expectations(base_dir, scenario).await
     }
     .await;
@@ -489,6 +515,7 @@ async fn run_matrix_scenario(
         base_dir: base_dir.to_string_lossy().to_string(),
         load_scenario: scenario.load_scenario,
         load_duration_secs: scenario.load_duration_secs,
+        abuse_pattern: scenario.abuse_pattern.as_ref().map(describe_abuse_pattern),
         settle_secs: scenario.settle_secs,
         gating_enabled: scenario.enable_service_gating,
         gating_threshold: scenario.service_gating_threshold,
@@ -496,9 +523,125 @@ async fn run_matrix_scenario(
         min_lowest_score: scenario.min_lowest_score,
         max_lowest_score: scenario.max_lowest_score,
         min_validator_gating_rejections: scenario.min_validator_gating_rejections,
+        min_total_peer_rate_limit_drops: scenario.min_total_peer_rate_limit_drops,
+        min_total_inbound_session_drops: scenario.min_total_inbound_session_drops,
         localnet_report,
         structural_report,
     })
+}
+
+fn describe_abuse_pattern(pattern: &AbusePattern) -> String {
+    match pattern {
+        AbusePattern::SyncControlFlood {
+            source_validator_id,
+            duration_secs,
+            bursts_per_second,
+        } => format!(
+            "sync-control-flood source v{source_validator_id} duration {duration_secs}s bursts/s {bursts_per_second}"
+        ),
+        AbusePattern::InboundConnectionFlood {
+            target_validator_id,
+            concurrent_connections,
+            hold_millis,
+            rounds,
+        } => format!(
+            "inbound-connection-flood target v{target_validator_id} connections {concurrent_connections} hold {hold_millis}ms rounds {rounds}"
+        ),
+    }
+}
+
+async fn run_abuse_pattern(base_dir: &Path, pattern: Option<AbusePattern>) -> Result<()> {
+    let Some(pattern) = pattern else {
+        return Ok(());
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let manifest = read_manifest(base_dir)?;
+    let genesis_contents = fs::read_to_string(&manifest.genesis_path)?;
+    let genesis: GenesisConfig = toml::from_str(&genesis_contents)?;
+    let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+    let node_configs = read_node_configs(&manifest)?;
+
+    match pattern {
+        AbusePattern::SyncControlFlood {
+            source_validator_id,
+            duration_secs,
+            bursts_per_second,
+        } => {
+            let source_config = node_configs
+                .iter()
+                .find(|config| config.validator_id == source_validator_id)
+                .ok_or_else(|| anyhow!("unknown abuse source validator {source_validator_id}"))?;
+            let interval_millis = (1_000 / bursts_per_second.max(1)).max(1);
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(duration_secs) {
+                for peer in &source_config.peers {
+                    let payload = ProtocolMessage::ReceiptFetch {
+                        requester_id: source_validator_id,
+                        epoch: 0,
+                        validator_id: source_validator_id,
+                    };
+                    send_protocol_message(&crypto, source_validator_id, peer, payload).await?;
+                }
+                tokio::time::sleep(Duration::from_millis(interval_millis)).await;
+            }
+        }
+        AbusePattern::InboundConnectionFlood {
+            target_validator_id,
+            concurrent_connections,
+            hold_millis,
+            rounds,
+        } => {
+            let target_config = node_configs
+                .iter()
+                .find(|config| config.validator_id == target_validator_id)
+                .ok_or_else(|| anyhow!("unknown abuse target validator {target_validator_id}"))?;
+            for _ in 0..rounds {
+                let mut streams = Vec::with_capacity(concurrent_connections);
+                for _ in 0..concurrent_connections {
+                    if let Ok(stream) = TcpStream::connect(&target_config.listen_address).await {
+                        streams.push(stream);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(hold_millis)).await;
+                drop(streams);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_protocol_message(
+    crypto: &DeterministicCryptoBackend,
+    from_validator_id: u64,
+    peer: &PeerConfig,
+    payload: ProtocolMessage,
+) -> Result<()> {
+    let message_hash = canonical_hash(&payload);
+    let envelope = SignedEnvelope {
+        from_validator_id,
+        message_hash,
+        signature: crypto.sign(from_validator_id, &message_hash)?,
+        payload,
+    };
+    let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
+    let mut stream = TcpStream::connect(&peer.address).await?;
+    stream.write_u32(bytes.len() as u32).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {
+    manifest
+        .node_configs
+        .iter()
+        .map(|config_path| {
+            let contents = fs::read_to_string(config_path)?;
+            Ok(toml::from_str(&contents)?)
+        })
+        .collect()
 }
 
 async fn wait_for_scenario_expectations(
@@ -585,6 +728,18 @@ fn scenario_expectations_met(
         }
     }
 
+    if let Some(minimum) = scenario.min_total_peer_rate_limit_drops {
+        if localnet_report.total_peer_rate_limit_drops < minimum {
+            return false;
+        }
+    }
+
+    if let Some(minimum) = scenario.min_total_inbound_session_drops {
+        if localnet_report.total_inbound_session_drops < minimum {
+            return false;
+        }
+    }
+
     true
 }
 
@@ -606,11 +761,14 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 12,
+            abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: None,
             min_lowest_score: Some(0.95),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
         },
         MatrixScenario {
             name: "baseline-6-bursty",
@@ -628,11 +786,14 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Bursty,
             load_duration_secs: 18,
+            abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: None,
             min_lowest_score: Some(0.45),
             max_lowest_score: None,
             min_validator_gating_rejections: None,
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
         },
         MatrixScenario {
             name: "gated-drop85",
@@ -650,11 +811,14 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 18,
+            abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: Some(4),
             min_lowest_score: None,
             max_lowest_score: Some(0.85),
             min_validator_gating_rejections: None,
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
         },
         MatrixScenario {
             name: "gated-drop95",
@@ -672,11 +836,14 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             degraded_disable_outbound: false,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 20,
+            abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: Some(3),
             min_lowest_score: None,
             max_lowest_score: Some(0.20),
             min_validator_gating_rejections: Some((3, 1)),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
         },
         MatrixScenario {
             name: "gated-outbound-disabled",
@@ -694,11 +861,73 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             degraded_disable_outbound: true,
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 20,
+            abuse_pattern: None,
             settle_secs,
             expected_lowest_validator: Some(3),
             min_lowest_score: None,
             max_lowest_score: Some(0.05),
             min_validator_gating_rejections: Some((3, 1)),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "abuse-sync-control-flood",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: false,
+            service_gating_start_epoch: 2,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: None,
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.0,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 12,
+            abuse_pattern: Some(AbusePattern::SyncControlFlood {
+                source_validator_id: 4,
+                duration_secs: 8,
+                bursts_per_second: 20,
+            }),
+            settle_secs,
+            expected_lowest_validator: None,
+            min_lowest_score: Some(0.85),
+            max_lowest_score: None,
+            min_validator_gating_rejections: None,
+            min_total_peer_rate_limit_drops: Some(8),
+            min_total_inbound_session_drops: None,
+        },
+        MatrixScenario {
+            name: "abuse-inbound-connection-flood",
+            validators: 4,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 5,
+            start_delay_millis: 1_000,
+            enable_service_gating: false,
+            service_gating_start_epoch: 2,
+            service_gating_threshold: default_service_gating_threshold(),
+            service_score_window_epochs: 4,
+            degraded_validator: None,
+            degraded_delay_ms: 0,
+            degraded_drop_probability: 0.0,
+            degraded_disable_outbound: false,
+            load_scenario: LoadScenario::Steady,
+            load_duration_secs: 12,
+            abuse_pattern: Some(AbusePattern::InboundConnectionFlood {
+                target_validator_id: 1,
+                concurrent_connections: 96,
+                hold_millis: 750,
+                rounds: 3,
+            }),
+            settle_secs,
+            expected_lowest_validator: None,
+            min_lowest_score: Some(0.85),
+            max_lowest_score: None,
+            min_validator_gating_rejections: None,
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: Some(1),
         },
     ]
 }
@@ -886,6 +1115,7 @@ struct MatrixScenarioResult {
     base_dir: String,
     load_scenario: LoadScenario,
     load_duration_secs: u64,
+    abuse_pattern: Option<String>,
     settle_secs: u64,
     gating_enabled: bool,
     gating_threshold: f64,
@@ -893,6 +1123,8 @@ struct MatrixScenarioResult {
     min_lowest_score: Option<f64>,
     max_lowest_score: Option<f64>,
     min_validator_gating_rejections: Option<(u64, u64)>,
+    min_total_peer_rate_limit_drops: Option<u64>,
+    min_total_inbound_session_drops: Option<u64>,
     localnet_report: LocalnetReport,
     structural_report: StructuralReport,
 }
@@ -994,6 +1226,12 @@ impl MatrixScenarioResult {
                         .map(|validator| validator.service_gating_rejections >= minimum)
                         .unwrap_or(false)
                 })
+            && self
+                .min_total_peer_rate_limit_drops
+                .is_none_or(|minimum| self.localnet_report.total_peer_rate_limit_drops >= minimum)
+            && self
+                .min_total_inbound_session_drops
+                .is_none_or(|minimum| self.localnet_report.total_inbound_session_drops >= minimum)
     }
 }
 
@@ -1010,7 +1248,7 @@ impl MatrixReport {
         ];
         for scenario in &self.scenarios {
             lines.push(format!(
-                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {}",
+                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} rate_limit_drops {} inbound_drops {}",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
                 scenario.structural_report.same_chain_count,
@@ -1023,7 +1261,9 @@ impl MatrixReport {
                     .lowest_score
                     .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
                     .unwrap_or_else(|| "n/a".into()),
-                scenario.localnet_report.total_gating_rejections
+                scenario.localnet_report.total_gating_rejections,
+                scenario.localnet_report.total_peer_rate_limit_drops,
+                scenario.localnet_report.total_inbound_session_drops
             ));
         }
         lines.join("\n")
@@ -1078,6 +1318,9 @@ impl MatrixReport {
                 "- Load: `{:?}` for {}s, settle {}s",
                 scenario.load_scenario, scenario.load_duration_secs, scenario.settle_secs
             ));
+            if let Some(abuse_pattern) = &scenario.abuse_pattern {
+                lines.push(format!("- Abuse: `{abuse_pattern}`"));
+            }
             lines.push(format!(
                 "- Gating: `{}` threshold `{:.3}`",
                 scenario.gating_enabled, scenario.gating_threshold
@@ -1089,6 +1332,11 @@ impl MatrixReport {
                 scenario.structural_report.all_parent_ok,
                 scenario.structural_report.all_tips_match,
                 scenario.structural_report.all_stderr_clean
+            ));
+            lines.push(format!(
+                "- Abuse counters: peer rate-limit drops `{}`, inbound session drops `{}`",
+                scenario.localnet_report.total_peer_rate_limit_drops,
+                scenario.localnet_report.total_inbound_session_drops
             ));
             lines.push(String::new());
             lines.push("| Validator | Score | Failed Sessions | Invalid Receipts | Proposed | Validated | Missed | Gated | Receipts | Rate-Limited | Inbound Drops |".to_string());
@@ -1576,6 +1824,8 @@ mod tests {
                 "gated-drop85",
                 "gated-drop95",
                 "gated-outbound-disabled",
+                "abuse-sync-control-flood",
+                "abuse-inbound-connection-flood",
             ]
         );
     }
@@ -1591,6 +1841,7 @@ mod tests {
                 base_dir: "var/localnet-matrix/demo".into(),
                 load_scenario: LoadScenario::Steady,
                 load_duration_secs: 12,
+                abuse_pattern: None,
                 settle_secs: 10,
                 gating_enabled: true,
                 gating_threshold: 0.40,
@@ -1598,6 +1849,8 @@ mod tests {
                 min_lowest_score: None,
                 max_lowest_score: Some(0.30),
                 min_validator_gating_rejections: Some((4, 1)),
+                min_total_peer_rate_limit_drops: None,
+                min_total_inbound_session_drops: None,
                 localnet_report: LocalnetReport {
                     base_dir: "var/localnet-matrix/demo".into(),
                     configured_validators: 4,
@@ -1654,6 +1907,7 @@ mod tests {
             base_dir: "var/localnet-matrix/demo".into(),
             load_scenario: LoadScenario::Steady,
             load_duration_secs: 12,
+            abuse_pattern: None,
             settle_secs: 10,
             gating_enabled: true,
             gating_threshold: 0.40,
@@ -1661,6 +1915,8 @@ mod tests {
             min_lowest_score: None,
             max_lowest_score: Some(0.30),
             min_validator_gating_rejections: Some((4, 1)),
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
             localnet_report: LocalnetReport {
                 base_dir: "var/localnet-matrix/demo".into(),
                 configured_validators: 4,

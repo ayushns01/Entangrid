@@ -108,6 +108,8 @@ Current built-in scenarios include:
 - gated `85%` drop on one validator
 - gated `95%` drop on one validator
 - gated outbound-disabled validator
+- sync-control flood against one validator
+- inbound connection flood against one validator
 
 For each scenario it:
 
@@ -117,6 +119,7 @@ For each scenario it:
 - waits for convergence during a bounded settle window
 - captures the structural/localnet report at that converged moment
 - checks scenario-specific expectations such as "the degraded validator had the lowest score", "that validator was actually gated" in the harshest cases, and "baseline validators stayed above a minimum score floor"
+- checks abuse-control expectations such as "peer rate limits were actually triggered" and "inbound session caps were actually exercised" in the dedicated adversarial cases
 - shuts the nodes down
 - verifies structural chain health
 - writes Markdown and JSON summaries under the chosen output directory
@@ -127,6 +130,7 @@ Recent improvement:
 - matrix/report JSONL readers now ignore only a truncated trailing line, so interrupted runs are easier to inspect without hiding mid-file corruption
 - localnet and matrix summaries now expose the penalty counters behind each validator's current score, which makes threshold and score-window tuning much easier to compare across runs
 - localnet and matrix summaries now also expose peer-rate-limit drops and inbound-session drops, which makes abuse-control tuning visible without digging into raw metrics files
+- the matrix can now generate protocol-level abuse traffic itself, so we can regression-test the new per-peer rate limits and inbound listener caps without needing manual socket scripts
 
 ### Fault and degradation controls
 

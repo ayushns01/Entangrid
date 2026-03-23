@@ -263,6 +263,7 @@ name = "entangrid-sim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "entangrid-crypto",
  "entangrid-types",
