@@ -104,14 +104,14 @@ Important:
 
 ## Current Recommended Prototype Policy
 
-The latest `13/13` rigorous matrix pass currently supports this prototype policy as the best default:
+The current prototype policy for Entangrid-style localnet work is still:
 
 - `service_gating_start_epoch = 3`
 - `service_gating_threshold = 0.40`
 - `service_score_window_epochs = 4`
 - `service_score_weights = [0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-This profile is the current middle ground:
+This is still the best current 4-validator policy baseline:
 
 - earlier gating start epochs risk startup noise
 - lower thresholds like `0.25` are viable, but they have not shown a clear advantage over the current midpoint
@@ -119,6 +119,12 @@ This profile is the current middle ground:
 - a `1`-epoch window is more reactive but more brittle
 - an `8`-epoch window is smoother but slower to reflect degradation
 - a penalty weight of `1.00` remains the clearest neutral default while we continue policy tuning
+
+Important:
+
+- the harsh 4-validator Entangrid scenarios and abuse scenarios are currently in a much better place than before
+- the current live matrix still shows that 6-validator bursty scenarios do not reconverge quickly enough after the normal settle window
+- because of that, this policy should be treated as the current 4-validator pre-PQ baseline, not as a final all-topology signoff
 
 ## Quickstart
 
@@ -188,7 +194,8 @@ cargo run -p entangrid-sim -- matrix \
 ```
 
 The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking. Those expectations now cover both sides of the policy: harsh degraded runs must actually gate the targeted validator, baseline runs must keep honest validators above a minimum score floor, and the policy-sweep cases now track how many non-target validators fell below threshold or suffered gating fallout under different threshold, score-window, and penalty-weight settings.
-The recommended prototype defaults above are the same values used by the current shared config defaults, so a plain gated `init-localnet` run now starts from the matrix-selected policy instead of an older warmup profile.
+The built-in matrix now also includes a healthy `gated-6-bursty` scenario, which is useful because it currently exposes the remaining convergence gap under heavier multi-validator traffic instead of silently hiding it.
+The recommended prototype defaults above are the same values used by the current shared config defaults, so a plain gated `init-localnet` run now starts from the current 4-validator matrix-selected policy instead of an older warmup profile.
 The localnet reports now also surface the penalty inputs behind the latest score, including failed session counts and invalid receipts, so threshold, weight, and window tuning is easier to inspect from one run to the next.
 The built-in matrix also includes abuse-control scenarios now, so we can verify that sync-control floods trip peer rate limits and inbound connection floods trip listener session caps without breaking the Entangrid-specific degraded-validator cases.
 Recent hardening also tightened two protocol-surface issues found during adversarial review:
@@ -201,6 +208,9 @@ Recent hardening also tightened two protocol-surface issues found during adversa
 - the matrix now reports total `peer_rate_limit_drops` and `inbound_session_drops` so abuse-control regressions show up in the same report as convergence and gating outcomes
 - the matrix now also records non-target below-threshold counts and non-target gating rejections, which makes threshold/window tuning much easier to judge from one report
 - service-score weights are now configurable through localnet config, so matrix sweeps can compare not only thresholds and windows but also how strongly penalty counters pull scores down
+- failed-session penalties now only count once a relay target is known live, which avoids treating the earliest bootstrap churn as definitive service failure
+- the transport now retries transient outbound connect failures before surfacing them as hard network failures
+- remote block acceptance no longer rejects peer blocks based on the local node's private service-score view; proposer gating is currently enforced only on local block production until the project has a stronger shared score source
 
 Then inspect:
 

@@ -88,6 +88,8 @@ Recent improvement:
 - sync snapshot adoption now validates the incoming block history structurally instead of trusting raw replay alone
 - sync snapshot adoption now validates and deduplicates incoming receipts before they can influence local service scores
 - this closes a class of sync-poisoning bugs where a malicious peer could try to inject invalid receipt evidence or an invalid longer chain through `SyncResponse`
+- remote block acceptance no longer applies local service-gating rejection logic to peer blocks
+- that means proposer gating is currently enforced on local block production, not on peer-block rejection, until the score source is made more globally shared and deterministic
 
 If the parent is unknown, the block is stored as an orphan.
 
@@ -104,8 +106,9 @@ The node also:
 - respects a configurable `service_gating_threshold` instead of using a hard-coded rejection line
 - respects a configurable rolling service-score window length
 - now feeds two real penalty sources into the score instead of leaving them at zero:
-  - failed outbound session attempts count against the local validator only when an assigned relay target could not be reached, and only once per target per epoch
+  - failed outbound session attempts count against the local validator only when an assigned relay target could not be reached, only after that peer is known live, and only once per target per epoch
   - invalid receipts count against the witness validator that signed them
+- clears a prior failed-session observation for a relay target once a successful outbound session to that target is observed in the same epoch
 - records the latest local score breakdown in metrics and logs
 - drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
 - writes metrics more eagerly around block and slot transitions so localnet reports stay closer to the saved chain state
@@ -152,7 +155,7 @@ The current recommended prototype localnet profile is:
 - score window `4`
 - score weights `[0.25, 0.50, 0.25, -1.00]`
 
-That profile is now the shared default emitted by `init-localnet`, so the node's runtime behavior matches the policy currently selected by the matrix review.
+That profile is still the shared default emitted by `init-localnet`, but it should currently be treated as the best 4-validator baseline rather than a final all-topology signoff.
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
 
@@ -165,6 +168,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - repeated sync requests from the same peer are throttled, which makes the prototype harder to abuse without breaking recovery
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
+- the latest rigorous testing still shows a remaining open issue in 6-validator bursty runs: the node can survive and keep scoring honest validators correctly, but larger-topology peers still do not always reconverge within the normal settle window
 
 But it is still intentionally early-stage.
 

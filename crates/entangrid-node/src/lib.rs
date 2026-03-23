@@ -129,7 +129,9 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         failed_sessions: 0,
         invalid_receipts: 0,
         observed_failed_sessions: BTreeSet::new(),
+        observed_successful_sessions: BTreeSet::new(),
         observed_invalid_receipts: BTreeMap::new(),
+        known_live_peers: BTreeSet::new(),
         last_sync_request_served_at: BTreeMap::new(),
         peer_sync_status: BTreeMap::new(),
         peer_message_windows: BTreeMap::new(),
@@ -165,7 +167,9 @@ struct NodeRunner {
     failed_sessions: u64,
     invalid_receipts: u64,
     observed_failed_sessions: BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
+    observed_successful_sessions: BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
     observed_invalid_receipts: BTreeMap<(Epoch, ValidatorId), u64>,
+    known_live_peers: BTreeSet<ValidatorId>,
     last_sync_request_served_at: BTreeMap<ValidatorId, u64>,
     peer_sync_status: BTreeMap<ValidatorId, (u64, HashBytes)>,
     peer_message_windows: BTreeMap<ValidatorId, PeerMessageWindow>,
@@ -506,6 +510,7 @@ impl NodeRunner {
                 payload,
                 bytes,
             } => {
+                self.known_live_peers.insert(from_validator_id);
                 self.log_event(
                     "network-recv",
                     format!("from {from_validator_id} bytes {bytes}"),
@@ -516,7 +521,16 @@ impl NodeRunner {
             NetworkEvent::SessionObserved {
                 peer_validator_id,
                 transcript_hash,
+                outbound,
             } => {
+                if outbound {
+                    self.known_live_peers.insert(peer_validator_id);
+                    self.record_successful_session(
+                        self.current_epoch(),
+                        self.config.validator_id,
+                        peer_validator_id,
+                    );
+                }
                 self.log_event(
                     "session-observed",
                     format!(
@@ -528,14 +542,17 @@ impl NodeRunner {
             NetworkEvent::SessionFailed {
                 peer_validator_id,
                 detail,
+                outbound,
             } => {
                 self.failed_sessions += 1;
-                if let Some(peer_validator_id) = peer_validator_id {
-                    self.record_failed_session(
-                        self.current_epoch(),
-                        self.config.validator_id,
-                        peer_validator_id,
-                    );
+                if outbound {
+                    if let Some(peer_validator_id) = peer_validator_id {
+                        self.record_failed_session(
+                            self.current_epoch(),
+                            self.config.validator_id,
+                            peer_validator_id,
+                        );
+                    }
                 }
                 self.update_metrics(|metrics| {
                     metrics.handshake_failures += 1;
@@ -1034,9 +1051,13 @@ impl NodeRunner {
             return Ok(false);
         }
 
-        let service_score = if self.config.feature_flags.enable_service_gating
-            && self.service_gating_active(block.header.epoch)
-        {
+        let service_gating_enforced = should_enforce_service_gating_for_block(
+            self.config.feature_flags.enable_service_gating,
+            local_proposal,
+            block.header.epoch,
+            self.config.feature_flags.service_gating_start_epoch,
+        );
+        let service_score = if service_gating_enforced {
             Some(self.service_score_for_validator(block.header.proposer_id))
         } else {
             None
@@ -1046,8 +1067,7 @@ impl NodeRunner {
                 &block,
                 self.ledger.snapshot().tip_hash,
                 service_score,
-                self.config.feature_flags.enable_service_gating
-                    && self.service_gating_active(block.header.epoch),
+                service_gating_enforced,
                 self.service_gating_threshold(),
             )
             .map_err(|error| anyhow!(error))?;
@@ -1528,14 +1548,36 @@ impl NodeRunner {
         validator_id: ValidatorId,
         peer_validator_id: ValidatorId,
     ) {
+        if !should_record_failed_session(
+            &self.consensus,
+            &self.known_live_peers,
+            &self.observed_successful_sessions,
+            epoch,
+            validator_id,
+            peer_validator_id,
+        ) {
+            return;
+        }
+        self.observed_failed_sessions
+            .insert((epoch, validator_id, peer_validator_id));
+    }
+
+    fn record_successful_session(
+        &mut self,
+        epoch: Epoch,
+        validator_id: ValidatorId,
+        peer_validator_id: ValidatorId,
+    ) {
         if !self
             .consensus
             .is_relay_target_for(validator_id, peer_validator_id, epoch)
         {
             return;
         }
-        self.observed_failed_sessions
+        self.observed_successful_sessions
             .insert((epoch, validator_id, peer_validator_id));
+        self.observed_failed_sessions
+            .remove(&(epoch, validator_id, peer_validator_id));
     }
 
     fn record_invalid_receipt(&mut self, epoch: Epoch, validator_id: ValidatorId) {
@@ -1563,6 +1605,8 @@ impl NodeRunner {
 
     fn prune_penalty_observations(&mut self, earliest_epoch: Epoch) {
         self.observed_failed_sessions
+            .retain(|(epoch, _, _)| *epoch >= earliest_epoch);
+        self.observed_successful_sessions
             .retain(|(epoch, _, _)| *epoch >= earliest_epoch);
         self.observed_invalid_receipts
             .retain(|(epoch, _), _| *epoch >= earliest_epoch);
@@ -1964,6 +2008,35 @@ fn accumulate_weighted_counters(
         .saturating_add(counters.invalid_receipts.saturating_mul(weight));
 }
 
+fn should_record_failed_session(
+    consensus: &ConsensusEngine,
+    known_live_peers: &BTreeSet<ValidatorId>,
+    observed_successful_sessions: &BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
+    epoch: Epoch,
+    validator_id: ValidatorId,
+    peer_validator_id: ValidatorId,
+) -> bool {
+    if !consensus.is_relay_target_for(validator_id, peer_validator_id, epoch) {
+        return false;
+    }
+    if !known_live_peers.contains(&peer_validator_id) {
+        return false;
+    }
+    if observed_successful_sessions.contains(&(epoch, validator_id, peer_validator_id)) {
+        return false;
+    }
+    true
+}
+
+fn should_enforce_service_gating_for_block(
+    enable_service_gating: bool,
+    local_proposal: bool,
+    epoch: Epoch,
+    service_gating_start_epoch: Epoch,
+) -> bool {
+    enable_service_gating && local_proposal && epoch >= service_gating_start_epoch
+}
+
 #[derive(Clone, Debug)]
 struct Storage {
     data_dir: PathBuf,
@@ -2359,6 +2432,62 @@ mod tests {
 
         let segment = build_chain_segment_from_chain(&snapshot, &blocks, &[], 4, 0, empty_hash());
         assert!(segment.is_none());
+    }
+
+    #[test]
+    fn failed_session_penalty_requires_peer_to_be_known_live() {
+        let consensus = ConsensusEngine::new(sample_genesis());
+        let known_live_peers = BTreeSet::new();
+        let observed_successful_sessions = BTreeSet::new();
+
+        assert!(!should_record_failed_session(
+            &consensus,
+            &known_live_peers,
+            &observed_successful_sessions,
+            0,
+            1,
+            2,
+        ));
+    }
+
+    #[test]
+    fn failed_session_penalty_clears_after_successful_session() {
+        let consensus = ConsensusEngine::new(sample_genesis());
+        let known_live_peers = BTreeSet::from([2]);
+        let observed_successful_sessions = BTreeSet::from([(0, 1, 2)]);
+
+        assert!(!should_record_failed_session(
+            &consensus,
+            &known_live_peers,
+            &observed_successful_sessions,
+            0,
+            1,
+            2,
+        ));
+    }
+
+    #[test]
+    fn failed_session_penalty_records_for_live_assigned_peer_without_success() {
+        let consensus = ConsensusEngine::new(sample_genesis());
+        let known_live_peers = BTreeSet::from([2]);
+        let observed_successful_sessions = BTreeSet::new();
+
+        assert!(should_record_failed_session(
+            &consensus,
+            &known_live_peers,
+            &observed_successful_sessions,
+            0,
+            1,
+            2,
+        ));
+    }
+
+    #[test]
+    fn remote_blocks_do_not_enforce_local_service_gating() {
+        assert!(should_enforce_service_gating_for_block(true, true, 7, 3));
+        assert!(!should_enforce_service_gating_for_block(true, false, 7, 3));
+        assert!(!should_enforce_service_gating_for_block(true, true, 2, 3));
+        assert!(!should_enforce_service_gating_for_block(false, true, 7, 3));
     }
 
     #[test]

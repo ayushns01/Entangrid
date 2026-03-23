@@ -68,6 +68,8 @@ Recent hardening:
 - inbound frames now have a fixed maximum size before allocation
 - oversized frames are rejected early instead of letting an attacker force unbounded memory growth through a large declared frame length
 - concurrent inbound session handling is now capped, so one noisy peer cannot force unbounded task fan-out on the listener side
+- outbound sends now retry transient connect failures before reporting a hard session failure, which reduces false negatives during localnet churn
+- outbound session observations are emitted only after the connect/write/flush path succeeds, so the node's penalty accounting is tied to real delivery attempts instead of pre-send optimistic bookkeeping
 
 ### Session observations
 
@@ -98,6 +100,7 @@ It does not yet provide:
 - discovery
 - NAT traversal
 - batching or compression
+- robust large-topology convergence under heavy bursty localnet load
 
 ## Why this crate matters
 

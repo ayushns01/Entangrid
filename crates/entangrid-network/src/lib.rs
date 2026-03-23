@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io::ErrorKind,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -18,6 +19,8 @@ use tokio::{
 
 const MAX_FRAME_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_INBOUND_SESSIONS: usize = 64;
+const MAX_CONNECT_RETRIES: u32 = 4;
+const CONNECT_RETRY_BACKOFF_MILLIS: u64 = 15;
 
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
@@ -29,10 +32,12 @@ pub enum NetworkEvent {
     SessionObserved {
         peer_validator_id: ValidatorId,
         transcript_hash: HashBytes,
+        outbound: bool,
     },
     SessionFailed {
         peer_validator_id: Option<ValidatorId>,
         detail: String,
+        outbound: bool,
     },
     InboundSessionDropped {
         detail: String,
@@ -124,6 +129,7 @@ pub async fn spawn_network(
                             let _ = event_tx.send(NetworkEvent::SessionFailed {
                                 peer_validator_id: None,
                                 detail: error.to_string(),
+                                outbound: false,
                             });
                         }
                     });
@@ -132,6 +138,7 @@ pub async fn spawn_network(
                     let _ = listener_events.send(NetworkEvent::SessionFailed {
                         peer_validator_id: None,
                         detail: error.to_string(),
+                        outbound: false,
                     });
                 }
             }
@@ -151,6 +158,7 @@ pub async fn spawn_network(
                     let _ = event_tx.send(NetworkEvent::SessionFailed {
                         peer_validator_id: Some(peer_id),
                         detail: "peer not configured".into(),
+                        outbound: true,
                     });
                     continue;
                 }
@@ -167,6 +175,7 @@ pub async fn spawn_network(
                     let _ = event_tx.send(NetworkEvent::SessionFailed {
                         peer_validator_id: Some(peer_id),
                         detail: error.to_string(),
+                        outbound: true,
                     });
                 }
             }
@@ -185,11 +194,21 @@ async fn send_message(
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
     if fault_profile.disable_outbound {
+        let _ = event_tx.send(NetworkEvent::SessionFailed {
+            peer_validator_id: Some(request.peer.validator_id),
+            detail: "outbound disabled by fault profile".into(),
+            outbound: true,
+        });
         return Ok(());
     }
 
     let message_hash = canonical_hash(&request.payload);
     if should_drop(&fault_profile, request.peer.validator_id, &message_hash) {
+        let _ = event_tx.send(NetworkEvent::SessionFailed {
+            peer_validator_id: Some(request.peer.validator_id),
+            detail: "outbound message dropped by fault profile".into(),
+            outbound: true,
+        });
         return Ok(());
     }
 
@@ -203,11 +222,6 @@ async fn send_message(
 
     let session =
         crypto.open_session(local_validator_id, request.peer.validator_id, &message_hash)?;
-    let _ = event_tx.send(NetworkEvent::SessionObserved {
-        peer_validator_id: request.peer.validator_id,
-        transcript_hash: session.transcript_hash,
-    });
-
     let signature = crypto.sign(local_validator_id, &message_hash)?;
     let envelope = SignedEnvelope {
         from_validator_id: local_validator_id,
@@ -217,12 +231,16 @@ async fn send_message(
     };
 
     let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
-    let mut stream = TcpStream::connect(&request.peer.address)
-        .await
-        .with_context(|| format!("failed to connect to {}", request.peer.address))?;
+    let mut stream = connect_with_retries(&request.peer.address).await?;
     stream.write_u32(bytes.len() as u32).await?;
     stream.write_all(&bytes).await?;
     stream.flush().await?;
+
+    let _ = event_tx.send(NetworkEvent::SessionObserved {
+        peer_validator_id: request.peer.validator_id,
+        transcript_hash: session.transcript_hash,
+        outbound: true,
+    });
 
     update_metrics(&metrics, |metrics| {
         metrics.bytes_sent += bytes.len() as u64;
@@ -277,6 +295,7 @@ async fn handle_inbound(
     let _ = event_tx.send(NetworkEvent::SessionObserved {
         peer_validator_id: envelope.from_validator_id,
         transcript_hash: session.transcript_hash,
+        outbound: false,
     });
 
     let verified = crypto.verify(
@@ -317,6 +336,40 @@ fn should_drop(
     fraction < fault_profile.outbound_drop_probability
 }
 
+async fn connect_with_retries(address: &str) -> Result<TcpStream> {
+    let mut last_error = None;
+    for attempt in 0..=MAX_CONNECT_RETRIES {
+        match TcpStream::connect(address).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                let retryable = is_retryable_connect_error(&error);
+                last_error = Some(error);
+                if !retryable || attempt == MAX_CONNECT_RETRIES {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(
+                    CONNECT_RETRY_BACKOFF_MILLIS * u64::from(attempt + 1),
+                ))
+                .await;
+            }
+        }
+    }
+    Err(last_error.expect("at least one connection attempt"))
+        .with_context(|| format!("failed to connect to {address}"))
+}
+
+fn is_retryable_connect_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::TimedOut
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::Interrupted
+    )
+}
+
 fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut NodeMetrics)) {
     if let Ok(mut metrics) = metrics.lock() {
         update(&mut metrics);
@@ -327,11 +380,25 @@ fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Error;
 
     #[test]
     fn rejects_oversized_inbound_frame() {
         assert!(MAX_FRAME_SIZE_BYTES < usize::MAX);
         let oversized = MAX_FRAME_SIZE_BYTES + 1;
         assert!(oversized > MAX_FRAME_SIZE_BYTES);
+    }
+
+    #[test]
+    fn classifies_retryable_connect_errors() {
+        assert!(is_retryable_connect_error(&Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(is_retryable_connect_error(&Error::from(
+            ErrorKind::TimedOut
+        )));
+        assert!(!is_retryable_connect_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
     }
 }
