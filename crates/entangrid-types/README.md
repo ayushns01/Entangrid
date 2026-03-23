@@ -103,6 +103,15 @@ One recent example of that role is service gating:
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
 - `NodeMetrics` now also carries the active score-weight profile so reports can explain not just the counters, but the policy that turned them into a score
 
+The current recommended prototype policy now lives in these shared defaults too:
+
+- gating start epoch `3`
+- gating threshold `0.40`
+- score window `4` epochs
+- score weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
+
+That matters because new localnets now inherit the same baseline policy that the rigorous matrix selected, instead of relying on older hard-coded warmup values in different crates.
+
 One recent example of the type layer evolving with the protocol is block commitments:
 
 - `Block` now carries `commitment_receipts` alongside the compact `TopologyCommitment`

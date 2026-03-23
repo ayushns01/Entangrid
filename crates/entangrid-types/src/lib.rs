@@ -8,6 +8,14 @@ pub type Epoch = u64;
 pub type HashBytes = [u8; 32];
 pub type AccountId = String;
 
+pub const RECOMMENDED_SERVICE_GATING_START_EPOCH: Epoch = 3;
+pub const RECOMMENDED_SERVICE_GATING_THRESHOLD: f64 = 0.40;
+pub const RECOMMENDED_SERVICE_SCORE_WINDOW_EPOCHS: u64 = 4;
+pub const RECOMMENDED_SERVICE_UPTIME_WEIGHT: f64 = 0.25;
+pub const RECOMMENDED_SERVICE_DELIVERY_WEIGHT: f64 = 0.50;
+pub const RECOMMENDED_SERVICE_DIVERSITY_WEIGHT: f64 = 0.25;
+pub const RECOMMENDED_SERVICE_PENALTY_WEIGHT: f64 = 1.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MessageClass {
     Heartbeat,
@@ -340,31 +348,31 @@ pub fn empty_hash() -> HashBytes {
 }
 
 pub fn default_service_gating_start_epoch() -> Epoch {
-    2
+    RECOMMENDED_SERVICE_GATING_START_EPOCH
 }
 
 pub fn default_service_gating_threshold() -> f64 {
-    0.40
+    RECOMMENDED_SERVICE_GATING_THRESHOLD
 }
 
 pub fn default_service_score_window_epochs() -> u64 {
-    4
+    RECOMMENDED_SERVICE_SCORE_WINDOW_EPOCHS
 }
 
 pub fn default_service_uptime_weight() -> f64 {
-    0.25
+    RECOMMENDED_SERVICE_UPTIME_WEIGHT
 }
 
 pub fn default_service_delivery_weight() -> f64 {
-    0.50
+    RECOMMENDED_SERVICE_DELIVERY_WEIGHT
 }
 
 pub fn default_service_diversity_weight() -> f64 {
-    0.25
+    RECOMMENDED_SERVICE_DIVERSITY_WEIGHT
 }
 
 pub fn default_service_penalty_weight() -> f64 {
-    1.0
+    RECOMMENDED_SERVICE_PENALTY_WEIGHT
 }
 
 pub fn default_service_score_weights() -> ServiceScoreWeights {
@@ -403,5 +411,30 @@ mod tests {
             memo: None,
         };
         assert_eq!(canonical_hash(&tx), canonical_hash(&tx));
+    }
+
+    #[test]
+    fn default_service_policy_matches_recommended_profile() {
+        assert_eq!(
+            default_service_gating_start_epoch(),
+            RECOMMENDED_SERVICE_GATING_START_EPOCH
+        );
+        assert!(
+            (default_service_gating_threshold() - RECOMMENDED_SERVICE_GATING_THRESHOLD).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            default_service_score_window_epochs(),
+            RECOMMENDED_SERVICE_SCORE_WINDOW_EPOCHS
+        );
+        assert_eq!(
+            default_service_score_weights(),
+            ServiceScoreWeights {
+                uptime_weight: RECOMMENDED_SERVICE_UPTIME_WEIGHT,
+                delivery_weight: RECOMMENDED_SERVICE_DELIVERY_WEIGHT,
+                diversity_weight: RECOMMENDED_SERVICE_DIVERSITY_WEIGHT,
+                penalty_weight: RECOMMENDED_SERVICE_PENALTY_WEIGHT,
+            }
+        );
     }
 }

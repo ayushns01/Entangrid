@@ -46,6 +46,13 @@ It also:
 - can set the service-score weight profile, including how strongly penalties affect the final score
 - can mark one validator as degraded
 
+The current recommended prototype gating profile emitted by default is:
+
+- `service_gating_start_epoch = 3`
+- `service_gating_threshold = 0.40`
+- `service_score_window_epochs = 4`
+- weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
+
 ### `up`
 
 This command reads the manifest and launches one OS process per node.
@@ -162,6 +169,7 @@ Recent improvement:
 - this makes it easier to keep the first few epochs as warmup before proposer gating is enforced
 - this also makes it possible to tune how strict gating should be without recompiling the node
 - this also makes it easier to trade off score stability, responsiveness, and penalty harshness in local experiments
+- the latest matrix review currently keeps the shared defaults at that same profile, so fresh localnet experiments start from the same policy we are using as the pre-PQ baseline
 
 ## What it is today
 

@@ -85,7 +85,10 @@ Current runtime detail:
 - invalid receipts penalize the witness validator that signed them
 - so the `minus penalties` part of the formula is now active in the running prototype, not just present in the math
 - the score weights are now configurable through shared config, so localnet experiments can tune the same consensus formula without recompiling the crate
-- the default profile still matches the current prototype:
+- the current recommended prototype profile is:
+  - gating start epoch `3`
+  - gating threshold `0.40`
+  - score window `4`
   - uptime `0.25`
   - delivery `0.50`
   - diversity `0.25`

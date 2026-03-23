@@ -145,6 +145,15 @@ The recent gating-focused improvement in this crate was mostly about observabili
 - `metrics.json` now also stores the active score-weight profile so reports can tell you not just what the counters were, but how the node interpreted them
 - `metrics.json` now also tracks how many duplicate receipts were ignored
 
+The current recommended prototype localnet profile is:
+
+- gating start epoch `3`
+- threshold `0.40`
+- score window `4`
+- score weights `[0.25, 0.50, 0.25, -1.00]`
+
+That profile is now the shared default emitted by `init-localnet`, so the node's runtime behavior matches the policy currently selected by the matrix review.
+
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
 
 - commitment validation now uses explicit proof data from the block
