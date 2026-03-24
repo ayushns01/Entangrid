@@ -7,17 +7,17 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use entangrid_consensus::ConsensusEngine;
 use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend};
 use entangrid_ledger::LedgerState;
-use entangrid_network::{spawn_network, NetworkEvent, NetworkHandle};
+use entangrid_network::{NetworkEvent, NetworkFailureKind, NetworkHandle, spawn_network};
 use entangrid_types::{
-    canonical_hash, empty_hash, now_unix_millis, Block, BlockHeader, ChainSegment, ChainSnapshot,
-    Epoch, EventLogEntry, GenesisConfig, HashBytes, HeartbeatPulse, MessageClass, NodeConfig,
-    NodeMetrics, PeerConfig, ProtocolMessage, RelayReceipt, ServiceCounters, SignedTransaction,
-    StateSnapshot, TopologyCommitment, ValidatorId,
+    Block, BlockHeader, ChainSegment, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig,
+    HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
+    RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
+    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -186,6 +186,13 @@ struct ServedSyncRequest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockAcceptance {
+    Accepted,
+    Duplicate,
+    Orphan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PeerMessageClass {
     SyncControl,
     TransactionGossip,
@@ -302,6 +309,9 @@ impl NodeRunner {
                 ),
             )?;
             self.log_current_service_score(epoch)?;
+            if epoch > 0 {
+                self.request_receipt_reconciliation(epoch - 1)?;
+            }
         }
 
         self.broadcast_heartbeat(slot, epoch)?;
@@ -471,10 +481,14 @@ impl NodeRunner {
             block_hash,
         };
 
-        self.accept_block(block.clone(), true).await?;
-        self.try_promote_orphans().await?;
-        self.network
-            .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
+        if matches!(
+            self.accept_block(block.clone(), true).await?,
+            BlockAcceptance::Accepted
+        ) {
+            self.try_promote_orphans().await?;
+            self.network
+                .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
+        }
         Ok(())
     }
 
@@ -533,8 +547,9 @@ impl NodeRunner {
                 peer_validator_id,
                 transcript_hash,
                 outbound,
+                service_accountable,
             } => {
-                if outbound {
+                if should_track_outbound_service_session(outbound, service_accountable) {
                     self.known_live_peers.insert(peer_validator_id);
                     self.record_successful_session(
                         self.current_epoch(),
@@ -554,9 +569,11 @@ impl NodeRunner {
                 peer_validator_id,
                 detail,
                 outbound,
+                service_accountable,
+                kind,
             } => {
                 self.failed_sessions += 1;
-                if outbound {
+                if should_record_failed_service_session(outbound, service_accountable, kind) {
                     if let Some(peer_validator_id) = peer_validator_id {
                         self.record_failed_session(
                             self.current_epoch(),
@@ -630,14 +647,15 @@ impl NodeRunner {
                 )
                 .await?;
                 match self.accept_block(block.clone(), false).await {
-                    Ok(true) => {
+                    Ok(BlockAcceptance::Accepted) => {
                         self.try_promote_orphans().await?;
                         self.network
                             .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
                     }
-                    Ok(false) => {
+                    Ok(BlockAcceptance::Orphan) => {
                         let peer_height = block.header.block_number.saturating_sub(1);
                         let peer_tip_hash = block.header.parent_hash;
+                        self.record_sync_repair_failure(from_validator_id);
                         if let Err(error) =
                             self.push_best_sync_to(from_validator_id, peer_height, peer_tip_hash)
                         {
@@ -653,6 +671,7 @@ impl NodeRunner {
                             )?;
                         }
                     }
+                    Ok(BlockAcceptance::Duplicate) => {}
                     Err(error) => {
                         self.log_event(
                             "peer-block-rejected",
@@ -693,8 +712,7 @@ impl NodeRunner {
                 known_height,
                 known_tip_hash,
             } => {
-                let force_full_snapshot =
-                    is_force_full_snapshot_hint(known_height, known_tip_hash);
+                let force_full_snapshot = is_force_full_snapshot_hint(known_height, known_tip_hash);
                 self.record_peer_sync_status(requester_id, known_height, known_tip_hash);
                 if !force_full_snapshot
                     && self.sync_request_is_throttled(requester_id, known_height, known_tip_hash)
@@ -829,7 +847,7 @@ impl NodeRunner {
                     })
                     .cloned()
                     .collect();
-                self.network.send_to(
+                self.network.send_control_to(
                     self.find_peer(requester_id)?,
                     ProtocolMessage::ReceiptResponse {
                         responder_id: self.config.validator_id,
@@ -1040,9 +1058,13 @@ impl NodeRunner {
         Ok(true)
     }
 
-    async fn accept_block(&mut self, block: Block, local_proposal: bool) -> Result<bool> {
+    async fn accept_block(
+        &mut self,
+        block: Block,
+        local_proposal: bool,
+    ) -> Result<BlockAcceptance> {
         if self.seen_blocks.contains(&block.block_hash) {
-            return Ok(false);
+            return Ok(BlockAcceptance::Duplicate);
         }
         let expected_hash =
             canonical_hash(&(block.header.clone(), &block.transactions, &block.commitment));
@@ -1075,7 +1097,7 @@ impl NodeRunner {
                     ),
                 )?;
             }
-            return Ok(false);
+            return Ok(BlockAcceptance::Orphan);
         }
 
         let service_gating_enforced = should_enforce_service_gating_for_block(
@@ -1151,7 +1173,7 @@ impl NodeRunner {
             ),
         )?;
         self.persist_metrics()?;
-        Ok(true)
+        Ok(BlockAcceptance::Accepted)
     }
 
     fn validate_commitment(
@@ -1175,6 +1197,49 @@ impl NodeRunner {
         Ok(())
     }
 
+    fn request_receipt_reconciliation(&self, epoch: Epoch) -> Result<()> {
+        if !self.config.feature_flags.enable_receipts || self.config.peers.is_empty() {
+            return Ok(());
+        }
+
+        let peer_ids: BTreeSet<_> = self
+            .config
+            .peers
+            .iter()
+            .map(|peer| peer.validator_id)
+            .collect();
+        let mut attempted = 0u64;
+        let mut failed = 0u64;
+        let validator_id = self.config.validator_id;
+
+        for peer_id in build_receipt_fetch_plan(self.config.validator_id, &peer_ids) {
+            attempted += 1;
+            if let Err(error) = self.network.send_control_to(
+                self.find_peer(peer_id)?,
+                ProtocolMessage::ReceiptFetch {
+                    requester_id: self.config.validator_id,
+                    epoch,
+                    validator_id,
+                },
+            ) {
+                failed += 1;
+                self.log_event(
+                    "receipt-fetch-failed",
+                    format!("epoch {epoch} peer {peer_id} validator {validator_id} detail {error}"),
+                )?;
+            }
+        }
+
+        self.log_event(
+            "receipt-fetch-round",
+            format!(
+                "epoch {epoch} peers {} validators 1 attempted {attempted} failed {failed}",
+                peer_ids.len()
+            ),
+        )?;
+        Ok(())
+    }
+
     async fn try_promote_orphans(&mut self) -> Result<()> {
         let mut progress = true;
         while progress {
@@ -1186,14 +1251,26 @@ impl NodeRunner {
                 .position(|orphan| orphan.header.parent_hash == tip_hash)
             {
                 let orphan = self.orphan_blocks.remove(index);
-                if let Err(error) = self.accept_block(orphan.clone(), false).await {
-                    self.log_event(
-                        "orphan-rejected",
-                        format!(
-                            "height {} slot {} detail {}",
-                            orphan.header.block_number, orphan.header.slot, error
-                        ),
-                    )?;
+                match self.accept_block(orphan.clone(), false).await {
+                    Ok(BlockAcceptance::Accepted | BlockAcceptance::Duplicate) => {}
+                    Ok(BlockAcceptance::Orphan) => {
+                        self.log_event(
+                            "orphan-rejected",
+                            format!(
+                                "height {} slot {} detail still orphaned after promotion",
+                                orphan.header.block_number, orphan.header.slot
+                            ),
+                        )?;
+                    }
+                    Err(error) => {
+                        self.log_event(
+                            "orphan-rejected",
+                            format!(
+                                "height {} slot {} detail {}",
+                                orphan.header.block_number, orphan.header.slot, error
+                            ),
+                        )?;
+                    }
                 }
                 progress = true;
             }
@@ -1432,7 +1509,7 @@ impl NodeRunner {
     }
 
     fn broadcast_sync_request(&self) -> Result<()> {
-        self.network.broadcast(
+        self.network.broadcast_control(
             &self.config.peers,
             ProtocolMessage::SyncRequest {
                 requester_id: self.config.validator_id,
@@ -1443,7 +1520,7 @@ impl NodeRunner {
     }
 
     fn broadcast_sync_status(&self) -> Result<()> {
-        self.network.broadcast(
+        self.network.broadcast_control(
             &self.config.peers,
             ProtocolMessage::SyncStatus {
                 validator_id: self.config.validator_id,
@@ -1455,7 +1532,7 @@ impl NodeRunner {
 
     fn request_sync_from(&self, validator_id: ValidatorId) -> Result<()> {
         let (known_height, known_tip_hash) = self.sync_request_hint_for_peer(validator_id);
-        self.network.send_to(
+        self.network.send_control_to(
             self.find_peer(validator_id)?,
             ProtocolMessage::SyncRequest {
                 requester_id: self.config.validator_id,
@@ -1485,7 +1562,7 @@ impl NodeRunner {
             self.update_metrics(|metrics| {
                 metrics.incremental_sync_served += 1;
             });
-            return self.network.send_to(
+            return self.network.send_control_to(
                 peer,
                 ProtocolMessage::SyncBlocks {
                     responder_id: self.config.validator_id,
@@ -1502,7 +1579,7 @@ impl NodeRunner {
         self.update_metrics(|metrics| {
             metrics.full_sync_served += 1;
         });
-        self.network.send_to(
+        self.network.send_control_to(
             peer,
             ProtocolMessage::SyncResponse {
                 responder_id: self.config.validator_id,
@@ -1823,6 +1900,19 @@ fn allow_peer_message_in_window(
     true
 }
 
+fn should_track_outbound_service_session(outbound: bool, service_accountable: bool) -> bool {
+    outbound && service_accountable
+}
+
+fn should_record_failed_service_session(
+    outbound: bool,
+    service_accountable: bool,
+    kind: NetworkFailureKind,
+) -> bool {
+    should_track_outbound_service_session(outbound, service_accountable)
+        && kind == NetworkFailureKind::FaultInjected
+}
+
 fn build_chain_segment_from_chain(
     target_snapshot: &StateSnapshot,
     blocks: &[Block],
@@ -1878,6 +1968,17 @@ fn build_chain_segment_from_chain(
         blocks: missing_blocks,
         receipts: recent_receipts,
     })
+}
+
+fn build_receipt_fetch_plan(
+    requester_id: ValidatorId,
+    peer_ids: &BTreeSet<ValidatorId>,
+) -> Vec<ValidatorId> {
+    peer_ids
+        .iter()
+        .copied()
+        .filter(|peer_id| *peer_id != requester_id)
+        .collect()
 }
 
 fn align_chain_segment_to_local_chain(
@@ -2363,8 +2464,8 @@ mod tests {
 
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::{
-        empty_hash, validator_account, GenesisConfig, SignedTransaction, Transaction,
-        ValidatorConfig,
+        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, empty_hash,
+        validator_account,
     };
 
     use super::*;
@@ -2633,6 +2734,14 @@ mod tests {
     }
 
     #[test]
+    fn receipt_fetch_plan_scales_with_peer_and_validator_count() {
+        let peer_ids = BTreeSet::from([2, 3, 4]);
+        let plan = build_receipt_fetch_plan(1, &peer_ids);
+
+        assert_eq!(plan, vec![2, 3, 4]);
+    }
+
+    #[test]
     fn snapshot_fork_choice_prefers_height_then_slot_then_tip_hash() {
         let local = StateSnapshot {
             balances: BTreeMap::new(),
@@ -2815,8 +2924,8 @@ mod tests {
             receipts: Vec::new(),
         };
 
-        let error =
-            align_chain_segment_to_local_chain(&local_blocks, &local_snapshot, segment).unwrap_err();
+        let error = align_chain_segment_to_local_chain(&local_blocks, &local_snapshot, segment)
+            .unwrap_err();
         assert!(error.to_string().contains("incremental sync"));
     }
 
@@ -2877,24 +2986,47 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_sessions_do_not_count_toward_service_penalties() {
+        assert!(should_track_outbound_service_session(true, true));
+        assert!(!should_track_outbound_service_session(true, false));
+        assert!(!should_track_outbound_service_session(false, true));
+        assert!(!should_track_outbound_service_session(false, false));
+        assert!(should_record_failed_service_session(
+            true,
+            true,
+            NetworkFailureKind::FaultInjected
+        ));
+        assert!(!should_record_failed_service_session(
+            true,
+            true,
+            NetworkFailureKind::Transport
+        ));
+        assert!(!should_record_failed_service_session(
+            true,
+            false,
+            NetworkFailureKind::FaultInjected
+        ));
+    }
+
+    #[test]
     fn peer_message_window_limits_and_resets_sync_control() {
         let mut window = PeerMessageWindow::default();
         for _ in 0..MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW {
             assert!(allow_peer_message_in_window(
                 &mut window,
                 PeerMessageClass::SyncControl,
-                1_000
+                1_000,
             ));
         }
         assert!(!allow_peer_message_in_window(
             &mut window,
             PeerMessageClass::SyncControl,
-            1_000
+            1_000,
         ));
         assert!(allow_peer_message_in_window(
             &mut window,
             PeerMessageClass::SyncControl,
-            1_000 + PEER_MESSAGE_WINDOW_MILLIS
+            1_000 + PEER_MESSAGE_WINDOW_MILLIS,
         ));
     }
 

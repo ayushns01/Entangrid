@@ -23,6 +23,13 @@ const INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS: u64 = 75;
 const MAX_CONNECT_RETRIES: u32 = 4;
 const CONNECT_RETRY_BACKOFF_MILLIS: u64 = 15;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkFailureKind {
+    FaultInjected,
+    Transport,
+    PeerConfig,
+}
+
 #[derive(Clone, Debug)]
 pub enum NetworkEvent {
     Received {
@@ -34,11 +41,14 @@ pub enum NetworkEvent {
         peer_validator_id: ValidatorId,
         transcript_hash: HashBytes,
         outbound: bool,
+        service_accountable: bool,
     },
     SessionFailed {
         peer_validator_id: Option<ValidatorId>,
         detail: String,
         outbound: bool,
+        service_accountable: bool,
+        kind: NetworkFailureKind,
     },
     InboundSessionDropped {
         detail: String,
@@ -54,6 +64,7 @@ pub struct NetworkHandle {
 struct OutboundRequest {
     peer: PeerConfig,
     payload: ProtocolMessage,
+    service_accountable: bool,
 }
 
 impl NetworkHandle {
@@ -66,7 +77,28 @@ impl NetworkHandle {
 
     pub fn send_to(&self, peer: PeerConfig, payload: ProtocolMessage) -> Result<()> {
         self.outbound_tx
-            .send(OutboundRequest { peer, payload })
+            .send(OutboundRequest {
+                peer,
+                payload,
+                service_accountable: true,
+            })
+            .map_err(|_| anyhow!("network outbound worker is closed"))
+    }
+
+    pub fn broadcast_control(&self, peers: &[PeerConfig], payload: ProtocolMessage) -> Result<()> {
+        for peer in peers {
+            self.send_control_to(peer.clone(), payload.clone())?;
+        }
+        Ok(())
+    }
+
+    pub fn send_control_to(&self, peer: PeerConfig, payload: ProtocolMessage) -> Result<()> {
+        self.outbound_tx
+            .send(OutboundRequest {
+                peer,
+                payload,
+                service_accountable: false,
+            })
             .map_err(|_| anyhow!("network outbound worker is closed"))
     }
 }
@@ -112,16 +144,16 @@ pub async fn spawn_network(
                     {
                         Ok(Ok(permit)) => permit,
                         Ok(Err(_)) | Err(_) => {
-                        update_metrics(&metrics, |metrics| {
-                            metrics.inbound_session_drops += 1;
-                        });
-                        let _ = event_tx.send(NetworkEvent::InboundSessionDropped {
-                            detail: format!(
-                                "inbound session capacity {} unavailable for {}ms",
-                                MAX_CONCURRENT_INBOUND_SESSIONS,
-                                INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS
-                            ),
-                        });
+                            update_metrics(&metrics, |metrics| {
+                                metrics.inbound_session_drops += 1;
+                            });
+                            let _ = event_tx.send(NetworkEvent::InboundSessionDropped {
+                                detail: format!(
+                                    "inbound session capacity {} unavailable for {}ms",
+                                    MAX_CONCURRENT_INBOUND_SESSIONS,
+                                    INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS
+                                ),
+                            });
                             continue;
                         }
                     };
@@ -140,6 +172,8 @@ pub async fn spawn_network(
                                 peer_validator_id: None,
                                 detail: error.to_string(),
                                 outbound: false,
+                                service_accountable: false,
+                                kind: NetworkFailureKind::Transport,
                             });
                         }
                     });
@@ -149,6 +183,8 @@ pub async fn spawn_network(
                         peer_validator_id: None,
                         detail: error.to_string(),
                         outbound: false,
+                        service_accountable: false,
+                        kind: NetworkFailureKind::Transport,
                     });
                 }
             }
@@ -164,11 +200,14 @@ pub async fn spawn_network(
             while let Some(request) = outbound_rx.recv().await {
                 let peer = request.peer.clone();
                 let peer_id = peer.validator_id;
+                let service_accountable = request.service_accountable;
                 if !peers_by_id.contains_key(&peer_id) {
                     let _ = event_tx.send(NetworkEvent::SessionFailed {
                         peer_validator_id: Some(peer_id),
                         detail: "peer not configured".into(),
                         outbound: true,
+                        service_accountable,
+                        kind: NetworkFailureKind::PeerConfig,
                     });
                     continue;
                 }
@@ -186,6 +225,8 @@ pub async fn spawn_network(
                         peer_validator_id: Some(peer_id),
                         detail: error.to_string(),
                         outbound: true,
+                        service_accountable,
+                        kind: NetworkFailureKind::Transport,
                     });
                 }
             }
@@ -208,6 +249,8 @@ async fn send_message(
             peer_validator_id: Some(request.peer.validator_id),
             detail: "outbound disabled by fault profile".into(),
             outbound: true,
+            service_accountable: request.service_accountable,
+            kind: NetworkFailureKind::FaultInjected,
         });
         return Ok(());
     }
@@ -218,6 +261,8 @@ async fn send_message(
             peer_validator_id: Some(request.peer.validator_id),
             detail: "outbound message dropped by fault profile".into(),
             outbound: true,
+            service_accountable: request.service_accountable,
+            kind: NetworkFailureKind::FaultInjected,
         });
         return Ok(());
     }
@@ -250,6 +295,7 @@ async fn send_message(
         peer_validator_id: request.peer.validator_id,
         transcript_hash: session.transcript_hash,
         outbound: true,
+        service_accountable: request.service_accountable,
     });
 
     update_metrics(&metrics, |metrics| {
@@ -306,6 +352,7 @@ async fn handle_inbound(
         peer_validator_id: envelope.from_validator_id,
         transcript_hash: session.transcript_hash,
         outbound: false,
+        service_accountable: true,
     });
 
     let verified = crypto.verify(

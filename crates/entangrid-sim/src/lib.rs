@@ -53,8 +53,8 @@ enum Commands {
         service_gating_start_epoch: u64,
         #[arg(long, default_value_t = default_service_gating_threshold())]
         service_gating_threshold: f64,
-        #[arg(long, default_value_t = default_service_score_window_epochs())]
-        service_score_window_epochs: u64,
+        #[arg(long)]
+        service_score_window_epochs: Option<u64>,
         #[arg(long, default_value_t = default_service_uptime_weight())]
         service_score_uptime_weight: f64,
         #[arg(long, default_value_t = default_service_delivery_weight())]
@@ -176,27 +176,32 @@ pub async fn cli_main() -> Result<()> {
             degraded_delay_ms,
             degraded_drop_probability,
             degraded_disable_outbound,
-        } => init_localnet(
-            validators,
-            &base_dir,
-            slot_duration_millis,
-            slots_per_epoch,
-            start_delay_millis,
-            enable_service_gating,
-            service_gating_start_epoch,
-            service_gating_threshold,
-            service_score_window_epochs,
-            ServiceScoreWeights {
-                uptime_weight: service_score_uptime_weight,
-                delivery_weight: service_score_delivery_weight,
-                diversity_weight: service_score_diversity_weight,
-                penalty_weight: service_score_penalty_weight,
-            },
-            degraded_validator,
-            degraded_delay_ms,
-            degraded_drop_probability,
-            degraded_disable_outbound,
-        ),
+        } => {
+            let service_score_window_epochs = service_score_window_epochs.unwrap_or_else(|| {
+                recommended_service_score_window_epochs_for_validators(validators)
+            });
+            init_localnet(
+                validators,
+                &base_dir,
+                slot_duration_millis,
+                slots_per_epoch,
+                start_delay_millis,
+                enable_service_gating,
+                service_gating_start_epoch,
+                service_gating_threshold,
+                service_score_window_epochs,
+                ServiceScoreWeights {
+                    uptime_weight: service_score_uptime_weight,
+                    delivery_weight: service_score_delivery_weight,
+                    diversity_weight: service_score_diversity_weight,
+                    penalty_weight: service_score_penalty_weight,
+                },
+                degraded_validator,
+                degraded_delay_ms,
+                degraded_drop_probability,
+                degraded_disable_outbound,
+            )
+        }
         Commands::Up { base_dir } => up_localnet(&base_dir).await,
         Commands::Load {
             base_dir,
@@ -852,7 +857,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: false,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
@@ -880,7 +885,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: false,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(6),
             service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
@@ -908,7 +913,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(6),
             service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
@@ -936,7 +941,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: Some(4),
             degraded_delay_ms: 0,
@@ -964,7 +969,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
@@ -992,7 +997,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
@@ -1020,7 +1025,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: 0.25,
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
@@ -1048,7 +1053,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: 0.55,
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: Some(3),
             degraded_delay_ms: 0,
@@ -1132,7 +1137,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: ServiceScoreWeights {
                 penalty_weight: 0.50,
                 ..default_service_score_weights()
@@ -1163,7 +1168,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: true,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: ServiceScoreWeights {
                 penalty_weight: 1.50,
                 ..default_service_score_weights()
@@ -1194,7 +1199,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: false,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
@@ -1226,7 +1231,7 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             enable_service_gating: false,
             service_gating_start_epoch: default_service_gating_start_epoch(),
             service_gating_threshold: default_service_gating_threshold(),
-            service_score_window_epochs: default_service_score_window_epochs(),
+            service_score_window_epochs: recommended_service_score_window_epochs_for_validators(4),
             service_score_weights: default_service_score_weights(),
             degraded_validator: None,
             degraded_delay_ms: 0,
@@ -1251,6 +1256,10 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
             min_total_inbound_session_drops: Some(1),
         },
     ]
+}
+
+fn recommended_service_score_window_epochs_for_validators(validators: usize) -> u64 {
+    default_service_score_window_epochs().max(validators as u64)
 }
 
 fn write_transaction_for_validator(
@@ -1884,7 +1893,9 @@ fn build_structural_report(manifest: &LocalnetManifest) -> Result<StructuralRepo
             .count() as u64;
         let tip_matches_snapshot = snapshot
             .as_ref()
-            .map(|snapshot| snapshot.tip_hash == last_hash && snapshot.height == blocks.len() as u64)
+            .map(|snapshot| {
+                snapshot.tip_hash == last_hash && snapshot.height == blocks.len() as u64
+            })
             .unwrap_or(false);
         let stderr_path = node_dir.join("stderr.log");
         let stderr_clean = if stderr_path.exists() {
@@ -2052,7 +2063,11 @@ fn localnet_is_fresh(manifest: &LocalnetManifest) -> Result<bool> {
 mod tests {
     use super::*;
 
-    fn block_chain(validator_id: u64, chain_name: &str, block_count: usize) -> Vec<entangrid_types::Block> {
+    fn block_chain(
+        validator_id: u64,
+        chain_name: &str,
+        block_count: usize,
+    ) -> Vec<entangrid_types::Block> {
         let mut parent_hash = empty_hash();
         let mut blocks = Vec::with_capacity(block_count);
         for block_number in 1..=block_count {
@@ -2371,6 +2386,41 @@ mod tests {
                 "abuse-inbound-connection-flood",
             ]
         );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.name == "baseline-4-steady")
+                .unwrap()
+                .service_score_window_epochs,
+            4
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.name == "baseline-6-bursty")
+                .unwrap()
+                .service_score_window_epochs,
+            6
+        );
+        assert_eq!(
+            scenarios
+                .iter()
+                .find(|scenario| scenario.name == "gated-6-bursty")
+                .unwrap()
+                .service_score_window_epochs,
+            6
+        );
+    }
+
+    #[test]
+    fn recommended_score_window_scales_with_validator_count() {
+        assert_eq!(recommended_service_score_window_epochs_for_validators(4), 4);
+        assert_eq!(recommended_service_score_window_epochs_for_validators(6), 6);
+        assert_eq!(recommended_service_score_window_epochs_for_validators(8), 8);
+        assert_eq!(
+            recommended_service_score_window_epochs_for_validators(12),
+            12
+        );
     }
 
     #[test]
@@ -2557,7 +2607,12 @@ mod tests {
         )
         .unwrap();
 
-        write_structural_node_artifacts(&unique_dir, 1, block_chain(1, "alpha", 2), &["fork-observed"]);
+        write_structural_node_artifacts(
+            &unique_dir,
+            1,
+            block_chain(1, "alpha", 2),
+            &["fork-observed"],
+        );
         write_structural_node_artifacts(
             &unique_dir,
             2,
