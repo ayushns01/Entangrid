@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -624,7 +624,14 @@ async fn run_abuse_pattern(base_dir: &Path, pattern: Option<AbusePattern>) -> Re
                         epoch: 0,
                         validator_id: source_validator_id,
                     };
-                    send_protocol_message(&crypto, source_validator_id, peer, payload).await?;
+                    if let Err(error) =
+                        send_protocol_message(&crypto, source_validator_id, peer, payload).await
+                    {
+                        info!(
+                            "ignoring failed sync-control flood message from validator {} to {}: {}",
+                            source_validator_id, peer.validator_id, error
+                        );
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(interval_millis)).await;
             }
@@ -1418,6 +1425,13 @@ struct StructuralNodeReport {
 struct StructuralReport {
     same_chain_count: usize,
     canonical_height: usize,
+    min_height: usize,
+    max_height: usize,
+    height_spread: usize,
+    distinct_tip_count: usize,
+    tip_spread: usize,
+    total_fork_observed: u64,
+    total_sync_blocks_rejected: u64,
     all_parent_ok: bool,
     all_tips_match: bool,
     all_stderr_clean: bool,
@@ -1565,6 +1579,25 @@ impl MatrixScenarioResult {
                 .max_non_target_gating_rejections
                 .is_none_or(|maximum| self.non_target_gating_rejections <= maximum)
     }
+
+    fn failure_signal(&self) -> Option<&'static str> {
+        if self.passed() {
+            return None;
+        }
+
+        let structural_fork_signal = self.structural_report.same_chain_count
+            != self.localnet_report.configured_validators
+            || self.structural_report.height_spread > 0
+            || self.structural_report.tip_spread > 0
+            || self.structural_report.total_fork_observed > 0
+            || self.structural_report.total_sync_blocks_rejected > 0;
+
+        if structural_fork_signal {
+            Some("sync/fork")
+        } else {
+            Some("policy/gating")
+        }
+    }
 }
 
 impl MatrixReport {
@@ -1579,12 +1612,18 @@ impl MatrixReport {
             format!("scenarios passed: {passed}/{}", self.scenarios.len()),
         ];
         for scenario in &self.scenarios {
+            let signal = scenario.failure_signal().unwrap_or("ok");
             lines.push(format!(
-                "{}: {} same_chain {}/{} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} honest_below_threshold {} honest_gating_rejections {} weights [{:.2},{:.2},{:.2},-{:.2}] rate_limit_drops {} inbound_drops {}",
+                "{}: {} signal {} same_chain {}/{} height_spread {} tip_spread {} fork_observed {} sync_blocks_rejected {} parent_ok {} tips_ok {} stderr_clean {} lowest_score {} gating_rejections {} honest_below_threshold {} honest_gating_rejections {} weights [{:.2},{:.2},{:.2},-{:.2}] rate_limit_drops {} inbound_drops {}",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
+                signal,
                 scenario.structural_report.same_chain_count,
                 scenario.localnet_report.configured_validators,
+                scenario.structural_report.height_spread,
+                scenario.structural_report.tip_spread,
+                scenario.structural_report.total_fork_observed,
+                scenario.structural_report.total_sync_blocks_rejected,
                 scenario.structural_report.all_parent_ok,
                 scenario.structural_report.all_tips_match,
                 scenario.structural_report.all_stderr_clean,
@@ -1623,8 +1662,8 @@ impl MatrixReport {
                 self.scenarios.len()
             ),
             String::new(),
-            "| Scenario | Status | Validators | Same Chain | Parent Hashes | Snapshots | Clean stderr | Lowest Score | Gating Rejections | Honest Below Threshold | Honest Gating Rejections |".to_string(),
-            "|---|---|---|---|---|---|---|---|---|---|---|".to_string(),
+            "| Scenario | Status | Signal | Validators | Same Chain | Height Spread | Tip Spread | Parent Hashes | Snapshots | Clean stderr | Lowest Score | Fork Observed | Sync Blocks Rejected | Gating Rejections | Honest Below Threshold | Honest Gating Rejections |".to_string(),
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|".to_string(),
         ];
 
         for scenario in &self.scenarios {
@@ -1633,17 +1672,23 @@ impl MatrixReport {
                 .lowest_score
                 .map(|(validator_id, score)| format!("v{validator_id}={score:.3}"))
                 .unwrap_or_else(|| "n/a".into());
+            let signal = scenario.failure_signal().unwrap_or("ok");
             lines.push(format!(
-                "| {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 scenario.name,
                 if scenario.passed() { "PASS" } else { "FAIL" },
+                signal,
                 scenario.localnet_report.configured_validators,
                 scenario.structural_report.same_chain_count,
+                scenario.structural_report.height_spread,
+                scenario.structural_report.tip_spread,
                 scenario.localnet_report.configured_validators,
                 scenario.structural_report.all_parent_ok,
                 scenario.structural_report.all_tips_match,
                 scenario.structural_report.all_stderr_clean,
                 lowest_score,
+                scenario.structural_report.total_fork_observed,
+                scenario.structural_report.total_sync_blocks_rejected,
                 scenario.localnet_report.total_gating_rejections,
                 scenario.non_target_below_threshold_count,
                 scenario.non_target_gating_rejections
@@ -1680,9 +1725,16 @@ impl MatrixReport {
                 ));
             }
             lines.push(format!(
-                "- Structural: same chain `{}/{}`, parent hashes `{}`, snapshots `{}`, clean stderr `{}`",
+                "- Structural: same chain `{}/{}`, height spread `{}` (range `{}..{}`), tip spread `{}` ({} unique tips), fork-observed `{}`, sync-blocks-rejected `{}`, parent hashes `{}`, snapshots `{}`, clean stderr `{}`",
                 scenario.structural_report.same_chain_count,
                 scenario.localnet_report.configured_validators,
+                scenario.structural_report.height_spread,
+                scenario.structural_report.min_height,
+                scenario.structural_report.max_height,
+                scenario.structural_report.tip_spread,
+                scenario.structural_report.distinct_tip_count,
+                scenario.structural_report.total_fork_observed,
+                scenario.structural_report.total_sync_blocks_rejected,
                 scenario.structural_report.all_parent_ok,
                 scenario.structural_report.all_tips_match,
                 scenario.structural_report.all_stderr_clean
@@ -1790,14 +1842,19 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
 fn build_structural_report(manifest: &LocalnetManifest) -> Result<StructuralReport> {
     let mut nodes = Vec::new();
     let mut chains: Vec<Vec<[u8; 32]>> = Vec::new();
+    let mut heights: Vec<usize> = Vec::new();
+    let mut tip_hashes: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut total_fork_observed = 0;
+    let mut total_sync_blocks_rejected = 0;
 
     for config_path in &manifest.node_configs {
         let contents = fs::read_to_string(config_path)?;
         let config: NodeConfig = toml::from_str(&contents)?;
         let node_dir = PathBuf::from(&config.data_dir);
         let blocks: Vec<entangrid_types::Block> = read_json_lines(&node_dir.join("blocks.jsonl"))?;
-        let snapshot: entangrid_types::StateSnapshot =
-            serde_json::from_str(&fs::read_to_string(node_dir.join("state_snapshot.json"))?)?;
+        let snapshot = read_state_snapshot(&node_dir.join("state_snapshot.json"))?;
+        let events: Vec<entangrid_types::EventLogEntry> =
+            read_json_lines(&node_dir.join("events.log"))?;
 
         let mut parent_ok = true;
         let mut previous_hash = empty_hash();
@@ -1815,8 +1872,20 @@ fn build_structural_report(manifest: &LocalnetManifest) -> Result<StructuralRepo
             .last()
             .map(|block| block.block_hash)
             .unwrap_or_else(empty_hash);
-        let tip_matches_snapshot =
-            snapshot.tip_hash == last_hash && snapshot.height == blocks.len() as u64;
+        heights.push(blocks.len());
+        tip_hashes.insert(last_hash);
+        total_fork_observed += events
+            .iter()
+            .filter(|entry| entry.event == "fork-observed")
+            .count() as u64;
+        total_sync_blocks_rejected += events
+            .iter()
+            .filter(|entry| entry.event == "sync-blocks-rejected")
+            .count() as u64;
+        let tip_matches_snapshot = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.tip_hash == last_hash && snapshot.height == blocks.len() as u64)
+            .unwrap_or(false);
         let stderr_path = node_dir.join("stderr.log");
         let stderr_clean = if stderr_path.exists() {
             fs::read_to_string(stderr_path)?.trim().is_empty()
@@ -1844,15 +1913,34 @@ fn build_structural_report(manifest: &LocalnetManifest) -> Result<StructuralRepo
         .iter()
         .filter(|chain| **chain == canonical_chain)
         .count();
+    let min_height = heights.iter().copied().min().unwrap_or(0);
+    let max_height = heights.iter().copied().max().unwrap_or(0);
+    let height_spread = max_height.saturating_sub(min_height);
+    let distinct_tip_count = tip_hashes.len();
+    let tip_spread = distinct_tip_count.saturating_sub(1);
 
     Ok(StructuralReport {
         same_chain_count,
         canonical_height: canonical_chain.len(),
+        min_height,
+        max_height,
+        height_spread,
+        distinct_tip_count,
+        tip_spread,
+        total_fork_observed,
+        total_sync_blocks_rejected,
         all_parent_ok: nodes.iter().all(|node| node.parent_ok),
         all_tips_match: nodes.iter().all(|node| node.tip_matches_snapshot),
         all_stderr_clean: nodes.iter().all(|node| node.stderr_clean),
         nodes,
     })
+}
+
+fn read_state_snapshot(path: &Path) -> Result<Option<entangrid_types::StateSnapshot>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
 }
 
 fn read_json_lines<T>(path: &Path) -> Result<Vec<T>>
@@ -1963,6 +2051,90 @@ fn localnet_is_fresh(manifest: &LocalnetManifest) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_chain(validator_id: u64, chain_name: &str, block_count: usize) -> Vec<entangrid_types::Block> {
+        let mut parent_hash = empty_hash();
+        let mut blocks = Vec::with_capacity(block_count);
+        for block_number in 1..=block_count {
+            let block_hash = canonical_hash(&(chain_name, validator_id, block_number as u64));
+            let header = entangrid_types::BlockHeader {
+                block_number: block_number as u64,
+                parent_hash,
+                slot: block_number as u64,
+                epoch: 1,
+                proposer_id: validator_id,
+                timestamp_unix_millis: block_number as u64,
+                state_root: block_hash,
+                transactions_root: block_hash,
+                topology_root: block_hash,
+            };
+            blocks.push(entangrid_types::Block {
+                header,
+                transactions: Vec::new(),
+                commitment: None,
+                commitment_receipts: Vec::new(),
+                signature: vec![validator_id as u8],
+                block_hash,
+            });
+            parent_hash = block_hash;
+        }
+        blocks
+    }
+
+    fn write_structural_node_artifacts(
+        base_dir: &Path,
+        validator_id: u64,
+        blocks: Vec<entangrid_types::Block>,
+        events: &[&str],
+    ) {
+        let node_dir = base_dir.join(format!("node-{validator_id}"));
+        fs::write(
+            node_dir.join("blocks.jsonl"),
+            blocks
+                .iter()
+                .map(|block| serde_json::to_string(block).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let tip_hash = blocks
+            .last()
+            .map(|block| block.block_hash)
+            .unwrap_or_else(empty_hash);
+        let snapshot = entangrid_types::StateSnapshot {
+            balances: BTreeMap::new(),
+            nonces: BTreeMap::new(),
+            tip_hash,
+            height: blocks.len() as u64,
+            last_slot: blocks.last().map(|block| block.header.slot).unwrap_or(0),
+        };
+        fs::write(
+            node_dir.join("state_snapshot.json"),
+            serde_json::to_string(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            node_dir.join("events.log"),
+            events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    serde_json::to_string(&entangrid_types::EventLogEntry {
+                        timestamp_unix_millis: 1_000 + index as u64,
+                        event: (*event).to_string(),
+                        detail: format!("{} detail", event),
+                    })
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        fs::write(node_dir.join("stderr.log"), "").unwrap();
+    }
 
     #[test]
     fn init_localnet_creates_manifest() {
@@ -2263,6 +2435,13 @@ mod tests {
                 structural_report: StructuralReport {
                     same_chain_count: 4,
                     canonical_height: 20,
+                    min_height: 20,
+                    max_height: 20,
+                    height_spread: 0,
+                    distinct_tip_count: 1,
+                    tip_spread: 0,
+                    total_fork_observed: 0,
+                    total_sync_blocks_rejected: 0,
                     all_parent_ok: true,
                     all_tips_match: true,
                     all_stderr_clean: true,
@@ -2276,7 +2455,7 @@ mod tests {
         assert!(rendered.contains("demo: PASS"));
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
-        assert!(markdown.contains("| Scenario | Status | Validators |"));
+        assert!(markdown.contains("| Scenario | Status | Signal | Validators |"));
     }
 
     #[test]
@@ -2337,6 +2516,13 @@ mod tests {
             structural_report: StructuralReport {
                 same_chain_count: 4,
                 canonical_height: 20,
+                min_height: 20,
+                max_height: 20,
+                height_spread: 0,
+                distinct_tip_count: 1,
+                tip_spread: 0,
+                total_fork_observed: 0,
+                total_sync_blocks_rejected: 0,
                 all_parent_ok: true,
                 all_tips_match: true,
                 all_stderr_clean: true,
@@ -2345,6 +2531,115 @@ mod tests {
         };
 
         assert!(!scenario.passed());
+    }
+
+    #[test]
+    fn structural_report_and_matrix_summary_surface_sync_fork_signals() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-structural-signal-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+        )
+        .unwrap();
+
+        write_structural_node_artifacts(&unique_dir, 1, block_chain(1, "alpha", 2), &["fork-observed"]);
+        write_structural_node_artifacts(
+            &unique_dir,
+            2,
+            block_chain(2, "beta", 4),
+            &["fork-observed", "fork-observed", "sync-blocks-rejected"],
+        );
+        write_structural_node_artifacts(
+            &unique_dir,
+            3,
+            block_chain(3, "gamma", 3),
+            &["sync-blocks-rejected", "sync-blocks-rejected"],
+        );
+        write_structural_node_artifacts(&unique_dir, 4, block_chain(4, "delta", 1), &[]);
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        let structural_report = build_structural_report(&manifest).unwrap();
+        assert_eq!(structural_report.same_chain_count, 1);
+        assert_eq!(structural_report.canonical_height, 4);
+        assert_eq!(structural_report.min_height, 1);
+        assert_eq!(structural_report.max_height, 4);
+        assert_eq!(structural_report.height_spread, 3);
+        assert_eq!(structural_report.distinct_tip_count, 4);
+        assert_eq!(structural_report.tip_spread, 3);
+        assert_eq!(structural_report.total_fork_observed, 3);
+        assert_eq!(structural_report.total_sync_blocks_rejected, 3);
+        assert!(structural_report.all_tips_match);
+
+        let scenario = MatrixScenarioResult {
+            name: "sync-fork-demo".into(),
+            base_dir: unique_dir.to_string_lossy().to_string(),
+            load_scenario: LoadScenario::Bursty,
+            load_duration_secs: 18,
+            abuse_pattern: None,
+            settle_secs: 12,
+            gating_enabled: false,
+            gating_threshold: 0.40,
+            score_window_epochs: 4,
+            score_weights: default_service_score_weights(),
+            policy_target_validator: None,
+            expected_lowest_validator: None,
+            min_lowest_score: Some(0.45),
+            max_lowest_score: None,
+            min_validator_gating_rejections: None,
+            max_non_target_below_threshold_count: None,
+            max_non_target_gating_rejections: None,
+            min_total_peer_rate_limit_drops: None,
+            min_total_inbound_session_drops: None,
+            non_target_below_threshold_count: 0,
+            non_target_gating_rejections: 0,
+            localnet_report: LocalnetReport {
+                base_dir: unique_dir.to_string_lossy().to_string(),
+                configured_validators: 4,
+                validators_with_metrics: 4,
+                total_blocks_proposed: 0,
+                total_missed_slots: 0,
+                total_gating_rejections: 0,
+                total_duplicate_receipts_ignored: 0,
+                total_peer_rate_limit_drops: 0,
+                total_inbound_session_drops: 0,
+                lowest_score: Some((1, 0.90)),
+                highest_score: Some((2, 1.0)),
+                validators: vec![],
+            },
+            structural_report: structural_report.clone(),
+        };
+
+        assert_eq!(scenario.failure_signal(), Some("sync/fork"));
+        let report = MatrixReport {
+            generated_at_unix_millis: 1,
+            base_dir: unique_dir.to_string_lossy().to_string(),
+            output_dir: unique_dir.to_string_lossy().to_string(),
+            scenarios: vec![scenario],
+        };
+        let rendered = report.render_text();
+        assert!(rendered.contains("signal sync/fork"));
+        assert!(rendered.contains("height_spread 3"));
+        assert!(rendered.contains("tip_spread 3"));
+        assert!(rendered.contains("fork_observed 3"));
+        assert!(rendered.contains("sync_blocks_rejected 3"));
+        let markdown = report.render_markdown();
+        assert!(markdown.contains("| Scenario | Status | Signal |"));
+        assert!(markdown.contains("| sync-fork-demo | FAIL | sync/fork |"));
     }
 
     #[test]

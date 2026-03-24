@@ -7,17 +7,17 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use entangrid_consensus::ConsensusEngine;
 use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend};
 use entangrid_ledger::LedgerState;
-use entangrid_network::{NetworkEvent, NetworkHandle, spawn_network};
+use entangrid_network::{spawn_network, NetworkEvent, NetworkHandle};
 use entangrid_types::{
-    Block, BlockHeader, ChainSegment, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig,
-    HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
-    RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
-    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
+    canonical_hash, empty_hash, now_unix_millis, Block, BlockHeader, ChainSegment, ChainSnapshot,
+    Epoch, EventLogEntry, GenesisConfig, HashBytes, HeartbeatPulse, MessageClass, NodeConfig,
+    NodeMetrics, PeerConfig, ProtocolMessage, RelayReceipt, ServiceCounters, SignedTransaction,
+    StateSnapshot, TopologyCommitment, ValidatorId,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -29,6 +29,7 @@ const ORPHANS_FILE: &str = "orphans.jsonl";
 const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
 const MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS: usize = 12;
 const SYNC_REQUEST_COOLDOWN_MILLIS: u64 = 1_500;
+const INCREMENTAL_SYNC_FAILURES_BEFORE_FULL_SNAPSHOT: u64 = 1;
 const PEER_MESSAGE_WINDOW_MILLIS: u64 = 5_000;
 const MAX_SYNC_CONTROL_MESSAGES_PER_WINDOW: u64 = 24;
 const MAX_TRANSACTION_GOSSIP_MESSAGES_PER_WINDOW: u64 = 256;
@@ -132,8 +133,9 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         observed_successful_sessions: BTreeSet::new(),
         observed_invalid_receipts: BTreeMap::new(),
         known_live_peers: BTreeSet::new(),
-        last_sync_request_served_at: BTreeMap::new(),
+        last_sync_request_served: BTreeMap::new(),
         peer_sync_status: BTreeMap::new(),
+        peer_sync_repair_failures: BTreeMap::new(),
         peer_message_windows: BTreeMap::new(),
     };
     runner.rebuild_seen_sets();
@@ -170,9 +172,17 @@ struct NodeRunner {
     observed_successful_sessions: BTreeSet<(Epoch, ValidatorId, ValidatorId)>,
     observed_invalid_receipts: BTreeMap<(Epoch, ValidatorId), u64>,
     known_live_peers: BTreeSet<ValidatorId>,
-    last_sync_request_served_at: BTreeMap<ValidatorId, u64>,
+    last_sync_request_served: BTreeMap<ValidatorId, ServedSyncRequest>,
     peer_sync_status: BTreeMap<ValidatorId, (u64, HashBytes)>,
+    peer_sync_repair_failures: BTreeMap<ValidatorId, u64>,
     peer_message_windows: BTreeMap<ValidatorId, PeerMessageWindow>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ServedSyncRequest {
+    served_at_unix_millis: u64,
+    known_height: u64,
+    known_tip_hash: HashBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -462,6 +472,7 @@ impl NodeRunner {
         };
 
         self.accept_block(block.clone(), true).await?;
+        self.try_promote_orphans().await?;
         self.network
             .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
         Ok(())
@@ -620,6 +631,7 @@ impl NodeRunner {
                 .await?;
                 match self.accept_block(block.clone(), false).await {
                     Ok(true) => {
+                        self.try_promote_orphans().await?;
                         self.network
                             .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
                     }
@@ -681,8 +693,12 @@ impl NodeRunner {
                 known_height,
                 known_tip_hash,
             } => {
+                let force_full_snapshot =
+                    is_force_full_snapshot_hint(known_height, known_tip_hash);
                 self.record_peer_sync_status(requester_id, known_height, known_tip_hash);
-                if self.sync_request_is_throttled(requester_id) {
+                if !force_full_snapshot
+                    && self.sync_request_is_throttled(requester_id, known_height, known_tip_hash)
+                {
                     self.update_metrics(|metrics| {
                         metrics.sync_requests_throttled += 1;
                     });
@@ -692,8 +708,12 @@ impl NodeRunner {
                     )?;
                     return Ok(());
                 }
-                self.record_sync_request_served(requester_id);
-                self.send_best_sync_to(requester_id, known_height, known_tip_hash)?;
+                if !force_full_snapshot {
+                    self.record_sync_request_served(requester_id, known_height, known_tip_hash);
+                    self.send_best_sync_to(requester_id, known_height, known_tip_hash)?;
+                } else {
+                    self.send_full_snapshot_to(self.find_peer(requester_id)?)?;
+                }
             }
             ProtocolMessage::SyncResponse {
                 responder_id,
@@ -704,9 +724,12 @@ impl NodeRunner {
                     chain.snapshot.height,
                     chain.snapshot.tip_hash,
                 );
-                if chain.snapshot.height > self.ledger.block_height() {
+                let local_snapshot = self.ledger.snapshot().clone();
+                if should_adopt_snapshot(&local_snapshot, &chain.snapshot) {
                     match self.apply_chain_snapshot(chain) {
                         Ok(()) => {
+                            self.try_promote_orphans().await?;
+                            self.clear_sync_repair_memory(responder_id);
                             self.update_metrics(|metrics| {
                                 metrics.full_sync_applied += 1;
                             });
@@ -722,7 +745,7 @@ impl NodeRunner {
                             )?;
                         }
                     }
-                } else if chain.snapshot.height < self.ledger.block_height() {
+                } else if should_adopt_snapshot(&chain.snapshot, &local_snapshot) {
                     if let Err(error) = self.push_best_sync_to(
                         responder_id,
                         chain.snapshot.height,
@@ -744,11 +767,14 @@ impl NodeRunner {
                     chain.target_snapshot.height,
                     chain.target_snapshot.tip_hash,
                 );
-                if chain.target_snapshot.height <= self.ledger.block_height() {
+                let local_snapshot = self.ledger.snapshot().clone();
+                if !should_adopt_snapshot(&local_snapshot, &chain.target_snapshot) {
                     return Ok(());
                 }
                 match self.apply_chain_segment(chain) {
                     Ok(()) => {
+                        self.try_promote_orphans().await?;
+                        self.clear_sync_repair_memory(responder_id);
                         self.update_metrics(|metrics| {
                             metrics.incremental_sync_applied += 1;
                         });
@@ -758,6 +784,7 @@ impl NodeRunner {
                         )?;
                     }
                     Err(error) => {
+                        self.record_sync_repair_failure(responder_id);
                         self.log_event(
                             "sync-blocks-rejected",
                             format!("from {responder_id} detail {error}"),
@@ -1190,16 +1217,8 @@ impl NodeRunner {
     }
 
     fn apply_chain_segment(&mut self, chain: ChainSegment) -> Result<()> {
-        if chain.base_height != self.ledger.block_height() {
-            return Err(anyhow!(
-                "incremental sync height mismatch local {} remote {}",
-                self.ledger.block_height(),
-                chain.base_height
-            ));
-        }
-        if chain.base_tip_hash != self.ledger.snapshot().tip_hash {
-            return Err(anyhow!("incremental sync tip mismatch"));
-        }
+        let chain =
+            align_chain_segment_to_local_chain(&self.blocks, self.ledger.snapshot(), chain)?;
 
         let receipts =
             validate_snapshot_receipts(&self.consensus, self.crypto.as_ref(), &chain.receipts)?;
@@ -1235,18 +1254,67 @@ impl NodeRunner {
         Ok(())
     }
 
-    fn sync_request_is_throttled(&self, validator_id: ValidatorId) -> bool {
-        self.last_sync_request_served_at
+    fn sync_request_is_throttled(
+        &self,
+        validator_id: ValidatorId,
+        known_height: u64,
+        known_tip_hash: HashBytes,
+    ) -> bool {
+        self.last_sync_request_served
             .get(&validator_id)
-            .map(|last_served_at| {
-                now_unix_millis().saturating_sub(*last_served_at) < SYNC_REQUEST_COOLDOWN_MILLIS
+            .map(|served| {
+                sync_request_should_throttle(
+                    *served,
+                    now_unix_millis(),
+                    known_height,
+                    known_tip_hash,
+                )
             })
             .unwrap_or(false)
     }
 
-    fn record_sync_request_served(&mut self, validator_id: ValidatorId) {
-        self.last_sync_request_served_at
-            .insert(validator_id, now_unix_millis());
+    fn record_sync_request_served(
+        &mut self,
+        validator_id: ValidatorId,
+        known_height: u64,
+        known_tip_hash: HashBytes,
+    ) {
+        self.last_sync_request_served.insert(
+            validator_id,
+            ServedSyncRequest {
+                served_at_unix_millis: now_unix_millis(),
+                known_height,
+                known_tip_hash,
+            },
+        );
+    }
+
+    fn sync_request_hint_for_peer(&self, validator_id: ValidatorId) -> (u64, HashBytes) {
+        sync_request_known_state(
+            self.ledger.block_height(),
+            self.ledger.snapshot().tip_hash,
+            self.should_force_full_snapshot_for_peer(validator_id),
+        )
+    }
+
+    fn should_force_full_snapshot_for_peer(&self, validator_id: ValidatorId) -> bool {
+        sync_repair_should_force_full_snapshot(
+            self.peer_sync_repair_failures
+                .get(&validator_id)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
+
+    fn record_sync_repair_failure(&mut self, validator_id: ValidatorId) {
+        *self
+            .peer_sync_repair_failures
+            .entry(validator_id)
+            .or_default() += 1;
+    }
+
+    fn clear_sync_repair_memory(&mut self, validator_id: ValidatorId) {
+        self.peer_sync_repair_failures.remove(&validator_id);
     }
 
     fn refresh_service_scores(&mut self) {
@@ -1386,12 +1454,13 @@ impl NodeRunner {
     }
 
     fn request_sync_from(&self, validator_id: ValidatorId) -> Result<()> {
+        let (known_height, known_tip_hash) = self.sync_request_hint_for_peer(validator_id);
         self.network.send_to(
             self.find_peer(validator_id)?,
             ProtocolMessage::SyncRequest {
                 requester_id: self.config.validator_id,
-                known_height: self.ledger.block_height(),
-                known_tip_hash: self.ledger.snapshot().tip_hash,
+                known_height,
+                known_tip_hash,
             },
         )
     }
@@ -1490,6 +1559,9 @@ impl NodeRunner {
         height: u64,
         tip_hash: HashBytes,
     ) {
+        if !should_record_peer_sync_status(height, tip_hash) {
+            return;
+        }
         self.peer_sync_status
             .insert(validator_id, (height, tip_hash));
     }
@@ -1808,6 +1880,59 @@ fn build_chain_segment_from_chain(
     })
 }
 
+fn align_chain_segment_to_local_chain(
+    local_blocks: &[Block],
+    local_snapshot: &StateSnapshot,
+    mut chain: ChainSegment,
+) -> Result<ChainSegment> {
+    if chain.base_height > local_snapshot.height {
+        return Err(anyhow!(
+            "incremental sync height mismatch local {} remote {}",
+            local_snapshot.height,
+            chain.base_height
+        ));
+    }
+
+    let expected_base_tip_hash = if chain.base_height == 0 {
+        empty_hash()
+    } else {
+        local_blocks
+            .get(chain.base_height.saturating_sub(1) as usize)
+            .map(|block| block.block_hash)
+            .ok_or_else(|| anyhow!("incremental sync missing local base block"))?
+    };
+    if expected_base_tip_hash != chain.base_tip_hash {
+        return Err(anyhow!("incremental sync tip mismatch"));
+    }
+
+    if chain.base_height == local_snapshot.height {
+        if chain.base_tip_hash != local_snapshot.tip_hash {
+            return Err(anyhow!("incremental sync tip mismatch"));
+        }
+        return Ok(chain);
+    }
+
+    let overlap = local_snapshot.height.saturating_sub(chain.base_height) as usize;
+    if overlap > chain.blocks.len() {
+        return Err(anyhow!("incremental sync missing local overlap"));
+    }
+
+    for (offset, block) in chain.blocks.iter().take(overlap).enumerate() {
+        let local_index = chain.base_height as usize + offset;
+        let local_block = local_blocks
+            .get(local_index)
+            .ok_or_else(|| anyhow!("incremental sync missing local overlap"))?;
+        if local_block.block_hash != block.block_hash {
+            return Err(anyhow!("incremental sync diverged from local chain"));
+        }
+    }
+
+    chain.base_height = local_snapshot.height;
+    chain.base_tip_hash = local_snapshot.tip_hash;
+    chain.blocks = chain.blocks.into_iter().skip(overlap).collect();
+    Ok(chain)
+}
+
 fn validate_chain_snapshot(
     genesis: &GenesisConfig,
     consensus: &ConsensusEngine,
@@ -2037,6 +2162,53 @@ fn should_enforce_service_gating_for_block(
     enable_service_gating && local_proposal && epoch >= service_gating_start_epoch
 }
 
+fn sync_request_known_state(
+    local_height: u64,
+    local_tip_hash: HashBytes,
+    force_full_snapshot: bool,
+) -> (u64, HashBytes) {
+    if force_full_snapshot {
+        // A sentinel height forces the responder to fall back to a full snapshot.
+        return (u64::MAX, empty_hash());
+    }
+
+    (local_height, local_tip_hash)
+}
+
+fn is_force_full_snapshot_hint(known_height: u64, known_tip_hash: HashBytes) -> bool {
+    known_height == u64::MAX && known_tip_hash == empty_hash()
+}
+
+fn should_record_peer_sync_status(height: u64, tip_hash: HashBytes) -> bool {
+    !is_force_full_snapshot_hint(height, tip_hash)
+}
+
+fn sync_repair_should_force_full_snapshot(failure_count: u64) -> bool {
+    failure_count >= INCREMENTAL_SYNC_FAILURES_BEFORE_FULL_SNAPSHOT
+}
+
+fn sync_request_should_throttle(
+    served: ServedSyncRequest,
+    now_unix_millis: u64,
+    known_height: u64,
+    known_tip_hash: HashBytes,
+) -> bool {
+    if is_force_full_snapshot_hint(known_height, known_tip_hash) {
+        return false;
+    }
+    now_unix_millis.saturating_sub(served.served_at_unix_millis) < SYNC_REQUEST_COOLDOWN_MILLIS
+        && served.known_height == known_height
+        && served.known_tip_hash == known_tip_hash
+}
+
+fn snapshot_preference(snapshot: &StateSnapshot) -> (u64, u64, HashBytes) {
+    (snapshot.height, snapshot.last_slot, snapshot.tip_hash)
+}
+
+fn should_adopt_snapshot(local: &StateSnapshot, remote: &StateSnapshot) -> bool {
+    snapshot_preference(remote) > snapshot_preference(local)
+}
+
 #[derive(Clone, Debug)]
 struct Storage {
     data_dir: PathBuf,
@@ -2191,8 +2363,8 @@ mod tests {
 
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::{
-        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, empty_hash,
-        validator_account,
+        empty_hash, validator_account, GenesisConfig, SignedTransaction, Transaction,
+        ValidatorConfig,
     };
 
     use super::*;
@@ -2432,6 +2604,220 @@ mod tests {
 
         let segment = build_chain_segment_from_chain(&snapshot, &blocks, &[], 4, 0, empty_hash());
         assert!(segment.is_none());
+    }
+
+    #[test]
+    fn sync_repair_escalates_to_full_snapshot_after_repeated_incremental_failures() {
+        let tip_hash = [7u8; 32];
+
+        assert!(!sync_repair_should_force_full_snapshot(0));
+        assert!(!sync_repair_should_force_full_snapshot(
+            INCREMENTAL_SYNC_FAILURES_BEFORE_FULL_SNAPSHOT - 1
+        ));
+        assert!(sync_repair_should_force_full_snapshot(
+            INCREMENTAL_SYNC_FAILURES_BEFORE_FULL_SNAPSHOT
+        ));
+
+        assert_eq!(
+            sync_request_known_state(42, tip_hash, false),
+            (42, tip_hash)
+        );
+        assert_eq!(
+            sync_request_known_state(42, tip_hash, true),
+            (u64::MAX, empty_hash())
+        );
+        assert!(is_force_full_snapshot_hint(u64::MAX, empty_hash()));
+        assert!(!is_force_full_snapshot_hint(42, tip_hash));
+        assert!(!should_record_peer_sync_status(u64::MAX, empty_hash()));
+        assert!(should_record_peer_sync_status(42, tip_hash));
+    }
+
+    #[test]
+    fn snapshot_fork_choice_prefers_height_then_slot_then_tip_hash() {
+        let local = StateSnapshot {
+            balances: BTreeMap::new(),
+            nonces: BTreeMap::new(),
+            tip_hash: [1u8; 32],
+            height: 10,
+            last_slot: 20,
+        };
+        let higher = StateSnapshot {
+            height: 11,
+            ..local.clone()
+        };
+        let later_slot = StateSnapshot {
+            tip_hash: [2u8; 32],
+            last_slot: 21,
+            ..local.clone()
+        };
+        let higher_tip_hash = StateSnapshot {
+            tip_hash: [3u8; 32],
+            ..local.clone()
+        };
+
+        assert!(should_adopt_snapshot(&local, &higher));
+        assert!(should_adopt_snapshot(&local, &later_slot));
+        assert!(should_adopt_snapshot(&local, &higher_tip_hash));
+        assert!(!should_adopt_snapshot(&later_slot, &local));
+    }
+
+    #[test]
+    fn sync_request_throttle_only_blocks_repeated_identical_known_state() {
+        let now = now_unix_millis();
+        let repeated = ServedSyncRequest {
+            served_at_unix_millis: now,
+            known_height: 10,
+            known_tip_hash: [1u8; 32],
+        };
+        let fresh_height = ServedSyncRequest {
+            known_height: 11,
+            ..repeated
+        };
+        let fresh_tip = ServedSyncRequest {
+            known_tip_hash: [2u8; 32],
+            ..repeated
+        };
+
+        assert!(sync_request_should_throttle(
+            repeated,
+            now + 10,
+            repeated.known_height,
+            repeated.known_tip_hash,
+        ));
+        assert!(!sync_request_should_throttle(
+            fresh_height,
+            now + 10,
+            repeated.known_height,
+            repeated.known_tip_hash,
+        ));
+        assert!(!sync_request_should_throttle(
+            fresh_tip,
+            now + 10,
+            repeated.known_height,
+            repeated.known_tip_hash,
+        ));
+        assert!(!sync_request_should_throttle(
+            repeated,
+            now + SYNC_REQUEST_COOLDOWN_MILLIS + 1,
+            repeated.known_height,
+            repeated.known_tip_hash,
+        ));
+        assert!(!sync_request_should_throttle(
+            repeated,
+            now + 10,
+            u64::MAX,
+            empty_hash(),
+        ));
+    }
+
+    fn valid_block_chain_for_slots(genesis: &GenesisConfig, slots: &[u64]) -> Vec<Block> {
+        let crypto = DeterministicCryptoBackend::from_genesis(genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let mut ledger = LedgerState::from_genesis(genesis);
+        let mut blocks = Vec::with_capacity(slots.len());
+        let mut parent_hash = empty_hash();
+        for (index, slot) in slots.iter().copied().enumerate() {
+            let proposer_id = consensus.proposer_for_slot(slot);
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions: Vec<SignedTransaction> = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: (index + 1) as u64,
+                parent_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            let block = Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            };
+            let mut next_ledger = ledger.clone();
+            next_ledger.apply_block(&block, &crypto).unwrap();
+            ledger = next_ledger;
+            parent_hash = block.block_hash;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    #[test]
+    fn align_chain_segment_trims_already_applied_prefix() {
+        let genesis = sample_genesis();
+        let blocks = valid_block_chain_for_slots(&genesis, &[0, 1, 2, 3]);
+        let local_blocks = blocks[..3].to_vec();
+        let local_snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &local_blocks,
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+        let target_snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &blocks,
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+        let segment = ChainSegment {
+            base_height: 2,
+            base_tip_hash: blocks[1].block_hash,
+            target_snapshot,
+            blocks: blocks[2..].to_vec(),
+            receipts: Vec::new(),
+        };
+
+        let aligned =
+            align_chain_segment_to_local_chain(&local_blocks, &local_snapshot, segment).unwrap();
+        assert_eq!(aligned.base_height, 3);
+        assert_eq!(aligned.base_tip_hash, blocks[2].block_hash);
+        assert_eq!(aligned.blocks, vec![blocks[3].clone()]);
+    }
+
+    #[test]
+    fn align_chain_segment_rejects_divergent_local_suffix() {
+        let genesis = sample_genesis();
+        let local_blocks = valid_block_chain_for_slots(&genesis, &[0, 1, 4]);
+        let remote_blocks = valid_block_chain_for_slots(&genesis, &[0, 1, 2, 3]);
+        let local_snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &local_blocks,
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+        let target_snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &remote_blocks,
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+        let segment = ChainSegment {
+            base_height: 2,
+            base_tip_hash: remote_blocks[1].block_hash,
+            target_snapshot,
+            blocks: remote_blocks[2..].to_vec(),
+            receipts: Vec::new(),
+        };
+
+        let error =
+            align_chain_segment_to_local_chain(&local_blocks, &local_snapshot, segment).unwrap_err();
+        assert!(error.to_string().contains("incremental sync"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use tokio::{
 
 const MAX_FRAME_SIZE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_INBOUND_SESSIONS: usize = 64;
+const INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS: u64 = 75;
 const MAX_CONNECT_RETRIES: u32 = 4;
 const CONNECT_RETRY_BACKOFF_MILLIS: u64 = 15;
 
@@ -103,17 +104,26 @@ pub async fn spawn_network(
                     let metrics = Arc::clone(&listener_metrics);
                     let event_tx = listener_events.clone();
                     let inbound_limit = Arc::clone(&inbound_limit);
-                    let Ok(permit) = inbound_limit.try_acquire_owned() else {
+                    let permit = match tokio::time::timeout(
+                        Duration::from_millis(INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS),
+                        inbound_limit.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) | Err(_) => {
                         update_metrics(&metrics, |metrics| {
                             metrics.inbound_session_drops += 1;
                         });
                         let _ = event_tx.send(NetworkEvent::InboundSessionDropped {
                             detail: format!(
-                                "max concurrent inbound sessions {} reached",
-                                MAX_CONCURRENT_INBOUND_SESSIONS
+                                "inbound session capacity {} unavailable for {}ms",
+                                MAX_CONCURRENT_INBOUND_SESSIONS,
+                                INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS
                             ),
                         });
-                        continue;
+                            continue;
+                        }
                     };
                     tokio::spawn(async move {
                         let _permit = permit;
