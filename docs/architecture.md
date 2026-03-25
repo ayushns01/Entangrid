@@ -6,6 +6,12 @@
 
 Instead of treating networking as a side detail, the protocol records and scores how validators participate in message delivery. Validators do not earn better proposer odds simply by holding stake or opening idle connections. They must maintain secure sessions and produce verifiable evidence that they forwarded useful traffic within deadline windows.
 
+Current status note:
+
+- the `main` branch architecture is still centered on the first working receipt-driven prototype
+- that prototype is enough for localnet experiments, but it is not yet the final architecture for larger validator counts
+- the active redesign toward committee-attested service evidence, certificate-backed ordering, and cleaner separation of ordering/service/sync planes is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+
 ## High-Level Components
 
 ### 1. Identity Layer

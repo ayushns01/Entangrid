@@ -145,6 +145,12 @@ That means:
 
 So think of it as the current policy engine for the chain, not the finished production consensus design.
 
+Important current limit:
+
+- this receipt-driven scoring model is still best treated as the validated 4-validator prototype baseline
+- larger validator-count localnets still need a stronger shared evidence source and stronger ordering/fork-choice story
+- the active redesign plan for that next step lives in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+
 ## Why this crate matters
 
 This crate contains the heart of the Entangrid research idea.

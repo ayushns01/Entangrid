@@ -50,6 +50,7 @@ This repository instead documents a more defensible design:
 - [Roadmap](docs/roadmap.md)
 - [Localnet Plan](docs/localnet.md)
 - [Benchmarking Plan](docs/benchmarks.md)
+- [Consensus V2 Redesign Plan](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
 
 ## MVP Scope
 
@@ -101,6 +102,7 @@ Important:
 
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
 - real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
+- the current `main` branch still uses the legacy receipt-driven gating prototype; the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
 
 ## Current Recommended Prototype Policy
 
@@ -125,6 +127,17 @@ Important:
 - the harsh 4-validator Entangrid scenarios and abuse scenarios are currently in a much better place than before
 - the current live matrix still shows that 6-validator bursty scenarios do not reconverge quickly enough after the normal settle window
 - because of that, this policy should be treated as the current 4-validator pre-PQ baseline, not as a final all-topology signoff
+
+## Active Redesign Direction
+
+The current prototype proved the core Entangrid idea is implementable, but it also exposed a real scaling limitation:
+
+- the current local-receipt-driven score path is still too topology-sensitive at larger validator counts
+- the next protocol step should move proposer gating onto prior-epoch committee-attested service aggregates
+- fork choice should eventually prefer certificate-backed ordering instead of relying on ad hoc repair alone
+
+That redesign is planned in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md).
+Until that work lands, treat the current `main` branch as the strongest validated research prototype, not the final consensus architecture.
 
 ## Quickstart
 

@@ -157,6 +157,12 @@ The current recommended prototype localnet profile is:
 
 That profile is still the shared default emitted by `init-localnet`, but it should currently be treated as the best 4-validator baseline rather than a final all-topology signoff.
 
+Important current limit:
+
+- the `main` branch node runtime still uses the legacy receipt-driven service-gating path
+- that path is useful for localnet experiments, but it is not yet the final validator-count-scalable design
+- the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
 
 - commitment validation now uses explicit proof data from the block

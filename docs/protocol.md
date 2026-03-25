@@ -11,6 +11,12 @@ This is the protocol direction for `Entangrid`:
 - signed relay receipts feed a rolling topology score
 - stake and service together determine proposer eligibility
 
+Current status note:
+
+- the `main` branch still implements the first working receipt-driven prototype of this idea
+- that prototype is useful, but it is not yet the final validator-count-scalable form of the protocol
+- the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+
 ## Protocol Goals
 
 - keep the system post-quantum from the application layer upward
