@@ -2,9 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use entangrid_types::{
     Block, CommitmentSummary, Epoch, EpochAssignment, GenesisConfig, HashBytes, MessageClass,
-    RelayReceipt, ServiceAggregate, ServiceCounters, ServiceScoreWeights, Slot,
-    TopologyCommitment, ValidatorId, canonical_hash, default_service_score_weights, hash_many,
-    now_unix_millis,
+    RelayReceipt, ServiceAggregate, ServiceCounters, ServiceScoreWeights, Slot, TopologyCommitment,
+    ValidatorId, canonical_hash, default_service_score_weights, hash_many, now_unix_millis,
 };
 
 #[derive(Clone, Debug)]

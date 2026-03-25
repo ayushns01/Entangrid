@@ -16,8 +16,8 @@ use entangrid_network::{NetworkEvent, NetworkFailureKind, NetworkHandle, spawn_n
 use entangrid_types::{
     Block, BlockHeader, ChainSegment, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig,
     HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
-    RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
-    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
+    RelayReceipt, ServiceAggregate, ServiceAttestation, ServiceCounters, SignedTransaction,
+    StateSnapshot, TopologyCommitment, ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -25,6 +25,8 @@ use tracing::info;
 const SNAPSHOT_FILE: &str = "state_snapshot.json";
 const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
+const SERVICE_ATTESTATIONS_FILE: &str = "service_attestations.jsonl";
+const SERVICE_AGGREGATES_FILE: &str = "service_aggregates.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
 const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
 const MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS: usize = 12;
@@ -80,6 +82,8 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
     storage.init()?;
     let loaded_blocks = storage.load_blocks()?;
     let loaded_receipts = storage.load_receipts()?;
+    let loaded_service_attestations = storage.load_service_attestations()?;
+    let loaded_service_aggregates = storage.load_service_aggregates()?;
     let snapshot = storage.load_snapshot()?;
     let ledger = match snapshot {
         Some(snapshot) => LedgerState::from_snapshot(snapshot),
@@ -121,6 +125,10 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         seen_blocks: BTreeSet::new(),
         seen_receipts: BTreeSet::new(),
         seen_receipt_events: BTreeSet::new(),
+        service_attestations: BTreeMap::new(),
+        service_aggregates: BTreeMap::new(),
+        seen_service_attestations: BTreeSet::new(),
+        seen_service_aggregates: BTreeSet::new(),
         last_processed_slot: None,
         last_logged_epoch: None,
         last_heartbeat_slot: None,
@@ -138,6 +146,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         peer_sync_repair_failures: BTreeMap::new(),
         peer_message_windows: BTreeMap::new(),
     };
+    runner.restore_service_evidence(loaded_service_attestations, loaded_service_aggregates)?;
     runner.rebuild_seen_sets();
     runner.run().await
 }
@@ -160,6 +169,10 @@ struct NodeRunner {
     seen_blocks: BTreeSet<HashBytes>,
     seen_receipts: BTreeSet<HashBytes>,
     seen_receipt_events: BTreeSet<HashBytes>,
+    service_attestations: BTreeMap<(ValidatorId, Epoch), BTreeMap<ValidatorId, ServiceAttestation>>,
+    service_aggregates: BTreeMap<(ValidatorId, Epoch), ServiceAggregate>,
+    seen_service_attestations: BTreeSet<HashBytes>,
+    seen_service_aggregates: BTreeSet<HashBytes>,
     last_processed_slot: Option<u64>,
     last_logged_epoch: Option<Epoch>,
     last_heartbeat_slot: Option<u64>,
@@ -310,6 +323,7 @@ impl NodeRunner {
             )?;
             self.log_current_service_score(epoch)?;
             if epoch > 0 {
+                self.emit_service_attestations_for_completed_epoch(epoch - 1)?;
                 self.request_receipt_reconciliation(epoch - 1)?;
             }
         }
@@ -837,8 +851,45 @@ impl NodeRunner {
                         .broadcast(&self.config.peers, ProtocolMessage::RelayReceipt(receipt))?;
                 }
             }
-            ProtocolMessage::ServiceAttestation(_) => {}
-            ProtocolMessage::ServiceAggregate(_) => {}
+            ProtocolMessage::ServiceAttestation(attestation) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_service_attestation(attestation.clone()) {
+                        self.log_event(
+                            "service-attestation-rejected",
+                            format!(
+                                "from {from_validator_id} subject {} epoch {} detail {error}",
+                                attestation.subject_validator_id, attestation.epoch
+                            ),
+                        )?;
+                    } else {
+                        self.update_metrics(|metrics| {
+                            metrics.service_attestations_imported += 1;
+                        });
+                        self.maybe_publish_service_aggregate(
+                            attestation.subject_validator_id,
+                            attestation.epoch,
+                        )?;
+                    }
+                }
+            }
+            ProtocolMessage::ServiceAggregate(aggregate) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_service_aggregate(aggregate.clone()) {
+                        self.log_event(
+                            "service-aggregate-rejected",
+                            format!(
+                                "from {from_validator_id} subject {} epoch {} detail {error}",
+                                aggregate.subject_validator_id, aggregate.epoch
+                            ),
+                        )?;
+                    } else {
+                        self.update_metrics(|metrics| {
+                            metrics.service_aggregates_imported += 1;
+                        });
+                        self.refresh_service_scores();
+                    }
+                }
+            }
             ProtocolMessage::ReceiptFetch {
                 requester_id,
                 epoch,
@@ -1440,6 +1491,57 @@ impl NodeRunner {
             return;
         }
 
+        if self.config.feature_flags.consensus_v2 {
+            let mut local_service_epoch = 0;
+            for validator_id in validator_ids {
+                let aggregate = self
+                    .latest_service_aggregate_before_epoch(validator_id, current_epoch)
+                    .cloned();
+                let score = aggregate
+                    .as_ref()
+                    .map(|aggregate| {
+                        self.consensus.compute_service_score_from_aggregate(
+                            aggregate,
+                            &self.config.feature_flags.service_score_weights,
+                        )
+                    })
+                    .unwrap_or(0.0);
+                self.latest_service_scores.insert(validator_id, score);
+                if validator_id == self.config.validator_id {
+                    local_service_epoch = aggregate
+                        .as_ref()
+                        .map(|aggregate| aggregate.epoch)
+                        .unwrap_or(0);
+                }
+                self.latest_service_counters.insert(
+                    validator_id,
+                    aggregate
+                        .map(|aggregate| aggregate.aggregate_counters)
+                        .unwrap_or_default(),
+                );
+            }
+            let scores = self.latest_service_scores.clone();
+            let local_score = scores
+                .get(&self.config.validator_id)
+                .copied()
+                .unwrap_or(0.0);
+            let local_counters = self.local_service_counters();
+            self.update_metrics(|metrics| {
+                metrics.relay_scores = scores;
+                metrics.last_local_service_score = local_score;
+                metrics.service_gating_threshold = self.service_gating_threshold();
+                metrics.last_completed_service_epoch = local_service_epoch;
+                metrics.service_gating_start_epoch =
+                    self.config.feature_flags.service_gating_start_epoch;
+                metrics.service_score_window_epochs =
+                    self.config.feature_flags.service_score_window_epochs;
+                metrics.service_score_weights =
+                    self.config.feature_flags.service_score_weights.clone();
+                metrics.last_local_service_counters = local_counters;
+            });
+            return;
+        }
+
         let window_epochs = self.config.feature_flags.service_score_window_epochs.max(1);
         let earliest_epoch = completed_epoch.saturating_sub(window_epochs.saturating_sub(1));
         self.prune_penalty_observations(earliest_epoch);
@@ -1483,6 +1585,20 @@ impl NodeRunner {
             metrics.service_score_weights = self.config.feature_flags.service_score_weights.clone();
             metrics.last_local_service_counters = local_counters;
         });
+    }
+
+    fn latest_service_aggregate_before_epoch(
+        &self,
+        validator_id: ValidatorId,
+        current_epoch: Epoch,
+    ) -> Option<&ServiceAggregate> {
+        if current_epoch == 0 {
+            return None;
+        }
+        self.service_aggregates
+            .range((validator_id, 0)..=(validator_id, current_epoch - 1))
+            .next_back()
+            .map(|(_, aggregate)| aggregate)
     }
 
     fn service_score_for_validator(&self, validator_id: ValidatorId) -> f64 {
@@ -1689,11 +1805,268 @@ impl NodeRunner {
         self.seen_blocks = self.blocks.iter().map(|block| block.block_hash).collect();
         self.seen_receipts = self.receipts.iter().map(canonical_hash).collect();
         self.seen_receipt_events = self.receipts.iter().map(receipt_event_hash).collect();
+        self.seen_service_attestations = self
+            .service_attestations
+            .values()
+            .flat_map(|by_member| by_member.values().map(service_attestation_signing_hash))
+            .collect();
+        self.seen_service_aggregates = self
+            .service_aggregates
+            .values()
+            .map(canonical_hash)
+            .collect();
         for block in &self.blocks {
             for transaction in &block.transactions {
                 self.seen_transactions.insert(transaction.tx_hash);
             }
         }
+    }
+
+    fn restore_service_evidence(
+        &mut self,
+        attestations: Vec<ServiceAttestation>,
+        aggregates: Vec<ServiceAggregate>,
+    ) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+        for attestation in attestations {
+            self.validate_service_attestation(&attestation)?;
+            self.insert_service_attestation(attestation, false)?;
+        }
+        for aggregate in aggregates {
+            self.validate_service_aggregate(&aggregate)?;
+            self.insert_service_aggregate(aggregate, false)?;
+        }
+        Ok(())
+    }
+
+    fn emit_service_attestations_for_completed_epoch(&mut self, epoch: Epoch) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+
+        let validator_ids: Vec<_> = self
+            .genesis
+            .validators
+            .iter()
+            .map(|validator| validator.validator_id)
+            .collect();
+        for subject_validator_id in validator_ids {
+            if subject_validator_id == self.config.validator_id {
+                continue;
+            }
+            let committee = self
+                .consensus
+                .service_committee_for(epoch, subject_validator_id);
+            if !committee.contains(&self.config.validator_id) {
+                continue;
+            }
+            let attestation = self.build_local_service_attestation(subject_validator_id, epoch)?;
+            if self.import_service_attestation(attestation.clone())? {
+                self.update_metrics(|metrics| {
+                    metrics.service_attestations_emitted += 1;
+                });
+                self.network.broadcast(
+                    &self.config.peers,
+                    ProtocolMessage::ServiceAttestation(attestation),
+                )?;
+            }
+            self.maybe_publish_service_aggregate(subject_validator_id, epoch)?;
+        }
+        Ok(())
+    }
+
+    fn build_local_service_attestation(
+        &self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<ServiceAttestation> {
+        let counters = self.consensus.counters_for_validator(
+            subject_validator_id,
+            epoch,
+            &self.receipts,
+            self.failed_sessions_for(subject_validator_id, epoch),
+            self.invalid_receipts_for(subject_validator_id, epoch),
+        );
+        let mut attestation = ServiceAttestation {
+            subject_validator_id,
+            committee_member_id: self.config.validator_id,
+            epoch,
+            counters,
+            signature: Vec::new(),
+        };
+        let hash = service_attestation_signing_hash(&attestation);
+        attestation.signature = self.crypto.sign(self.config.validator_id, &hash)?;
+        Ok(attestation)
+    }
+
+    fn import_service_attestation(&mut self, attestation: ServiceAttestation) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("service attestations require consensus_v2"));
+        }
+        self.validate_service_attestation(&attestation)?;
+        self.store_service_attestation(attestation)
+    }
+
+    fn validate_service_attestation(&self, attestation: &ServiceAttestation) -> Result<()> {
+        let committee = self
+            .consensus
+            .service_committee_for(attestation.epoch, attestation.subject_validator_id);
+        if !committee.contains(&attestation.committee_member_id) {
+            return Err(anyhow!(
+                "service attestation signer is not in the service committee"
+            ));
+        }
+        let hash = service_attestation_signing_hash(attestation);
+        let verified = self.crypto.verify(
+            attestation.committee_member_id,
+            &hash,
+            &attestation.signature,
+        )?;
+        if !verified {
+            return Err(anyhow!("invalid service attestation signature"));
+        }
+        Ok(())
+    }
+
+    fn store_service_attestation(&mut self, attestation: ServiceAttestation) -> Result<bool> {
+        self.insert_service_attestation(attestation, true)
+    }
+
+    fn insert_service_attestation(
+        &mut self,
+        attestation: ServiceAttestation,
+        persist: bool,
+    ) -> Result<bool> {
+        let key = (attestation.subject_validator_id, attestation.epoch);
+        let attestation_id = service_attestation_signing_hash(&attestation);
+        if self.seen_service_attestations.contains(&attestation_id) {
+            return Ok(false);
+        }
+        let by_member = self.service_attestations.entry(key).or_default();
+        if let Some(existing) = by_member.get(&attestation.committee_member_id) {
+            if service_attestation_signing_hash(existing) == attestation_id {
+                return Ok(false);
+            }
+            return Err(anyhow!("conflicting service attestation"));
+        }
+        by_member.insert(attestation.committee_member_id, attestation.clone());
+        self.seen_service_attestations.insert(attestation_id);
+        if persist {
+            self.storage
+                .append_json_line(&self.storage.service_attestations_path, &attestation)?;
+        }
+        Ok(true)
+    }
+
+    fn maybe_publish_service_aggregate(
+        &mut self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(aggregate) = self.build_service_aggregate(subject_validator_id, epoch)? else {
+            return Ok(false);
+        };
+        if self.import_service_aggregate(aggregate.clone())? {
+            self.update_metrics(|metrics| {
+                metrics.service_aggregates_published += 1;
+            });
+            self.network.broadcast(
+                &self.config.peers,
+                ProtocolMessage::ServiceAggregate(aggregate),
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn build_service_aggregate(
+        &self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<Option<ServiceAggregate>> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(None);
+        }
+        if self
+            .service_aggregates
+            .contains_key(&(subject_validator_id, epoch))
+        {
+            return Ok(None);
+        }
+        let Some(by_member) = self
+            .service_attestations
+            .get(&(subject_validator_id, epoch))
+        else {
+            return Ok(None);
+        };
+        let attestations = by_member.values().cloned().collect::<Vec<_>>();
+        let aggregate = ServiceAggregate {
+            subject_validator_id,
+            epoch,
+            attestation_root: entangrid_types::service_attestation_root(&attestations),
+            aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
+            attestations,
+        };
+        if self
+            .consensus
+            .validate_service_aggregate(&aggregate)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(aggregate))
+    }
+
+    fn import_service_aggregate(&mut self, aggregate: ServiceAggregate) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("service aggregates require consensus_v2"));
+        }
+        self.validate_service_aggregate(&aggregate)?;
+        self.store_service_aggregate(aggregate)
+    }
+
+    fn validate_service_aggregate(&self, aggregate: &ServiceAggregate) -> Result<()> {
+        self.consensus
+            .validate_service_aggregate(aggregate)
+            .map_err(|error| anyhow!(error))?;
+        for attestation in &aggregate.attestations {
+            self.validate_service_attestation(attestation)?;
+        }
+        Ok(())
+    }
+
+    fn store_service_aggregate(&mut self, aggregate: ServiceAggregate) -> Result<bool> {
+        self.insert_service_aggregate(aggregate, true)
+    }
+
+    fn insert_service_aggregate(
+        &mut self,
+        aggregate: ServiceAggregate,
+        persist: bool,
+    ) -> Result<bool> {
+        let key = (aggregate.subject_validator_id, aggregate.epoch);
+        let aggregate_id = canonical_hash(&aggregate);
+        if self.seen_service_aggregates.contains(&aggregate_id) {
+            return Ok(false);
+        }
+        if let Some(existing) = self.service_aggregates.get(&key) {
+            if canonical_hash(existing) == aggregate_id {
+                return Ok(false);
+            }
+            return Err(anyhow!("conflicting service aggregate"));
+        }
+        self.service_aggregates.insert(key, aggregate.clone());
+        self.seen_service_aggregates.insert(aggregate_id);
+        if persist {
+            self.storage
+                .append_json_line(&self.storage.service_aggregates_path, &aggregate)?;
+        }
+        Ok(true)
     }
 
     fn record_failed_session(
@@ -1778,6 +2151,10 @@ impl NodeRunner {
 
     fn log_current_service_score(&self, epoch: Epoch) -> Result<()> {
         let counters = self.local_service_counters();
+        let v2_completed_epoch = self
+            .latest_service_aggregate_before_epoch(self.config.validator_id, epoch)
+            .map(|aggregate| aggregate.epoch)
+            .unwrap_or(epoch.saturating_sub(1));
         if epoch < self.config.feature_flags.service_gating_start_epoch {
             return self.log_event(
                 "service-score",
@@ -1807,7 +2184,11 @@ impl NodeRunner {
             "service-score",
             format!(
                 "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
-                epoch.saturating_sub(1),
+                if self.config.feature_flags.consensus_v2 {
+                    v2_completed_epoch
+                } else {
+                    epoch.saturating_sub(1)
+                },
                 self.service_score_for_validator(self.config.validator_id),
                 self.service_gating_threshold(),
                 self.config.feature_flags.service_score_window_epochs,
@@ -1830,6 +2211,12 @@ impl NodeRunner {
 
 fn receipt_signing_hash(receipt: &RelayReceipt) -> HashBytes {
     let mut unsigned = receipt.clone();
+    unsigned.signature.clear();
+    canonical_hash(&unsigned)
+}
+
+fn service_attestation_signing_hash(attestation: &ServiceAttestation) -> HashBytes {
+    let mut unsigned = attestation.clone();
     unsigned.signature.clear();
     canonical_hash(&unsigned)
 }
@@ -2327,6 +2714,8 @@ struct Storage {
     processed_dir: PathBuf,
     blocks_path: PathBuf,
     receipts_path: PathBuf,
+    service_attestations_path: PathBuf,
+    service_aggregates_path: PathBuf,
     orphan_path: PathBuf,
     snapshot_path: PathBuf,
     log_path: PathBuf,
@@ -2341,6 +2730,8 @@ impl Storage {
             processed_dir: data_dir.join("processed"),
             blocks_path: data_dir.join(BLOCKS_FILE),
             receipts_path: data_dir.join(RECEIPTS_FILE),
+            service_attestations_path: data_dir.join(SERVICE_ATTESTATIONS_FILE),
+            service_aggregates_path: data_dir.join(SERVICE_AGGREGATES_FILE),
             orphan_path: data_dir.join(ORPHANS_FILE),
             snapshot_path: data_dir.join(SNAPSHOT_FILE),
             log_path: PathBuf::from(&config.log_path),
@@ -2362,6 +2753,14 @@ impl Storage {
 
     fn load_receipts(&self) -> Result<Vec<RelayReceipt>> {
         self.load_json_lines(&self.receipts_path)
+    }
+
+    fn load_service_attestations(&self) -> Result<Vec<ServiceAttestation>> {
+        self.load_json_lines(&self.service_attestations_path)
+    }
+
+    fn load_service_aggregates(&self) -> Result<Vec<ServiceAggregate>> {
+        self.load_json_lines(&self.service_aggregates_path)
     }
 
     fn load_snapshot(&self) -> Result<Option<StateSnapshot>> {
@@ -2470,13 +2869,20 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use entangrid_crypto::{DeterministicCryptoBackend, Signer};
-    use entangrid_types::{
-        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, empty_hash,
-        validator_account,
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::Duration,
     };
+
+    use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend, Signer};
+    use entangrid_network::{NetworkEvent, spawn_network};
+    use entangrid_types::{
+        FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PeerConfig, ProtocolMessage,
+        ServiceAggregate, ServiceAttestation, ServiceCounters, SignedTransaction, Transaction,
+        ValidatorConfig, empty_hash, validator_account,
+    };
+    use tokio::{sync::mpsc, time::timeout};
 
     use super::*;
 
@@ -2572,6 +2978,520 @@ mod tests {
         }
     }
 
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "entangrid-node-{label}-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ))
+    }
+
+    fn reserve_local_address() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        address
+    }
+
+    fn sample_node_config(
+        validator_id: ValidatorId,
+        listen_address: String,
+        peers: Vec<PeerConfig>,
+        data_label: &str,
+    ) -> NodeConfig {
+        let data_dir = unique_test_dir(data_label);
+        NodeConfig {
+            validator_id,
+            data_dir: data_dir.display().to_string(),
+            genesis_path: data_dir.join("genesis.toml").display().to_string(),
+            listen_address,
+            peers,
+            log_path: data_dir.join("events.log").display().to_string(),
+            metrics_path: data_dir.join("metrics.json").display().to_string(),
+            feature_flags: FeatureFlags {
+                enable_receipts: true,
+                enable_service_gating: true,
+                consensus_v2: true,
+                service_gating_start_epoch: 1,
+                ..FeatureFlags::default()
+            },
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: false,
+        }
+    }
+
+    async fn spawn_test_network(
+        validator_id: ValidatorId,
+        listen_address: String,
+        peers: Vec<PeerConfig>,
+        genesis: &GenesisConfig,
+    ) -> (
+        Arc<dyn CryptoBackend>,
+        NetworkHandle,
+        Arc<Mutex<NodeMetrics>>,
+        mpsc::UnboundedReceiver<NetworkEvent>,
+    ) {
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_genesis(genesis));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id,
+            ..NodeMetrics::default()
+        }));
+        let (network_event_tx, network_event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            validator_id,
+            listen_address,
+            peers,
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            Arc::clone(&metrics),
+            network_event_tx,
+        )
+        .await
+        .unwrap();
+        (crypto, network, metrics, network_event_rx)
+    }
+
+    async fn build_test_runner(
+        validator_id: ValidatorId,
+        config: NodeConfig,
+        genesis: GenesisConfig,
+    ) -> NodeRunner {
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let ledger = LedgerState::from_genesis(&genesis);
+        let (crypto, network, metrics, network_event_rx) = spawn_test_network(
+            validator_id,
+            config.listen_address.clone(),
+            config.peers.clone(),
+            &genesis,
+        )
+        .await;
+        let storage = Storage::new(&config).unwrap();
+        storage.init().unwrap();
+        NodeRunner {
+            config,
+            genesis: genesis.clone(),
+            consensus,
+            crypto,
+            storage,
+            network,
+            network_event_rx,
+            metrics,
+            ledger,
+            blocks: Vec::new(),
+            receipts: Vec::new(),
+            orphan_blocks: Vec::new(),
+            mempool: BTreeMap::new(),
+            seen_transactions: BTreeSet::new(),
+            seen_blocks: BTreeSet::new(),
+            seen_receipts: BTreeSet::new(),
+            seen_receipt_events: BTreeSet::new(),
+            service_attestations: BTreeMap::new(),
+            service_aggregates: BTreeMap::new(),
+            seen_service_attestations: BTreeSet::new(),
+            seen_service_aggregates: BTreeSet::new(),
+            last_processed_slot: None,
+            last_logged_epoch: None,
+            last_heartbeat_slot: None,
+            last_proposed_slot: None,
+            latest_service_scores: BTreeMap::new(),
+            latest_service_counters: BTreeMap::new(),
+            failed_sessions: 0,
+            invalid_receipts: 0,
+            observed_failed_sessions: BTreeSet::new(),
+            observed_successful_sessions: BTreeSet::new(),
+            observed_invalid_receipts: BTreeMap::new(),
+            known_live_peers: BTreeSet::new(),
+            last_sync_request_served: BTreeMap::new(),
+            peer_sync_status: BTreeMap::new(),
+            peer_sync_repair_failures: BTreeMap::new(),
+            peer_message_windows: BTreeMap::new(),
+        }
+    }
+
+    fn signed_service_attestation(
+        crypto: &dyn CryptoBackend,
+        subject_validator_id: ValidatorId,
+        committee_member_id: ValidatorId,
+        epoch: Epoch,
+        counters: ServiceCounters,
+    ) -> ServiceAttestation {
+        let mut attestation = ServiceAttestation {
+            subject_validator_id,
+            committee_member_id,
+            epoch,
+            counters,
+            signature: Vec::new(),
+        };
+        let hash = service_attestation_signing_hash(&attestation);
+        attestation.signature = crypto.sign(committee_member_id, &hash).unwrap();
+        attestation
+    }
+
+    fn service_aggregate_for_subject(
+        crypto: &dyn CryptoBackend,
+        consensus: &ConsensusEngine,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+        counters: ServiceCounters,
+    ) -> ServiceAggregate {
+        let attestations = consensus
+            .service_committee_for(epoch, subject_validator_id)
+            .into_iter()
+            .map(|committee_member_id| {
+                signed_service_attestation(
+                    crypto,
+                    subject_validator_id,
+                    committee_member_id,
+                    epoch,
+                    counters.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ServiceAggregate {
+            subject_validator_id,
+            epoch,
+            attestation_root: entangrid_types::service_attestation_root(&attestations),
+            aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
+            attestations,
+        }
+    }
+
+    async fn recv_protocol_message(
+        events: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+    ) -> ProtocolMessage {
+        loop {
+            let event = timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .expect("peer network should stay alive");
+            if let NetworkEvent::Received { payload, .. } = event {
+                return payload;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committee_member_emits_attestation_on_epoch_transition_in_v2_mode() {
+        let mut genesis = sample_genesis();
+        genesis.genesis_time_unix_millis = now_unix_millis()
+            .saturating_sub(genesis.slots_per_epoch * genesis.slot_duration_millis);
+        let local_address = reserve_local_address();
+        let peer_address = reserve_local_address();
+        let peer = PeerConfig {
+            validator_id: 2,
+            address: peer_address.clone(),
+        };
+        let config = sample_node_config(1, local_address, vec![peer], "attestation-emission");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+
+        runner.process_slot_tick().await.unwrap();
+
+        let mut seen_subjects = BTreeSet::new();
+        for _ in 0..3 {
+            match recv_protocol_message(&mut peer_events).await {
+                ProtocolMessage::ServiceAttestation(attestation) => {
+                    assert_eq!(attestation.epoch, 0);
+                    assert_eq!(attestation.committee_member_id, 1);
+                    seen_subjects.insert(attestation.subject_validator_id);
+                }
+                other => panic!("expected service attestation, got {other:?}"),
+            }
+        }
+        assert_eq!(seen_subjects, BTreeSet::from([2, 3, 4]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aggregate_import_updates_local_v2_service_score_view() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-view");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 2);
+
+        let counters = ServiceCounters {
+            uptime_windows: 5,
+            total_windows: 5,
+            timely_deliveries: 5,
+            expected_deliveries: 5,
+            distinct_peers: 2,
+            expected_peers: 2,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        };
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            counters,
+        );
+
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+        runner.refresh_service_scores();
+
+        let expected_score = runner.consensus.compute_service_score_from_aggregate(
+            &aggregate,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert_eq!(runner.service_score_for_validator(1), expected_score);
+        assert_eq!(
+            runner.local_service_counters(),
+            aggregate.aggregate_counters
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_scores_fall_back_to_latest_available_prior_aggregate() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-fallback");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 3);
+
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 5,
+                timely_deliveries: 5,
+                expected_deliveries: 5,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+        runner.refresh_service_scores();
+
+        let expected_score = runner.consensus.compute_service_score_from_aggregate(
+            &aggregate,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert_eq!(runner.service_score_for_validator(1), expected_score);
+        assert_eq!(runner.snapshot_metrics().last_completed_service_epoch, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_local_proposer_gating_uses_prior_epoch_aggregate_instead_of_legacy_rolling_score() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "v2-gating");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (proposal_epoch, slot) = (2..8)
+            .find_map(|epoch| {
+                let start = genesis.slots_per_epoch * epoch;
+                let end = genesis.slots_per_epoch * (epoch + 1);
+                (start..end)
+                    .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+                    .map(|slot| (epoch, slot))
+            })
+            .unwrap();
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+        runner
+            .observed_invalid_receipts
+            .insert((proposal_epoch - 1, 1), 100);
+        runner
+            .observed_failed_sessions
+            .insert((proposal_epoch - 1, 1, 2));
+        runner.known_live_peers.insert(2);
+
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            proposal_epoch - 1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 5,
+                timely_deliveries: 5,
+                expected_deliveries: 5,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        runner.import_service_aggregate(aggregate).unwrap();
+        runner.refresh_service_scores();
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.last_proposed_slot, Some(slot));
+        assert_eq!(runner.blocks.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_service_attestation_signature_is_rejected() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "bad-attestation");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let mut attestation =
+            signed_service_attestation(runner.crypto.as_ref(), 1, 2, 1, ServiceCounters::default());
+        attestation.signature = vec![9, 9, 9];
+
+        let error = runner.import_service_attestation(attestation).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid service attestation signature")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_service_aggregate_payload_is_rejected() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "bad-aggregate");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let mut aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+        aggregate.attestation_root = [7u8; 32];
+
+        let error = runner.import_service_aggregate(aggregate).unwrap_err();
+
+        assert!(error.to_string().contains("aggregate payload is malformed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_mode_ignores_and_rejects_v2_service_evidence() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "legacy-v2-ignore");
+        config.feature_flags.consensus_v2 = false;
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let committee_member_id = runner.consensus.service_committee_for(1, 1)[0];
+        let attestation = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            committee_member_id,
+            1,
+            ServiceCounters::default(),
+        );
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: committee_member_id,
+                payload: ProtocolMessage::ServiceAttestation(attestation.clone()),
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: committee_member_id,
+                payload: ProtocolMessage::ServiceAggregate(aggregate.clone()),
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(runner.service_attestations.is_empty());
+        assert!(runner.service_aggregates.is_empty());
+        assert!(
+            runner
+                .import_service_attestation(attestation)
+                .unwrap_err()
+                .to_string()
+                .contains("require consensus_v2")
+        );
+        assert!(
+            runner
+                .import_service_aggregate(aggregate)
+                .unwrap_err()
+                .to_string()
+                .contains("require consensus_v2")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_service_evidence_rebuilds_state_without_reappending_files() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "restore-v2");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 4,
+                total_windows: 4,
+                timely_deliveries: 4,
+                expected_deliveries: 4,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        for attestation in aggregate.attestations.clone() {
+            runner.import_service_attestation(attestation).unwrap();
+        }
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+
+        let loaded_attestations = runner.storage.load_service_attestations().unwrap();
+        let loaded_aggregates = runner.storage.load_service_aggregates().unwrap();
+        let attestation_lines_before =
+            fs::read_to_string(&runner.storage.service_attestations_path)
+                .unwrap()
+                .lines()
+                .count();
+        let aggregate_lines_before = fs::read_to_string(&runner.storage.service_aggregates_path)
+            .unwrap()
+            .lines()
+            .count();
+
+        runner.service_attestations.clear();
+        runner.service_aggregates.clear();
+        runner.seen_service_attestations.clear();
+        runner.seen_service_aggregates.clear();
+
+        runner
+            .restore_service_evidence(loaded_attestations, loaded_aggregates)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&runner.storage.service_attestations_path)
+                .unwrap()
+                .lines()
+                .count(),
+            attestation_lines_before
+        );
+        assert_eq!(
+            fs::read_to_string(&runner.storage.service_aggregates_path)
+                .unwrap()
+                .lines()
+                .count(),
+            aggregate_lines_before
+        );
+        assert_eq!(
+            runner.service_attestations.get(&(1, 1)).unwrap().len(),
+            aggregate.attestations.len()
+        );
+        assert_eq!(runner.service_aggregates.get(&(1, 1)).unwrap(), &aggregate);
+    }
+
     #[test]
     fn receipt_event_hash_ignores_non_identity_fields() {
         let mut first = sample_receipt();
@@ -2598,6 +3518,8 @@ mod tests {
             processed_dir: unique_dir.join("processed"),
             blocks_path: unique_dir.join(BLOCKS_FILE),
             receipts_path: unique_dir.join(RECEIPTS_FILE),
+            service_attestations_path: unique_dir.join(SERVICE_ATTESTATIONS_FILE),
+            service_aggregates_path: unique_dir.join(SERVICE_AGGREGATES_FILE),
             orphan_path: unique_dir.join(ORPHANS_FILE),
             snapshot_path: unique_dir.join(SNAPSHOT_FILE),
             log_path: unique_dir.join("events.log"),
