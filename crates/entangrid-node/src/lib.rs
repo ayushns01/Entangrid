@@ -683,6 +683,7 @@ impl NodeRunner {
                     }
                 }
             }
+            ProtocolMessage::ProposalVote(_) => {}
             ProtocolMessage::SyncStatus {
                 validator_id,
                 height,
@@ -828,12 +829,16 @@ impl NodeRunner {
                 )
                 .await?;
             }
+            ProtocolMessage::CertifiedSyncRequest(_) => {}
+            ProtocolMessage::CertifiedSyncResponse(_) => {}
             ProtocolMessage::RelayReceipt(receipt) => {
                 if self.store_receipt(receipt.clone())? {
                     self.network
                         .broadcast(&self.config.peers, ProtocolMessage::RelayReceipt(receipt))?;
                 }
             }
+            ProtocolMessage::ServiceAttestation(_) => {}
+            ProtocolMessage::ServiceAggregate(_) => {}
             ProtocolMessage::ReceiptFetch {
                 requester_id,
                 epoch,
@@ -1845,13 +1850,18 @@ fn classify_peer_message(payload: &ProtocolMessage) -> Option<PeerMessageClass> 
     match payload {
         ProtocolMessage::SyncStatus { .. }
         | ProtocolMessage::SyncRequest { .. }
+        | ProtocolMessage::CertifiedSyncRequest(_)
         | ProtocolMessage::ReceiptFetch { .. } => Some(PeerMessageClass::SyncControl),
         ProtocolMessage::TransactionBroadcast(_) => Some(PeerMessageClass::TransactionGossip),
         ProtocolMessage::RelayReceipt(_) => Some(PeerMessageClass::ReceiptGossip),
         ProtocolMessage::BlockProposal(_)
+        | ProtocolMessage::ProposalVote(_)
         | ProtocolMessage::SyncResponse { .. }
         | ProtocolMessage::SyncBlocks { .. }
+        | ProtocolMessage::CertifiedSyncResponse(_)
         | ProtocolMessage::HeartbeatPulse(_)
+        | ProtocolMessage::ServiceAttestation(_)
+        | ProtocolMessage::ServiceAggregate(_)
         | ProtocolMessage::ReceiptResponse { .. } => None,
     }
 }

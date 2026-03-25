@@ -49,6 +49,8 @@ enum Commands {
         start_delay_millis: u64,
         #[arg(long, default_value_t = false)]
         enable_service_gating: bool,
+        #[arg(long, default_value_t = false)]
+        consensus_v2: bool,
         #[arg(long, default_value_t = default_service_gating_start_epoch())]
         service_gating_start_epoch: u64,
         #[arg(long, default_value_t = default_service_gating_threshold())]
@@ -165,6 +167,7 @@ pub async fn cli_main() -> Result<()> {
             slots_per_epoch,
             start_delay_millis,
             enable_service_gating,
+            consensus_v2,
             service_gating_start_epoch,
             service_gating_threshold,
             service_score_window_epochs,
@@ -200,6 +203,7 @@ pub async fn cli_main() -> Result<()> {
                 degraded_delay_ms,
                 degraded_drop_probability,
                 degraded_disable_outbound,
+                consensus_v2,
             )
         }
         Commands::Up { base_dir } => up_localnet(&base_dir).await,
@@ -232,6 +236,7 @@ pub fn init_localnet(
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
     degraded_disable_outbound: bool,
+    consensus_v2: bool,
 ) -> Result<()> {
     if validators < 4 {
         return Err(anyhow!("at least 4 validators are recommended"));
@@ -306,6 +311,7 @@ pub fn init_localnet(
             feature_flags: FeatureFlags {
                 enable_receipts: true,
                 enable_service_gating,
+                consensus_v2,
                 service_gating_start_epoch,
                 service_gating_threshold,
                 service_score_window_epochs,
@@ -524,6 +530,7 @@ async fn run_matrix_scenario(
         scenario.degraded_delay_ms,
         scenario.degraded_drop_probability,
         scenario.degraded_disable_outbound,
+        false,
     )?;
 
     let mut children = spawn_localnet_children(base_dir).await?;
@@ -2170,6 +2177,7 @@ mod tests {
             0,
             0.0,
             false,
+            false,
         )
         .unwrap();
         assert!(manifest_path(&unique_dir).exists());
@@ -2225,6 +2233,7 @@ mod tests {
             0,
             0.75,
             false,
+            false,
         )
         .unwrap();
         let node_three_path = unique_dir.join("node-3").join("node.toml");
@@ -2239,6 +2248,36 @@ mod tests {
             default_service_score_weights()
         );
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
+    }
+
+    #[test]
+    fn init_localnet_can_enable_consensus_v2() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-consensus-v2-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            true,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert!(node_config.feature_flags.consensus_v2);
     }
 
     #[test]
@@ -2259,6 +2298,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
@@ -2347,6 +2387,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
@@ -2603,6 +2644,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
