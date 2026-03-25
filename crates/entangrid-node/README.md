@@ -113,6 +113,14 @@ The node also:
 - drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
 - writes metrics more eagerly around block and slot transitions so localnet reports stay closer to the saved chain state
 
+Experimental `consensus_v2` additions:
+
+- committee witnesses emit `ServiceAttestation` records for validators they were actually assigned to observe
+- nodes import and store those attestations, then publish/import `ServiceAggregate` records
+- at epoch transition, the node first reconciles receipts for `epoch - 1`, then emits attestations for `epoch - 2`
+- this one-epoch lag is intentional: it prevents witnesses from publishing empty evidence before the prior epoch's receipts have finished propagating
+- when no newer usable aggregate exists yet, the node now preserves the last known service score instead of forcing a temporary zero
+
 That means the node can now explain service gating in a much more concrete way:
 
 - what the score was
@@ -169,6 +177,17 @@ The recent validation-focused improvement in this crate was about correctness un
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 - the latest rigorous testing still shows a remaining open issue in 6-validator bursty runs: the node can survive and keep scoring honest validators correctly, but larger-topology peers still do not always reconverge within the normal settle window
+
+The latest V2-specific bursty runs on this branch now look like this:
+
+- `4 validators`: healthy service scores, zero false gating, converged
+- `6 validators`: service scores are healthy again, but fork choice is still weak enough that bursty peers diverge
+- `8 validators`: service evidence is no longer collapsing to all-zero immediately, but validator-count-aware coverage is still not strong enough to keep all honest validators healthy
+
+So the next node-runtime milestone is no longer just "make scores less noisy". It is:
+
+- QC-backed ordering and fork choice for the V2 path
+- certified sync after that
 
 But it is still intentionally early-stage.
 

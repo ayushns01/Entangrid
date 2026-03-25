@@ -96,11 +96,34 @@ The repository now includes a working Rust workspace with:
 - a CLI node binary and localnet simulator
 - block commitments backed by explicit receipt bundles in the runtime prototype
 - a direct-delivery witness model where relay targets act as the current prototype witnesses for receipt generation
+- an experimental `consensus_v2` path that replaces local receipt-driven gating with witness-aligned service attestations and prior-epoch service aggregates
 
 Important:
 
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
 - real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
+
+## Experimental Consensus V2 Status
+
+This branch also carries the first real `consensus_v2` implementation behind config.
+
+Current V2 shape:
+
+- service evidence is produced by the validator's actual assigned witnesses, not by a separate ad hoc observer set
+- each witness attests only to the obligations it can really observe for that validator
+- nodes reconcile receipts for the just-finished epoch first, then publish attestations for the prior completed epoch with a one-epoch lag
+- proposer gating reads the latest available aggregate from an earlier epoch instead of dropping straight to zero when the newest aggregate is still in flight
+
+Current live V2 bursty status is mixed:
+
+- `4 validators`: healthy, converged, and no false gating in the latest run
+- `6 validators`: service scores are now healthy, but ordering still diverges under bursty load
+- `8 validators`: service evidence is much better than before, but still not strong enough to avoid some score collapse and partial convergence trouble
+
+So the main remaining V2 blockers are now:
+
+- QC-backed ordering and fork choice
+- further validator-count-aware service coverage improvement at larger topologies
 
 ## Current Recommended Prototype Policy
 
@@ -216,6 +239,16 @@ Then inspect:
 
 - `node-4/events.log` for missed slots due to low service score
 - `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `peer_rate_limit_drops`, `inbound_session_drops`, `service_gating_start_epoch`, the latest local score, and the latest local service counters, including any failed-session or invalid-receipt penalties that contributed to that score
+
+To initialize a localnet with the experimental V2 path enabled:
+
+```bash
+cargo run -p entangrid-sim -- init-localnet \
+  --validators 4 \
+  --base-dir var/localnet-v2 \
+  --enable-service-gating \
+  --consensus-v2
+```
 
 ## Guiding Principle
 

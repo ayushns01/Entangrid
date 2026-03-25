@@ -196,27 +196,9 @@ impl ConsensusEngine {
         epoch: Epoch,
         subject_validator_id: ValidatorId,
     ) -> Vec<ValidatorId> {
-        let mut candidates: Vec<_> = self
-            .validator_ids
-            .iter()
-            .copied()
-            .filter(|validator_id| *validator_id != subject_validator_id)
-            .collect();
-        if candidates.is_empty() {
-            return Vec::new();
-        }
-        let size = derived_service_committee_size(self.validator_ids.len()).min(candidates.len());
-        let seed = hash_many(&[
-            &self.epoch_seed(epoch),
-            &subject_validator_id.to_le_bytes(),
-            b"service-committee",
-        ]);
-        let mut rotation_bytes = [0u8; 8];
-        rotation_bytes.copy_from_slice(&seed[..8]);
-        let rotation = (u64::from_le_bytes(rotation_bytes) as usize) % candidates.len();
-        candidates.rotate_left(rotation);
-        candidates.truncate(size);
-        candidates
+        self.assignment_for(epoch, subject_validator_id)
+            .map(|assignment| assignment.witnesses)
+            .unwrap_or_default()
     }
 
     pub fn validate_service_aggregate(&self, aggregate: &ServiceAggregate) -> Result<(), String> {
@@ -284,6 +266,57 @@ impl ConsensusEngine {
             failed_sessions,
             invalid_receipts,
         )
+    }
+
+    pub fn counters_for_validator_from_observer(
+        &self,
+        validator_id: ValidatorId,
+        observer_validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+    ) -> ServiceCounters {
+        let assignment = self
+            .assignment_for(epoch, validator_id)
+            .unwrap_or(EpochAssignment {
+                epoch,
+                validator_id,
+                witnesses: Vec::new(),
+                relay_targets: Vec::new(),
+            });
+        if !assignment.witnesses.contains(&observer_validator_id) {
+            return ServiceCounters::default();
+        }
+
+        let mut heartbeat_slots = BTreeSet::new();
+        let mut timely_deliveries = 0;
+        let observed_receipts: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.source_validator_id == validator_id
+                    && receipt.epoch == epoch
+                    && receipt.witness_validator_id == observer_validator_id
+            })
+            .collect();
+
+        for receipt in &observed_receipts {
+            if receipt.message_class == MessageClass::Heartbeat {
+                heartbeat_slots.insert(receipt.slot);
+            }
+            if receipt.latency_bucket_ms <= self.genesis.slot_duration_millis {
+                timely_deliveries += 1;
+            }
+        }
+
+        ServiceCounters {
+            uptime_windows: heartbeat_slots.len() as u64,
+            total_windows: self.genesis.slots_per_epoch.max(1),
+            timely_deliveries,
+            expected_deliveries: self.genesis.slots_per_epoch.max(1),
+            distinct_peers: u64::from(!observed_receipts.is_empty()),
+            expected_peers: 1,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        }
     }
 
     pub fn counters_from_receipts(
@@ -454,14 +487,6 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 fn capped_ratio(numerator: u64, denominator: u64) -> f64 {
     ratio(numerator.min(denominator), denominator)
-}
-
-fn derived_service_committee_size(validator_count: usize) -> usize {
-    if validator_count <= 1 {
-        return 0;
-    }
-    let recommended = ((validator_count as f64).log2().ceil() as usize + 1).max(3);
-    recommended.min(validator_count.saturating_sub(1))
 }
 
 fn service_committee_threshold(committee_size: usize) -> usize {
@@ -648,11 +673,24 @@ mod tests {
     }
 
     #[test]
-    fn service_committee_scales_with_validator_count() {
+    fn service_committee_matches_observable_witness_assignments() {
         let four = ConsensusEngine::new(sample_genesis_with_validators(4));
         let eight = ConsensusEngine::new(sample_genesis_with_validators(8));
-        assert_eq!(four.service_committee_for(2, 1).len(), 3);
-        assert_eq!(eight.service_committee_for(2, 1).len(), 4);
+        let four_assignment = four.assignment_for(2, 1).unwrap();
+        let eight_assignment = eight.assignment_for(2, 1).unwrap();
+        assert_eq!(four.service_committee_for(2, 1), four_assignment.witnesses);
+        assert_eq!(
+            eight.service_committee_for(2, 1),
+            eight_assignment.witnesses
+        );
+        assert_eq!(
+            four.service_committee_for(2, 1).len(),
+            four.genesis().witness_count.min(3)
+        );
+        assert_eq!(
+            eight.service_committee_for(2, 1).len(),
+            eight.genesis().witness_count.min(7)
+        );
     }
 
     #[test]

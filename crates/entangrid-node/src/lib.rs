@@ -323,8 +323,10 @@ impl NodeRunner {
             )?;
             self.log_current_service_score(epoch)?;
             if epoch > 0 {
-                self.emit_service_attestations_for_completed_epoch(epoch - 1)?;
                 self.request_receipt_reconciliation(epoch - 1)?;
+            }
+            if epoch > 1 {
+                self.emit_service_attestations_for_completed_epoch(epoch - 2)?;
             }
         }
 
@@ -1493,32 +1495,40 @@ impl NodeRunner {
 
         if self.config.feature_flags.consensus_v2 {
             let mut local_service_epoch = 0;
+            let previous_scores = self.latest_service_scores.clone();
+            let previous_counters = self.latest_service_counters.clone();
+            let previous_completed_epoch = self.snapshot_metrics().last_completed_service_epoch;
             for validator_id in validator_ids {
                 let aggregate = self
                     .latest_service_aggregate_before_epoch(validator_id, current_epoch)
                     .cloned();
-                let score = aggregate
-                    .as_ref()
-                    .map(|aggregate| {
-                        self.consensus.compute_service_score_from_aggregate(
-                            aggregate,
-                            &self.config.feature_flags.service_score_weights,
-                        )
-                    })
-                    .unwrap_or(0.0);
-                self.latest_service_scores.insert(validator_id, score);
-                if validator_id == self.config.validator_id {
-                    local_service_epoch = aggregate
-                        .as_ref()
-                        .map(|aggregate| aggregate.epoch)
-                        .unwrap_or(0);
+                if let Some(aggregate) = aggregate {
+                    let score = self.consensus.compute_service_score_from_aggregate(
+                        &aggregate,
+                        &self.config.feature_flags.service_score_weights,
+                    );
+                    self.latest_service_scores.insert(validator_id, score);
+                    if validator_id == self.config.validator_id {
+                        local_service_epoch = aggregate.epoch;
+                    }
+                    self.latest_service_counters
+                        .insert(validator_id, aggregate.aggregate_counters);
+                } else {
+                    self.latest_service_scores.insert(
+                        validator_id,
+                        previous_scores.get(&validator_id).copied().unwrap_or(1.0),
+                    );
+                    self.latest_service_counters.insert(
+                        validator_id,
+                        previous_counters
+                            .get(&validator_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    if validator_id == self.config.validator_id {
+                        local_service_epoch = previous_completed_epoch;
+                    }
                 }
-                self.latest_service_counters.insert(
-                    validator_id,
-                    aggregate
-                        .map(|aggregate| aggregate.aggregate_counters)
-                        .unwrap_or_default(),
-                );
             }
             let scores = self.latest_service_scores.clone();
             let local_score = scores
@@ -1882,12 +1892,11 @@ impl NodeRunner {
         subject_validator_id: ValidatorId,
         epoch: Epoch,
     ) -> Result<ServiceAttestation> {
-        let counters = self.consensus.counters_for_validator(
+        let counters = self.consensus.counters_for_validator_from_observer(
             subject_validator_id,
+            self.config.validator_id,
             epoch,
             &self.receipts,
-            self.failed_sessions_for(subject_validator_id, epoch),
-            self.invalid_receipts_for(subject_validator_id, epoch),
         );
         let mut attestation = ServiceAttestation {
             subject_validator_id,
@@ -3172,10 +3181,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn committee_member_emits_attestation_on_epoch_transition_in_v2_mode() {
+    async fn committee_member_emits_lagged_attestation_after_reconciliation_in_v2_mode() {
         let mut genesis = sample_genesis();
         genesis.genesis_time_unix_millis = now_unix_millis()
-            .saturating_sub(genesis.slots_per_epoch * genesis.slot_duration_millis);
+            .saturating_sub(genesis.slots_per_epoch * genesis.slot_duration_millis * 2);
         let local_address = reserve_local_address();
         let peer_address = reserve_local_address();
         let peer = PeerConfig {
@@ -3186,21 +3195,34 @@ mod tests {
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let (_, _, _, mut peer_events) =
             spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let expected_subjects: BTreeSet<_> = genesis
+            .validators
+            .iter()
+            .map(|validator| validator.validator_id)
+            .filter(|subject_validator_id| *subject_validator_id != 1)
+            .filter(|subject_validator_id| {
+                runner
+                    .consensus
+                    .service_committee_for(0, *subject_validator_id)
+                    .contains(&1)
+            })
+            .collect();
 
         runner.process_slot_tick().await.unwrap();
 
         let mut seen_subjects = BTreeSet::new();
-        for _ in 0..3 {
+        while seen_subjects.len() < expected_subjects.len() {
             match recv_protocol_message(&mut peer_events).await {
                 ProtocolMessage::ServiceAttestation(attestation) => {
                     assert_eq!(attestation.epoch, 0);
                     assert_eq!(attestation.committee_member_id, 1);
                     seen_subjects.insert(attestation.subject_validator_id);
                 }
+                ProtocolMessage::ReceiptFetch { .. } => {}
                 other => panic!("expected service attestation, got {other:?}"),
             }
         }
-        assert_eq!(seen_subjects, BTreeSet::from([2, 3, 4]));
+        assert_eq!(seen_subjects, expected_subjects);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3243,6 +3265,25 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn v2_attestations_only_score_observable_witness_obligations() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(2, reserve_local_address(), Vec::new(), "witness-v2");
+        let runner = build_test_runner(2, config, genesis.clone()).await;
+
+        let attestation = runner.build_local_service_attestation(1, 1).unwrap();
+
+        assert_eq!(attestation.committee_member_id, 2);
+        assert_eq!(attestation.counters.total_windows, genesis.slots_per_epoch);
+        assert_eq!(
+            attestation.counters.expected_deliveries,
+            genesis.slots_per_epoch
+        );
+        assert_eq!(attestation.counters.expected_peers, 1);
+        assert_eq!(attestation.counters.failed_sessions, 0);
+        assert_eq!(attestation.counters.invalid_receipts, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn v2_scores_fall_back_to_latest_available_prior_aggregate() {
         let genesis = sample_genesis();
         let config =
@@ -3276,6 +3317,34 @@ mod tests {
         );
         assert_eq!(runner.service_score_for_validator(1), expected_score);
         assert_eq!(runner.snapshot_metrics().last_completed_service_epoch, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_scores_preserve_last_known_value_when_no_aggregate_is_available() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-preserve");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 4);
+        let prior_counters = ServiceCounters {
+            uptime_windows: 3,
+            total_windows: 5,
+            timely_deliveries: 4,
+            expected_deliveries: 5,
+            distinct_peers: 2,
+            expected_peers: 2,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        };
+        runner.latest_service_scores.insert(1, 0.73);
+        runner
+            .latest_service_counters
+            .insert(1, prior_counters.clone());
+
+        runner.refresh_service_scores();
+
+        assert_eq!(runner.service_score_for_validator(1), 0.73);
+        assert_eq!(runner.local_service_counters(), prior_counters);
     }
 
     #[tokio::test(flavor = "current_thread")]
