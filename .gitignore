@@ -1,5 +1,5 @@
 /target
 /var
+.worktrees/
 *.log
 /test-results
-
