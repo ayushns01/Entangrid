@@ -11,6 +11,7 @@ Current status note:
 - the `main` branch architecture is still centered on the first working receipt-driven prototype
 - that prototype is enough for localnet experiments, but it is not yet the final architecture for larger validator counts
 - the active redesign toward committee-attested service evidence, certificate-backed ordering, and cleaner separation of ordering/service/sync planes is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+- the latest implementation status for that redesign is in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md)
 
 ## High-Level Components
 

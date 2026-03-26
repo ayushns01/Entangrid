@@ -52,6 +52,7 @@ This repository instead documents a more defensible design:
 - [Localnet Plan](docs/localnet.md)
 - [Benchmarking Plan](docs/benchmarks.md)
 - [Consensus V2 Redesign Plan](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+- [Consensus V2 Status Update](docs/superpowers/plans/entangrid-consensus-v2-status.md)
 
 ## MVP Scope
 
@@ -104,6 +105,7 @@ Important:
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
 - real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
 - the current `main` branch still uses the legacy receipt-driven gating prototype; the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+- the latest branch-level implementation progress and blockers are summarized in [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md)
 
 ## Current Recommended Prototype Policy
 
@@ -138,6 +140,7 @@ The current prototype proved the core Entangrid idea is implementable, but it al
 - fork choice should eventually prefer certificate-backed ordering instead of relying on ad hoc repair alone
 
 That redesign is planned in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md).
+The latest status update for that work lives in [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md).
 Until that work lands, treat the current `main` branch as the strongest validated research prototype, not the final consensus architecture.
 
 ## Quickstart

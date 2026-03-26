@@ -335,3 +335,4 @@ The active V2 redesign is moving toward:
 - certified sync
 
 That future direction is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md).
+The latest branch-level status update is documented in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md).

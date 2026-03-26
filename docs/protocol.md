@@ -16,6 +16,7 @@ Current status note:
 - the `main` branch still implements the first working receipt-driven prototype of this idea
 - that prototype is useful, but it is not yet the final validator-count-scalable form of the protocol
 - the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+- the latest status update for that redesign is in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md)
 
 ## Protocol Goals
 
