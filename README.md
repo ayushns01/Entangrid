@@ -45,6 +45,7 @@ This repository instead documents a more defensible design:
 ## Documentation Index
 
 - [Architecture](docs/architecture.md)
+- [Current Main-Branch Flow](docs/current-flow.md)
 - [Protocol Specification](docs/protocol.md)
 - [Threat Model](docs/threat-model.md)
 - [Roadmap](docs/roadmap.md)
