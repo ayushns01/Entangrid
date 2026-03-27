@@ -718,6 +718,19 @@ impl NodeRunner {
                     }
                 }
             }
+            ProtocolMessage::QuorumCertificate(qc) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_quorum_certificate(qc.clone()) {
+                        self.log_event(
+                            "qc-rejected",
+                            format!(
+                                "from {from_validator_id} block {:02x?} detail {error}",
+                                &qc.block_hash[..4]
+                            ),
+                        )?;
+                    }
+                }
+            }
             ProtocolMessage::SyncStatus {
                 validator_id,
                 height,
@@ -1199,6 +1212,11 @@ impl NodeRunner {
                 )?;
             }
             self.maybe_broadcast_vote_for_competing_block(&block)?;
+            let adopted = self.maybe_adopt_preferred_competing_branch(&block)?
+                || self.ledger.snapshot().tip_hash == block.block_hash;
+            if adopted {
+                return Ok(BlockAcceptance::Accepted);
+            }
             return Ok(BlockAcceptance::Orphan);
         }
 
@@ -1285,7 +1303,9 @@ impl NodeRunner {
             LedgerState::replay_blocks(&self.genesis, &parent_chain, self.crypto.as_ref())?;
         ledger.apply_block(block, self.crypto.as_ref())?;
         parent_chain.push(block.clone());
-        Ok(self.compare_branch_quality(&parent_chain, &self.blocks) != Ordering::Less)
+        let candidate_quality = self.branch_quality_with_extra_tip_vote(&parent_chain, Some(block.block_hash));
+        let current_quality = self.branch_quality_with_extra_tip_vote(&self.blocks, None);
+        Ok(candidate_quality >= current_quality)
     }
 
     fn build_parent_chain_for_block(&self, block: &Block) -> Result<Option<Vec<Block>>> {
@@ -1338,6 +1358,8 @@ impl NodeRunner {
         if inserted {
             if let Some(qc) = self.maybe_build_qc(vote.block_hash)? {
                 self.maybe_adopt_certified_branch(qc.block_hash)?;
+                self.network
+                    .broadcast(&self.config.peers, ProtocolMessage::QuorumCertificate(qc.clone()))?;
                 self.log_event(
                     "qc-built",
                     format!(
@@ -1348,9 +1370,58 @@ impl NodeRunner {
                         qc.votes.len()
                     ),
                 )?;
+            } else {
+                self.maybe_adopt_vote_supported_branch(vote.block_hash)?;
             }
         }
         Ok(inserted)
+    }
+
+    fn import_quorum_certificate(&mut self, qc: QuorumCertificate) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("quorum certificates require consensus_v2"));
+        }
+        let Some(block) = self.known_block(qc.block_hash) else {
+            return Err(anyhow!("quorum certificate references unknown block"));
+        };
+        if qc.block_number != block.header.block_number
+            || qc.epoch != block.header.epoch
+            || qc.slot != block.header.slot
+        {
+            return Err(anyhow!("quorum certificate metadata does not match block"));
+        }
+        if !qc.is_well_formed() {
+            return Err(anyhow!("malformed quorum certificate"));
+        }
+        let threshold = quorum_certificate_threshold(self.genesis.validators.len());
+        if qc.votes.len() < threshold {
+            return Err(anyhow!("quorum certificate does not meet threshold"));
+        }
+        if entangrid_types::quorum_certificate_vote_root(&qc.votes) != qc.vote_root {
+            return Err(anyhow!("quorum certificate vote root mismatch"));
+        }
+        for vote in &qc.votes {
+            self.validate_proposal_vote(vote)?;
+        }
+        for vote in qc.votes.iter().cloned() {
+            let _ = self.store_proposal_vote(vote)?;
+        }
+        if self.quorum_certificates.contains_key(&qc.block_hash) {
+            return Ok(false);
+        }
+        self.quorum_certificates.insert(qc.block_hash, qc.clone());
+        self.maybe_adopt_certified_branch(qc.block_hash)?;
+        self.log_event(
+            "qc-imported",
+            format!(
+                "height {} slot {} block {:02x?} votes {}",
+                qc.block_number,
+                qc.slot,
+                &qc.block_hash[..4],
+                qc.votes.len()
+            ),
+        )?;
+        Ok(true)
     }
 
     fn validate_proposal_vote(&self, vote: &ProposalVote) -> Result<()> {
@@ -1459,7 +1530,57 @@ impl NodeRunner {
         if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
             return Ok(false);
         }
-        self.adopt_canonical_chain(candidate_chain)?;
+        self.adopt_canonical_chain(candidate_chain, "certified-reorg")?;
+        Ok(true)
+    }
+
+    fn maybe_adopt_vote_supported_branch(&mut self, candidate_tip_hash: HashBytes) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
+            return Ok(false);
+        };
+        let Some(candidate_chain) = self.build_chain_to_tip(candidate_tip_hash) else {
+            return Ok(false);
+        };
+        if !candidate_chain
+            .iter()
+            .any(|block| block.block_hash == locked_qc_hash)
+        {
+            return Ok(false);
+        }
+        if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
+            return Ok(false);
+        }
+        self.adopt_canonical_chain(candidate_chain, "vote-supported-branch-adopted")?;
+        Ok(true)
+    }
+
+    fn maybe_adopt_preferred_competing_branch(&mut self, block: &Block) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
+            return Ok(false);
+        };
+        let Some(mut candidate_chain) = self.build_parent_chain_for_block(block)? else {
+            return Ok(false);
+        };
+        if !candidate_chain
+            .iter()
+            .any(|ancestor| ancestor.block_hash == locked_qc_hash)
+        {
+            return Ok(false);
+        }
+        let mut candidate_ledger =
+            LedgerState::replay_blocks(&self.genesis, &candidate_chain, self.crypto.as_ref())?;
+        candidate_ledger.apply_block(block, self.crypto.as_ref())?;
+        candidate_chain.push(block.clone());
+        if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
+            return Ok(false);
+        }
+        self.adopt_canonical_chain(candidate_chain, "preferred-branch-adopted")?;
         Ok(true)
     }
 
@@ -1496,12 +1617,16 @@ impl NodeRunner {
     }
 
     fn compare_branch_quality(&self, candidate_chain: &[Block], current_chain: &[Block]) -> Ordering {
-        let candidate_quality = self.branch_quality(candidate_chain);
-        let current_quality = self.branch_quality(current_chain);
+        let candidate_quality = self.branch_quality_with_extra_tip_vote(candidate_chain, None);
+        let current_quality = self.branch_quality_with_extra_tip_vote(current_chain, None);
         candidate_quality.cmp(&current_quality)
     }
 
-    fn branch_quality(&self, chain: &[Block]) -> (u64, u64, u64, HashBytes) {
+    fn branch_quality_with_extra_tip_vote(
+        &self,
+        chain: &[Block],
+        extra_tip_vote_for: Option<HashBytes>,
+    ) -> (u64, u64, usize, u64, HashBytes) {
         let latest_certified_height = chain
             .iter()
             .rev()
@@ -1509,15 +1634,32 @@ impl NodeRunner {
             .map(|block| block.header.block_number)
             .unwrap_or(0);
         let tip = chain.last();
+        let tip_vote_count = tip
+            .map(|block| {
+                let existing = self
+                    .proposal_votes
+                    .get(&block.block_hash)
+                    .map(|votes| votes.len())
+                    .unwrap_or(0);
+                let receives_extra_local_vote = extra_tip_vote_for == Some(block.block_hash)
+                    && !self
+                        .proposal_votes
+                        .get(&block.block_hash)
+                        .map(|votes| votes.contains_key(&self.config.validator_id))
+                        .unwrap_or(false);
+                existing + usize::from(receives_extra_local_vote)
+            })
+            .unwrap_or(0);
         (
             latest_certified_height,
             tip.map(|block| block.header.block_number).unwrap_or(0),
+            tip_vote_count,
             tip.map(|block| block.header.slot).unwrap_or(0),
             tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
         )
     }
 
-    fn adopt_canonical_chain(&mut self, candidate_chain: Vec<Block>) -> Result<()> {
+    fn adopt_canonical_chain(&mut self, candidate_chain: Vec<Block>, event_name: &str) -> Result<()> {
         let ledger = LedgerState::replay_blocks(&self.genesis, &candidate_chain, self.crypto.as_ref())?;
         let candidate_hashes: BTreeSet<_> = candidate_chain.iter().map(|block| block.block_hash).collect();
         let orphan_blocks = self
@@ -1531,6 +1673,14 @@ impl NodeRunner {
         self.ledger = ledger;
         self.blocks = candidate_chain;
         self.orphan_blocks = orphan_blocks;
+        let receipts_to_import = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.commitment_receipts.clone())
+            .collect::<Vec<_>>();
+        for receipt in receipts_to_import {
+            let _ = self.persist_receipt(receipt)?;
+        }
         self.rebuild_seen_sets();
         self.storage.write_snapshot(self.ledger.snapshot())?;
         self.storage
@@ -1538,9 +1688,9 @@ impl NodeRunner {
         self.storage
             .overwrite_json_lines(&self.storage.orphan_path, &self.orphan_blocks)?;
         self.log_event(
-            "certified-reorg",
+            event_name,
             format!(
-                "adopted certified tip {:02x?} height {}",
+                "adopted tip {:02x?} height {}",
                 &self.ledger.snapshot().tip_hash[..4],
                 self.ledger.snapshot().height
             ),
@@ -2589,6 +2739,7 @@ fn classify_peer_message(payload: &ProtocolMessage) -> Option<PeerMessageClass> 
         ProtocolMessage::RelayReceipt(_) => Some(PeerMessageClass::ReceiptGossip),
         ProtocolMessage::BlockProposal(_)
         | ProtocolMessage::ProposalVote(_)
+        | ProtocolMessage::QuorumCertificate(_)
         | ProtocolMessage::SyncResponse { .. }
         | ProtocolMessage::SyncBlocks { .. }
         | ProtocolMessage::CertifiedSyncResponse(_)
@@ -3746,6 +3897,237 @@ mod tests {
             .orphan_blocks
             .iter()
             .any(|block| block.block_hash == current_tip.block_hash));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn imported_quorum_certificate_reorgs_competing_branch() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-import");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_tip = first_valid_block(&genesis);
+        let competing_tip = valid_empty_block_on_parent(
+            &genesis,
+            empty_hash(),
+            1,
+            2,
+            current_tip.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner.accept_block(current_tip.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner.accept_block(competing_tip.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+
+        let votes = vec![
+            signed_proposal_vote(runner.crypto.as_ref(), 2, &competing_tip),
+            signed_proposal_vote(runner.crypto.as_ref(), 3, &competing_tip),
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &competing_tip),
+        ];
+        let qc = QuorumCertificate {
+            block_hash: competing_tip.block_hash,
+            block_number: competing_tip.header.block_number,
+            epoch: competing_tip.header.epoch,
+            slot: competing_tip.header.slot,
+            vote_root: entangrid_types::quorum_certificate_vote_root(&votes),
+            votes,
+        };
+
+        assert!(runner.import_quorum_certificate(qc).unwrap());
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn higher_quality_replayable_branch_replaces_uncertified_tip_in_v2() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "prefer-branch");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner.accept_block(certified_root.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                2,
+                &certified_root
+            ))
+            .unwrap());
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                3,
+                &certified_root
+            ))
+            .unwrap());
+        assert!(runner
+            .quorum_certificates
+            .contains_key(&certified_root.block_hash));
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+        let current_tip = build_child(2, certified_root.header.slot + 1);
+        let competing_tip = build_child(3, current_tip.header.slot + 1);
+
+        assert_eq!(
+            runner.accept_block(current_tip.clone(), false).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        let mut competing_chain = runner
+            .build_parent_chain_for_block(&competing_tip)
+            .unwrap()
+            .unwrap();
+        competing_chain.push(competing_tip.clone());
+        assert_eq!(
+            runner.highest_locked_qc_hash(),
+            Some(certified_root.block_hash)
+        );
+        assert_eq!(runner.proposal_votes[&current_tip.block_hash].len(), 1);
+        assert!(runner.proposal_votes.get(&competing_tip.block_hash).is_none());
+
+        assert_eq!(
+            runner.accept_block(competing_tip.clone(), false).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+        assert_eq!(runner.blocks.last().unwrap().block_hash, competing_tip.block_hash);
+        assert!(runner
+            .orphan_blocks
+            .iter()
+            .any(|block| block.block_hash == current_tip.block_hash));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stronger_vote_supported_branch_replaces_uncertified_tip_before_qc() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "vote-branch");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner.accept_block(certified_root.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                2,
+                &certified_root
+            ))
+            .unwrap());
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                3,
+                &certified_root
+            ))
+            .unwrap());
+        assert!(runner
+            .quorum_certificates
+            .contains_key(&certified_root.block_hash));
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let competing_tip = build_child(2, certified_root.header.slot + 1);
+        let current_tip = build_child(3, competing_tip.header.slot + 1);
+
+        assert_eq!(
+            runner.accept_block(current_tip.clone(), false).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner.accept_block(competing_tip.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                2,
+                &competing_tip
+            ))
+            .unwrap());
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                4,
+                &competing_tip
+            ))
+            .unwrap());
+        assert!(!runner
+            .quorum_certificates
+            .contains_key(&competing_tip.block_hash));
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]

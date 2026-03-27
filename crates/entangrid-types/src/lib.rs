@@ -295,6 +295,7 @@ pub enum ProtocolMessage {
     TransactionBroadcast(SignedTransaction),
     BlockProposal(Block),
     ProposalVote(ProposalVote),
+    QuorumCertificate(QuorumCertificate),
     SyncStatus {
         validator_id: ValidatorId,
         height: u64,
