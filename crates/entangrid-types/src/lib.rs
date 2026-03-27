@@ -253,6 +253,12 @@ pub struct ServiceAggregate {
     pub attestation_root: HashBytes,
     pub attestations: Vec<ServiceAttestation>,
     pub aggregate_counters: ServiceCounters,
+    #[serde(default)]
+    pub committee_size: usize,
+    #[serde(default)]
+    pub quorum_threshold: usize,
+    #[serde(default)]
+    pub coverage_count: usize,
 }
 
 impl ServiceAggregate {
@@ -610,6 +616,9 @@ mod tests {
             attestation_root: service_attestation_root(std::slice::from_ref(&attestation)),
             attestations: vec![attestation.clone()],
             aggregate_counters: aggregate_service_counters(std::slice::from_ref(&attestation)),
+            committee_size: 1,
+            quorum_threshold: 1,
+            coverage_count: 1,
         };
         assert!(aggregate.is_well_formed());
 

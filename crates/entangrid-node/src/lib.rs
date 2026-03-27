@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use entangrid_consensus::ConsensusEngine;
+use entangrid_consensus::{ConsensusEngine, ServiceEvidenceStatus};
 use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend};
 use entangrid_ledger::LedgerState;
 use entangrid_network::{NetworkEvent, NetworkFailureKind, NetworkHandle, spawn_network};
@@ -386,40 +386,23 @@ impl NodeRunner {
                     ),
                 )?;
             } else {
-                let score = self.service_score_for_validator(self.config.validator_id);
-                let counters = self.local_service_counters();
-                self.log_event(
-                    "service-gating-check",
-                    format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
-                        self.service_gating_threshold(),
-                        self.config.feature_flags.service_score_window_epochs,
-                        self.config.feature_flags.service_score_weights.uptime_weight,
-                        self.config.feature_flags.service_score_weights.delivery_weight,
-                        self.config.feature_flags.service_score_weights.diversity_weight,
-                        self.config.feature_flags.service_score_weights.penalty_weight,
-                        counters.uptime_windows,
-                        counters.total_windows,
-                        counters.timely_deliveries,
-                        counters.expected_deliveries,
-                        counters.distinct_peers,
-                        counters.expected_peers,
-                        counters.failed_sessions,
-                        counters.invalid_receipts
-                    ),
-                )?;
-                if score < self.service_gating_threshold() {
-                    self.update_metrics(|metrics| {
-                        metrics.missed_proposer_slots += 1;
-                        metrics.service_gating_rejections += 1;
-                        metrics.last_local_service_score = score;
-                        metrics.service_gating_threshold = self.service_gating_threshold();
-                        metrics.last_local_service_counters = counters.clone();
-                    });
+                let confirmed_aggregate = self
+                    .latest_confirmed_service_aggregate_before_epoch(self.config.validator_id, epoch)
+                    .filter(|aggregate| epoch.saturating_sub(aggregate.epoch) <= 2);
+                if confirmed_aggregate.is_none() && self.config.feature_flags.consensus_v2 {
                     self.log_event(
-                        "missed-slot",
+                        "service-gating-insufficient-evidence",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                            "slot {slot} skipping V2 service gating because no quorum-backed aggregate is available within 2 epochs"
+                        ),
+                    )?;
+                } else {
+                    let score = self.service_score_for_validator(self.config.validator_id);
+                    let counters = self.local_service_counters();
+                    self.log_event(
+                        "service-gating-check",
+                        format!(
+                            "slot {slot} local_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                             self.service_gating_threshold(),
                             self.config.feature_flags.service_score_window_epochs,
                             self.config.feature_flags.service_score_weights.uptime_weight,
@@ -436,8 +419,37 @@ impl NodeRunner {
                             counters.invalid_receipts
                         ),
                     )?;
-                    self.persist_metrics()?;
-                    return Ok(());
+                    if score < self.service_gating_threshold() {
+                        self.update_metrics(|metrics| {
+                            metrics.missed_proposer_slots += 1;
+                            metrics.service_gating_rejections += 1;
+                            metrics.last_local_service_score = score;
+                            metrics.service_gating_threshold = self.service_gating_threshold();
+                            metrics.last_local_service_counters = counters.clone();
+                        });
+                        self.log_event(
+                            "missed-slot",
+                            format!(
+                                "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                                self.service_gating_threshold(),
+                                self.config.feature_flags.service_score_window_epochs,
+                                self.config.feature_flags.service_score_weights.uptime_weight,
+                                self.config.feature_flags.service_score_weights.delivery_weight,
+                                self.config.feature_flags.service_score_weights.diversity_weight,
+                                self.config.feature_flags.service_score_weights.penalty_weight,
+                                counters.uptime_windows,
+                                counters.total_windows,
+                                counters.timely_deliveries,
+                                counters.expected_deliveries,
+                                counters.distinct_peers,
+                                counters.expected_peers,
+                                counters.failed_sessions,
+                                counters.invalid_receipts
+                            ),
+                        )?;
+                        self.persist_metrics()?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1550,6 +1562,11 @@ impl NodeRunner {
         {
             return Ok(false);
         }
+        if self.latest_certified_height_for_chain(&candidate_chain)
+            <= self.latest_certified_height_for_chain(&self.blocks)
+        {
+            return Ok(false);
+        }
         if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
             return Ok(false);
         }
@@ -1577,6 +1594,11 @@ impl NodeRunner {
             LedgerState::replay_blocks(&self.genesis, &candidate_chain, self.crypto.as_ref())?;
         candidate_ledger.apply_block(block, self.crypto.as_ref())?;
         candidate_chain.push(block.clone());
+        if self.latest_certified_height_for_chain(&candidate_chain)
+            <= self.latest_certified_height_for_chain(&self.blocks)
+        {
+            return Ok(false);
+        }
         if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
             return Ok(false);
         }
@@ -1622,17 +1644,20 @@ impl NodeRunner {
         candidate_quality.cmp(&current_quality)
     }
 
+    fn latest_certified_height_for_chain(&self, chain: &[Block]) -> u64 {
+        chain.iter()
+            .rev()
+            .find(|block| self.quorum_certificates.contains_key(&block.block_hash))
+            .map(|block| block.header.block_number)
+            .unwrap_or(0)
+    }
+
     fn branch_quality_with_extra_tip_vote(
         &self,
         chain: &[Block],
         extra_tip_vote_for: Option<HashBytes>,
     ) -> (u64, u64, usize, u64, HashBytes) {
-        let latest_certified_height = chain
-            .iter()
-            .rev()
-            .find(|block| self.quorum_certificates.contains_key(&block.block_hash))
-            .map(|block| block.header.block_number)
-            .unwrap_or(0);
+        let latest_certified_height = self.latest_certified_height_for_chain(chain);
         let tip = chain.last();
         let tip_vote_count = tip
             .map(|block| {
@@ -1964,7 +1989,7 @@ impl NodeRunner {
             let previous_completed_epoch = self.snapshot_metrics().last_completed_service_epoch;
             for validator_id in validator_ids {
                 let aggregate = self
-                    .latest_service_aggregate_before_epoch(validator_id, current_epoch)
+                    .latest_confirmed_service_aggregate_before_epoch(validator_id, current_epoch)
                     .cloned();
                 if let Some(aggregate) = aggregate {
                     let score = self.consensus.compute_service_score_from_aggregate(
@@ -2061,7 +2086,7 @@ impl NodeRunner {
         });
     }
 
-    fn latest_service_aggregate_before_epoch(
+    fn latest_confirmed_service_aggregate_before_epoch(
         &self,
         validator_id: ValidatorId,
         current_epoch: Epoch,
@@ -2071,8 +2096,12 @@ impl NodeRunner {
         }
         self.service_aggregates
             .range((validator_id, 0)..=(validator_id, current_epoch - 1))
-            .next_back()
-            .map(|(_, aggregate)| aggregate)
+            .rev()
+            .find_map(|(_, aggregate)| {
+                (self.consensus.service_evidence_status(aggregate).ok()
+                    == Some(ServiceEvidenceStatus::Confirmed))
+                .then_some(aggregate)
+            })
     }
 
     fn service_score_for_validator(&self, validator_id: ValidatorId) -> f64 {
@@ -2498,12 +2527,20 @@ impl NodeRunner {
             attestation_root: entangrid_types::service_attestation_root(&attestations),
             aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
             attestations,
+            committee_size: self
+                .consensus
+                .service_committee_for(epoch, subject_validator_id)
+                .len(),
+            quorum_threshold: {
+                let committee_size = self
+                    .consensus
+                    .service_committee_for(epoch, subject_validator_id)
+                    .len();
+                ((committee_size * 2) / 3) + 1
+            },
+            coverage_count: by_member.len(),
         };
-        if self
-            .consensus
-            .validate_service_aggregate(&aggregate)
-            .is_err()
-        {
+        if self.validate_service_aggregate(&aggregate).is_err() {
             return Ok(None);
         }
         Ok(Some(aggregate))
@@ -2537,7 +2574,13 @@ impl NodeRunner {
         persist: bool,
     ) -> Result<bool> {
         let key = (aggregate.subject_validator_id, aggregate.epoch);
-        let aggregate_id = canonical_hash(&aggregate);
+        for attestation in aggregate.attestations {
+            let _ = self.insert_service_attestation(attestation, persist)?;
+        }
+        let Some(merged) = self.build_service_aggregate(key.0, key.1)? else {
+            return Ok(false);
+        };
+        let aggregate_id = canonical_hash(&merged);
         if self.seen_service_aggregates.contains(&aggregate_id) {
             return Ok(false);
         }
@@ -2545,16 +2588,12 @@ impl NodeRunner {
             if canonical_hash(existing) == aggregate_id {
                 return Ok(false);
             }
-            if !service_counters_dominate(&aggregate.aggregate_counters, &existing.aggregate_counters)
-            {
-                return Err(anyhow!("conflicting service aggregate"));
-            }
         }
-        self.service_aggregates.insert(key, aggregate.clone());
+        self.service_aggregates.insert(key, merged.clone());
         self.seen_service_aggregates.insert(aggregate_id);
         if persist {
             self.storage
-                .append_json_line(&self.storage.service_aggregates_path, &aggregate)?;
+                .append_json_line(&self.storage.service_aggregates_path, &merged)?;
         }
         Ok(true)
     }
@@ -2642,7 +2681,7 @@ impl NodeRunner {
     fn log_current_service_score(&self, epoch: Epoch) -> Result<()> {
         let counters = self.local_service_counters();
         let v2_completed_epoch = self
-            .latest_service_aggregate_before_epoch(self.config.validator_id, epoch)
+            .latest_confirmed_service_aggregate_before_epoch(self.config.validator_id, epoch)
             .map(|aggregate| aggregate.epoch)
             .unwrap_or(epoch.saturating_sub(1));
         if epoch < self.config.feature_flags.service_gating_start_epoch {
@@ -3709,6 +3748,12 @@ mod tests {
             attestation_root: entangrid_types::service_attestation_root(&attestations),
             aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
             attestations,
+            committee_size: consensus.service_committee_for(epoch, subject_validator_id).len(),
+            quorum_threshold: {
+                let committee_size = consensus.service_committee_for(epoch, subject_validator_id).len();
+                ((committee_size * 2) / 3) + 1
+            },
+            coverage_count: consensus.service_committee_for(epoch, subject_validator_id).len(),
         }
     }
 
@@ -3782,7 +3827,9 @@ mod tests {
                     assert_eq!(attestation.committee_member_id, 1);
                     seen_subjects.insert(attestation.subject_validator_id);
                 }
-                ProtocolMessage::ReceiptFetch { .. } | ProtocolMessage::HeartbeatPulse(_) => {}
+                ProtocolMessage::ServiceAggregate(_)
+                | ProtocolMessage::ReceiptFetch { .. }
+                | ProtocolMessage::HeartbeatPulse(_) => {}
                 other => panic!("expected service attestation, got {other:?}"),
             }
         }
@@ -3941,7 +3988,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn higher_quality_replayable_branch_replaces_uncertified_tip_in_v2() {
+    async fn higher_quality_replayable_branch_stays_orphan_until_certified_in_v2() {
         let genesis = sample_genesis();
         let config = sample_node_config(1, reserve_local_address(), Vec::new(), "prefer-branch");
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
@@ -4023,18 +4070,18 @@ mod tests {
 
         assert_eq!(
             runner.accept_block(competing_tip.clone(), false).await.unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
-        assert_eq!(runner.blocks.last().unwrap().block_hash, competing_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.blocks.last().unwrap().block_hash, current_tip.block_hash);
         assert!(runner
             .orphan_blocks
             .iter()
-            .any(|block| block.block_hash == current_tip.block_hash));
+            .any(|block| block.block_hash == competing_tip.block_hash));
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stronger_vote_supported_branch_replaces_uncertified_tip_before_qc() {
+    async fn stronger_vote_supported_branch_does_not_replace_uncertified_tip_before_qc() {
         let genesis = sample_genesis();
         let config = sample_node_config(1, reserve_local_address(), Vec::new(), "vote-branch");
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
@@ -4127,7 +4174,7 @@ mod tests {
         assert!(!runner
             .quorum_certificates
             .contains_key(&competing_tip.block_hash));
-        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4465,6 +4512,242 @@ mod tests {
 
         assert_eq!(runner.service_score_for_validator(1), 0.73);
         assert_eq!(runner.local_service_counters(), prior_counters);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn partial_v2_aggregate_is_stored_but_does_not_override_confirmed_score() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-partial");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 4);
+
+        let confirmed = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            2,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 5,
+                timely_deliveries: 5,
+                expected_deliveries: 5,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        runner.import_service_aggregate(confirmed.clone()).unwrap();
+
+        let committee = runner.consensus.service_committee_for(3, 1);
+        let partial_attestations = committee
+            .iter()
+            .take(committee.len().saturating_sub(1))
+            .map(|committee_member_id| {
+                signed_service_attestation(
+                    runner.crypto.as_ref(),
+                    1,
+                    *committee_member_id,
+                    3,
+                    ServiceCounters {
+                        uptime_windows: 0,
+                        total_windows: 5,
+                        timely_deliveries: 0,
+                        expected_deliveries: 5,
+                        distinct_peers: 0,
+                        expected_peers: 2,
+                        failed_sessions: 1,
+                        invalid_receipts: 0,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let partial = ServiceAggregate {
+            subject_validator_id: 1,
+            epoch: 3,
+            attestation_root: entangrid_types::service_attestation_root(&partial_attestations),
+            aggregate_counters: entangrid_types::aggregate_service_counters(&partial_attestations),
+            attestations: partial_attestations.clone(),
+            committee_size: committee.len(),
+            quorum_threshold: ((committee.len() * 2) / 3) + 1,
+            coverage_count: partial_attestations.len(),
+        };
+        runner.import_service_aggregate(partial).unwrap();
+        runner.refresh_service_scores();
+
+        let expected_score = runner.consensus.compute_service_score_from_aggregate(
+            &confirmed,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert_eq!(runner.service_score_for_validator(1), expected_score);
+        assert!(runner.service_aggregates.contains_key(&(1, 3)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn partial_v2_aggregates_merge_committee_coverage() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-merge");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let committee = runner.consensus.service_committee_for(2, 1);
+        assert!(committee.len() >= 2);
+        let counters = ServiceCounters {
+            uptime_windows: 0,
+            total_windows: 5,
+            timely_deliveries: 0,
+            expected_deliveries: 5,
+            distinct_peers: 0,
+            expected_peers: 2,
+            failed_sessions: 1,
+            invalid_receipts: 0,
+        };
+        let aggregate_one = {
+            let attestation =
+                signed_service_attestation(runner.crypto.as_ref(), 1, committee[0], 2, counters.clone());
+            ServiceAggregate {
+                subject_validator_id: 1,
+                epoch: 2,
+                attestation_root: entangrid_types::service_attestation_root(std::slice::from_ref(
+                    &attestation,
+                )),
+                aggregate_counters: entangrid_types::aggregate_service_counters(
+                    std::slice::from_ref(&attestation),
+                ),
+                attestations: vec![attestation],
+                committee_size: committee.len(),
+                quorum_threshold: ((committee.len() * 2) / 3) + 1,
+                coverage_count: 1,
+            }
+        };
+        let aggregate_two = {
+            let attestation =
+                signed_service_attestation(runner.crypto.as_ref(), 1, committee[1], 2, counters);
+            ServiceAggregate {
+                subject_validator_id: 1,
+                epoch: 2,
+                attestation_root: entangrid_types::service_attestation_root(std::slice::from_ref(
+                    &attestation,
+                )),
+                aggregate_counters: entangrid_types::aggregate_service_counters(
+                    std::slice::from_ref(&attestation),
+                ),
+                attestations: vec![attestation],
+                committee_size: committee.len(),
+                quorum_threshold: ((committee.len() * 2) / 3) + 1,
+                coverage_count: 1,
+            }
+        };
+
+        assert!(runner.import_service_aggregate(aggregate_one).unwrap());
+        assert!(runner.import_service_aggregate(aggregate_two).unwrap());
+
+        let merged = runner.service_aggregates.get(&(1, 2)).unwrap();
+        assert_eq!(merged.coverage_count, 2);
+        assert_eq!(merged.attestations.len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merged_negative_v2_aggregates_become_confirmed_and_penalize_scores() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-confirmed");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let target_epoch = 2;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * (target_epoch + 1));
+        let committee = runner.consensus.service_committee_for(target_epoch, 1);
+        assert!(!committee.is_empty());
+
+        for committee_member_id in committee {
+            let attestation = signed_service_attestation(
+                runner.crypto.as_ref(),
+                1,
+                committee_member_id,
+                target_epoch,
+                ServiceCounters {
+                    uptime_windows: 0,
+                    total_windows: 5,
+                    timely_deliveries: 0,
+                    expected_deliveries: 5,
+                    distinct_peers: 0,
+                    expected_peers: 2,
+                    failed_sessions: 1,
+                    invalid_receipts: 0,
+                },
+            );
+            let aggregate = ServiceAggregate {
+                subject_validator_id: 1,
+                epoch: target_epoch,
+                attestation_root: entangrid_types::service_attestation_root(std::slice::from_ref(
+                    &attestation,
+                )),
+                aggregate_counters: entangrid_types::aggregate_service_counters(
+                    std::slice::from_ref(&attestation),
+                ),
+                attestations: vec![attestation],
+                committee_size: runner.consensus.service_committee_for(target_epoch, 1).len(),
+                quorum_threshold: {
+                    let committee_size =
+                        runner.consensus.service_committee_for(target_epoch, 1).len();
+                    ((committee_size * 2) / 3) + 1
+                },
+                coverage_count: 1,
+            };
+            assert!(runner.import_service_aggregate(aggregate).unwrap());
+        }
+
+        runner.refresh_service_scores();
+
+        let confirmed = runner
+            .latest_confirmed_service_aggregate_before_epoch(1, target_epoch + 1)
+            .expect("expected merged confirmed aggregate");
+        assert_eq!(confirmed.coverage_count, confirmed.quorum_threshold);
+        assert_eq!(runner.service_score_for_validator(1), 0.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_local_gating_fails_open_when_confirmed_evidence_is_stale() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "v2-gating-stale");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (proposal_epoch, slot) = (4..8)
+            .find_map(|epoch| {
+                let start = genesis.slots_per_epoch * epoch;
+                let end = genesis.slots_per_epoch * (epoch + 1);
+                (start..end)
+                    .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+                    .map(|slot| (epoch, slot))
+            })
+            .unwrap();
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+
+        let stale = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            proposal_epoch - 3,
+            ServiceCounters {
+                uptime_windows: 0,
+                total_windows: 5,
+                timely_deliveries: 0,
+                expected_deliveries: 5,
+                distinct_peers: 0,
+                expected_peers: 2,
+                failed_sessions: 4,
+                invalid_receipts: 0,
+            },
+        );
+        runner.import_service_aggregate(stale).unwrap();
+        runner.refresh_service_scores();
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.last_proposed_slot, Some(slot));
+        assert_eq!(runner.snapshot_metrics().service_gating_rejections, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

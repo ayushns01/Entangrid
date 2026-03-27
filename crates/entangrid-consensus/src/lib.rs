@@ -6,6 +6,21 @@ use entangrid_types::{
     ValidatorId, canonical_hash, default_service_score_weights, hash_many, now_unix_millis,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceEvidenceStatus {
+    Confirmed,
+    InsufficientEvidence,
+}
+
+pub fn derived_service_committee_size(validator_count: usize) -> usize {
+    if validator_count <= 1 {
+        return 0;
+    }
+    let log2 = validator_count.ilog2() as usize;
+    let target = (log2 + 1).max(3);
+    target.min(validator_count - 1)
+}
+
 #[derive(Clone, Debug)]
 pub struct ConsensusEngine {
     genesis: GenesisConfig,
@@ -69,10 +84,7 @@ impl ConsensusEngine {
         for (position, validator_id) in rotated.iter().copied().enumerate() {
             let mut witnesses = Vec::new();
             let mut relay_targets = Vec::new();
-            let max_relations = self
-                .genesis
-                .witness_count
-                .min(rotated.len().saturating_sub(1));
+            let max_relations = derived_service_committee_size(rotated.len());
             for offset in 1..=max_relations {
                 let target = rotated[(position + offset) % rotated.len()];
                 if target != validator_id {
@@ -207,6 +219,12 @@ impl ConsensusEngine {
         }
         let committee = self.service_committee_for(aggregate.epoch, aggregate.subject_validator_id);
         let threshold = service_committee_threshold(committee.len());
+        if aggregate.committee_size != 0 && aggregate.committee_size != committee.len() {
+            return Err("aggregate committee size does not match derived committee".into());
+        }
+        if aggregate.quorum_threshold != 0 && aggregate.quorum_threshold != threshold {
+            return Err("aggregate quorum threshold does not match derived threshold".into());
+        }
         let committee_members: BTreeSet<_> = committee.into_iter().collect();
         let mut attested_members = BTreeSet::new();
         for attestation in &aggregate.attestations {
@@ -217,10 +235,24 @@ impl ConsensusEngine {
                 return Err("duplicate committee attestation".into());
             }
         }
-        if attested_members.len() < threshold {
-            return Err("aggregate does not meet service committee threshold".into());
+        if aggregate.coverage_count != 0 && aggregate.coverage_count != attested_members.len() {
+            return Err("aggregate coverage count does not match attestations".into());
         }
         Ok(())
+    }
+
+    pub fn service_evidence_status(
+        &self,
+        aggregate: &ServiceAggregate,
+    ) -> Result<ServiceEvidenceStatus, String> {
+        self.validate_service_aggregate(aggregate)?;
+        let committee = self.service_committee_for(aggregate.epoch, aggregate.subject_validator_id);
+        let threshold = service_committee_threshold(committee.len());
+        if aggregate.attestations.len() >= threshold {
+            Ok(ServiceEvidenceStatus::Confirmed)
+        } else {
+            Ok(ServiceEvidenceStatus::InsufficientEvidence)
+        }
     }
 
     pub fn compute_service_score_from_aggregate(
@@ -243,7 +275,7 @@ impl ConsensusEngine {
         if aggregate.epoch >= current_epoch {
             return false;
         }
-        if self.validate_service_aggregate(aggregate).is_err() {
+        if self.service_evidence_status(aggregate).ok() != Some(ServiceEvidenceStatus::Confirmed) {
             return false;
         }
         self.compute_service_score_from_aggregate(aggregate, &default_service_score_weights())
@@ -685,12 +717,13 @@ mod tests {
         );
         assert_eq!(
             four.service_committee_for(2, 1).len(),
-            four.genesis().witness_count.min(3)
+            derived_service_committee_size(4)
         );
         assert_eq!(
             eight.service_committee_for(2, 1).len(),
-            eight.genesis().witness_count.min(7)
+            derived_service_committee_size(8)
         );
+        assert_eq!(four.service_committee_for(2, 1).len(), derived_service_committee_size(4));
     }
 
     #[test]
@@ -723,12 +756,56 @@ mod tests {
             attestation_root: service_attestation_root(&attestations),
             aggregate_counters: aggregate_service_counters(&attestations),
             attestations: attestations.clone(),
+            committee_size: committee.len(),
+            quorum_threshold: service_committee_threshold(committee.len()),
+            coverage_count: attestations.len(),
         };
         assert!(engine.validate_service_aggregate(&aggregate).is_ok());
 
         let mut wrong_counters = aggregate.clone();
         wrong_counters.aggregate_counters.failed_sessions = 1;
         assert!(engine.validate_service_aggregate(&wrong_counters).is_err());
+    }
+
+    #[test]
+    fn below_quorum_aggregate_is_structurally_valid_but_insufficient() {
+        let engine = ConsensusEngine::new(sample_genesis_with_validators(8));
+        let committee = engine.service_committee_for(4, 3);
+        let attestations: Vec<_> = committee
+            .iter()
+            .take(service_committee_threshold(committee.len()) - 1)
+            .map(|committee_member_id| ServiceAttestation {
+                subject_validator_id: 3,
+                committee_member_id: *committee_member_id,
+                epoch: 4,
+                counters: ServiceCounters {
+                    uptime_windows: 1,
+                    total_windows: 1,
+                    timely_deliveries: 2,
+                    expected_deliveries: 2,
+                    distinct_peers: 1,
+                    expected_peers: 1,
+                    failed_sessions: 0,
+                    invalid_receipts: 0,
+                },
+                signature: vec![],
+            })
+            .collect();
+        let aggregate = ServiceAggregate {
+            subject_validator_id: 3,
+            epoch: 4,
+            attestation_root: service_attestation_root(&attestations),
+            aggregate_counters: aggregate_service_counters(&attestations),
+            attestations: attestations.clone(),
+            committee_size: committee.len(),
+            quorum_threshold: service_committee_threshold(committee.len()),
+            coverage_count: attestations.len(),
+        };
+        assert!(engine.validate_service_aggregate(&aggregate).is_ok());
+        assert_eq!(
+            engine.service_evidence_status(&aggregate).unwrap(),
+            ServiceEvidenceStatus::InsufficientEvidence
+        );
     }
 
     #[test]
@@ -760,6 +837,9 @@ mod tests {
             attestation_root: service_attestation_root(&attestations),
             aggregate_counters: aggregate_service_counters(&attestations),
             attestations,
+            committee_size: committee.len(),
+            quorum_threshold: service_committee_threshold(committee.len()),
+            coverage_count: committee.len(),
         };
         assert!(engine.proposer_is_service_eligible(Some(&aggregate), 0.4, 3));
         assert!(!engine.proposer_is_service_eligible(Some(&aggregate), 0.4, 2));
