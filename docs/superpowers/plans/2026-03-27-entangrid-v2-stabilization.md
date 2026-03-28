@@ -70,13 +70,14 @@ What was fixed:
 - `SyncStatus` and certified sync requests now exchange recent QC anchors instead of a single QC hash
 - peer sync state preserves and merges QC-anchor history instead of wiping it on later tip-only updates
 - responders now find the highest shared QC from that anchor history before falling back
-- repeated live `6/7/8` bursty runs now show nonzero certified sync activity on all three topologies
+- repeated live `6/7/8` bursty runs now keep certified sync available on all three topologies
+- stale certified-sync responses are now skipped if they would downgrade a newer local certified tip
 
 Latest verified outcome:
 
-- `6`: `certified_sync_served = 104`, `certified_sync_applied = 81`, `full_sync_applied = 2`
-- `7`: `certified_sync_served = 80`, `certified_sync_applied = 77`, `full_sync_applied = 8`
-- `8`: `certified_sync_served = 438`, `certified_sync_applied = 158`, `full_sync_applied = 0`
+- earlier recovery-focused reruns still showed nonzero `certified_sync_applied` on `6/7/8`
+- the latest healthy shutdown reruns showed `certified_sync_served > 0` and `full_sync_applied = 0` on `6/7/8`
+- in those latest healthy reruns, certified repair did not need to apply because the nodes stayed converged enough throughout the run
 
 ### Issue 2: Canonical Branch Selection
 
@@ -94,9 +95,9 @@ What was fixed:
 
 Latest verified outcome:
 
-- healthy `6`: `same_chain = 6/6`, height `26`, certified sync active, full snapshot `0`
-- healthy `7`: `same_chain = 7/7`, height `17`, certified sync active, full snapshot `0`
-- healthy `8`: `same_chain = 8/8`, height `11`, certified sync active, full snapshot `0`
+- healthy `6`: `same_chain = 6/6`, height `32`, `full_sync_applied = 0`
+- healthy `7`: `same_chain = 7/7`, height `19`, `full_sync_applied = 0`
+- healthy `8`: `same_chain = 8/8`, height `10`, `full_sync_applied = 0`
 
 ### Issue 3: Service-Gating Enforcement At Scale
 
@@ -127,13 +128,13 @@ Work on **Issue 3** next.
 
 Issue 1 is now complete enough to close because:
 
-- live bursty runs show nonzero certified sync activity on `6/7/8`
+- live bursty runs show certified sync availability on `6/7/8`, and recovery-focused runs still prove nonzero certified repair when it is actually needed
 - certified repair is no longer stuck behind legacy snapshot repair
 
 Issue 2 is now complete enough to close because:
 
 - healthy `6/7/8` bursty runs now finish on one tip
-- certified sync remains active during those runs
+- stale certified-sync responses no longer drag a node back to an older certified tip during those runs
 - full snapshot fallback no longer drives the healthy live-recovery path
 
 The next blocker is no longer sync activation or canonical branch choice. It is service-gating enforcement and score stability after recovery.

@@ -24,6 +24,7 @@ On the active `consensus_v2` path on `main`, the protocol direction is tightenin
 - nodes build `ServiceAggregate` records from those attestations
 - proposer gating reads prior-epoch aggregate evidence instead of raw local receipt views
 - proposal votes, quorum certificates, certified sync, and QC-dominant canonical branch choice are live
+- certified sync now rejects stale certified responses that would otherwise downgrade a newer local certified tip
 - the next blocker is not branch recovery itself, but stable service-evidence interpretation once recovery succeeds at `7/8`
 
 ## Protocol Goals

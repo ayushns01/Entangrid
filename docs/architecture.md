@@ -11,7 +11,8 @@ Current status note:
 - `main` now carries the active V2-focused architecture work behind `consensus_v2`
 - the baseline receipt-driven path is still available when `consensus_v2` is disabled and is preserved as the benchmark line on `codex/consensus-v1`
 - committee-attested service evidence, certified sync, and QC-dominant branch choice are now live on `main`
-- healthy `6/7/8` bursty runs now reconverge structurally on one tip, but larger-topology service scoring and gating are still unfinished
+- healthy `6/7/8` bursty runs now repeatedly shut down structurally on one tip, and certified sync now ignores stale certified suffixes instead of downgrading local state
+- larger-topology service scoring and gating are still unfinished
 - the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## High-Level Components

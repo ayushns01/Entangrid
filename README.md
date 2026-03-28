@@ -164,7 +164,8 @@ The current prototype proved the core Entangrid idea is implementable, and `main
 
 - the baseline local-receipt path is still too topology-sensitive at larger validator counts
 - V2 service gating must keep improving from confirmed prior-epoch committee evidence
-- healthy `6/7/8` bursty runs now reconverge on one tip with certified sync and QC-dominant branch choice active
+- healthy `6/7/8` bursty runs now repeatedly shut down on one tip with QC-dominant branch choice active
+- certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
 - the next blocker is no longer branch selection itself, but service-score collapse and gating semantics at `7/8`
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).

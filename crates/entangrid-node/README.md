@@ -173,7 +173,9 @@ Important current limit:
 - the baseline receipt-driven path still exists and is preserved as the benchmark line on `codex/consensus-v1`
 - `main` is now the active V2-focused node runtime line
 - certified sync and QC-dominant branch choice are now live on `main`
-- healthy bursty `6/7/8` runs now reconverge structurally on one tip, but service scores and gating still need work at `7/8`
+- healthy bursty `6/7/8` runs now repeatedly shut down structurally on one tip
+- stale certified-sync responses are now skipped instead of re-adopting an older certified suffix
+- service scores and gating still need work at `7/8`
 - the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
@@ -189,6 +191,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 - the active matrix focus on `main` is the V2 `4/5/6/7/8` healthy and degraded bursty sweep, using `codex/consensus-v1` as the benchmark/control line
 - larger-topology peers now reconverge structurally in repeated healthy `6/7/8` runs, which cuts down the old ordering blocker substantially
+- certified sync now refuses stale certified responses that would otherwise pull a node backward after it already advanced
 - the next node-runtime milestone is service-gating enforcement and score stability at `7/8`, not activating certified repair itself
 
 So the next node-runtime milestone is:

@@ -100,13 +100,18 @@ Most importantly:
 
 Latest repeated healthy `6/7/8` bursty validation on `main` showed:
 
-- `6`: `same_chain = 6/6`, height `26`, `certified_sync_applied > 0`, `full_sync_applied = 0`
-- `7`: `same_chain = 7/7`, height `17`, `certified_sync_applied > 0`, `full_sync_applied = 0`
-- `8`: `same_chain = 8/8`, height `11`, `certified_sync_applied > 0`, `full_sync_applied = 0`
+- `6`: `same_chain = 6/6`, height `32`, `certified_sync_served > 0`, `full_sync_applied = 0`
+- `7`: `same_chain = 7/7`, height `19`, `certified_sync_served > 0`, `full_sync_applied = 0`
+- `8`: `same_chain = 8/8`, height `10`, `certified_sync_served > 0`, `full_sync_applied = 0`
+
+The latest node-runtime hardening behind those results was a stale certified-sync guard:
+
+- certified-sync responses are now ignored when they would downgrade a node that already holds a newer certified tip
+- that closes the last oscillation we were still seeing in the 8-validator healthy shutdown path
 
 That means both Issue 1 and Issue 2 have been cut down substantially:
 
-- certified sync is active in live recovery
+- certified sync is active in live recovery when needed, and its availability remains live in repeated healthy runs
 - QC-dominant branch choice plus the pending-certified-child lane now keep healthy `6/7/8` runs on one tip
 
 ## What Is Still Broken
@@ -116,7 +121,7 @@ The biggest remaining blocker is now service-score stability and gating semantic
 The latest healthy bursty runs on `main` make that pretty clear:
 
 - structural convergence is now much better than the older `3/6`, `2/7`, `3/8` shapes
-- certified sync is active and full-snapshot fallback is no longer driving these healthy `6/7/8` runs
+- full-snapshot fallback is no longer driving these healthy `6/7/8` runs
 - but `7` and especially `8` still show service-score collapse and `0` gating rejections
 
 In the latest cross-branch comparison:

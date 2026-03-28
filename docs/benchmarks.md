@@ -16,7 +16,7 @@ Current benchmark gate on `main`:
 - healthy and degraded bursty localnets across `4/5/6/7/8` validators
 - `consensus_v2` is the implementation target
 - `codex/consensus-v1` is the benchmark/control line
-- Issue 1 certified-sync activation is now expected to be nonzero in live `6/7/8` runs
+- Issue 1 certified-sync availability is now expected to stay live in `6/7/8`, and certified repair should apply whenever a run actually needs recovery
 - Issue 2 healthy branch convergence is now expected to finish on one tip in repeated `6/7/8` runs
 - PQ integration stays out of scope until the V2 matrix is green
 
