@@ -172,7 +172,7 @@ Important current limit:
 
 - the baseline receipt-driven path still exists and is preserved as the benchmark line on `codex/consensus-v1`
 - `main` is now the active V2-focused node runtime line
-- certified sync and full larger-validator convergence are still not finished
+- certified sync is now live, but full larger-validator convergence is still not finished
 - the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
@@ -187,12 +187,12 @@ The recent validation-focused improvement in this crate was about correctness un
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 - the active matrix focus on `main` is the V2 `4/5/6/7/8` healthy and degraded bursty sweep, using `codex/consensus-v1` as the benchmark/control line
-- larger-topology peers still do not always reconverge within the normal settle window, which is why QC-backed ordering and certified sync remain the next node-runtime milestones
+- larger-topology peers still do not always reconverge within the normal settle window, which is why QC-backed ordering remains the next node-runtime milestone even though certified sync is now live
 
 So the next node-runtime milestone is no longer just "make scores less noisy". It is:
 
 - QC-backed ordering and fork choice for the V2 path
-- certified sync after that
+- stronger convergence after certified repair
 
 But it is still intentionally early-stage.
 

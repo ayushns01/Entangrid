@@ -276,18 +276,35 @@ pub struct CertifiedBlockHeader {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncQcAnchor {
+    pub block_hash: HashBytes,
+    pub block_number: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkedSyncRequest {
     pub requester_id: ValidatorId,
+    pub known_qc_hash: Option<HashBytes>,
+    pub known_qc_height: u64,
+    pub known_qc_anchors: Vec<SyncQcAnchor>,
     pub from_height: u64,
     pub want_certified_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ChunkedSyncResponse {
-    pub responder_id: ValidatorId,
-    pub headers: Vec<CertifiedBlockHeader>,
-    pub blocks: Vec<Block>,
-    pub service_aggregates: Vec<ServiceAggregate>,
+pub enum ChunkedSyncResponse {
+    Certified {
+        responder_id: ValidatorId,
+        shared_qc_hash: HashBytes,
+        shared_qc_height: u64,
+        headers: Vec<CertifiedBlockHeader>,
+        blocks: Vec<Block>,
+        qcs: Vec<QuorumCertificate>,
+        service_aggregates: Vec<ServiceAggregate>,
+    },
+    Unavailable {
+        responder_id: ValidatorId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -300,6 +317,9 @@ pub enum ProtocolMessage {
         validator_id: ValidatorId,
         height: u64,
         tip_hash: HashBytes,
+        highest_qc_hash: Option<HashBytes>,
+        highest_qc_height: u64,
+        recent_qc_anchors: Vec<SyncQcAnchor>,
     },
     SyncRequest {
         requester_id: ValidatorId,
@@ -411,6 +431,8 @@ pub struct NodeMetrics {
     pub incremental_sync_applied: u64,
     pub full_sync_served: u64,
     pub full_sync_applied: u64,
+    pub certified_sync_served: u64,
+    pub certified_sync_applied: u64,
     pub last_updated_unix_millis: u64,
 }
 

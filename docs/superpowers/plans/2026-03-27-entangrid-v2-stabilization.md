@@ -55,6 +55,74 @@ This plan is complete only when these outcomes are true on the same bursty gated
   - real punishment of validator `3`
   - stronger convergence than current `v2`
 
+## Issue Buckets
+
+Treat the remaining V2 consensus problems as separate buckets and solve them one at a time.
+
+### Issue 1: Certified Sync Activation
+
+Status:
+
+- completed on `main`
+
+What was fixed:
+
+- `SyncStatus` and certified sync requests now exchange recent QC anchors instead of a single QC hash
+- peer sync state preserves and merges QC-anchor history instead of wiping it on later tip-only updates
+- responders now find the highest shared QC from that anchor history before falling back
+- repeated live `6/7/8` bursty runs now show nonzero certified sync activity on all three topologies
+
+Latest verified outcome:
+
+- `6`: `certified_sync_served = 104`, `certified_sync_applied = 81`, `full_sync_applied = 2`
+- `7`: `certified_sync_served = 80`, `certified_sync_applied = 77`, `full_sync_applied = 8`
+- `8`: `certified_sync_served = 438`, `certified_sync_applied = 158`, `full_sync_applied = 0`
+
+### Issue 2: Canonical Branch Selection
+
+Problem:
+
+- even after the first QC-ordering slices, `6/7/8` still end on too many distinct tips
+
+Goal:
+
+- highest QC-backed branch must dominate live canonical choice
+- uncertified local drift must stop beating shared certified state
+
+### Issue 3: Service-Gating Enforcement At Scale
+
+Problem:
+
+- larger healthy runs still show many enforcement skips
+- larger degraded runs still do not punish reliably enough
+
+Goal:
+
+- confirmed poor service rejects
+- insufficient evidence skips
+- healthy validators do not collapse to `0.0`
+
+### Issue 4: Matrix Tightening
+
+Problem:
+
+- simulator acceptance rules still do not fail loudly enough on the exact V2 regressions we care about
+
+Goal:
+
+- make `4/5/6/7/8` healthy and degraded bursty scenarios fail on the right convergence and punishment regressions
+
+### Current Focus
+
+Work on **Issue 2** next.
+
+Issue 1 is now complete enough to close because:
+
+- live bursty runs show nonzero certified sync activity on `6/7/8`
+- certified repair is no longer stuck behind legacy snapshot repair
+
+The next blocker is no longer sync activation. It is canonical branch selection and convergence after repair.
+
 ## File Structure
 
 **Benchmarking and diagnostics**

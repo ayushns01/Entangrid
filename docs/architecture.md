@@ -103,7 +103,8 @@ The relay score should affect proposer eligibility or rewards, but not replace a
 Current V2 detail on `main`:
 
 - service-evidence gating is partially live behind `consensus_v2`
-- QC-backed ordering is still the next consensus milestone and is the main remaining reason larger bursty `6/8` validator runs can still diverge structurally
+- certified sync is now live behind `consensus_v2`
+- QC-backed canonical branch selection is still the next consensus milestone and is the main remaining reason larger bursty `6/7/8` validator runs can still diverge structurally
 
 ### 7. Storage Layer
 
@@ -142,7 +143,7 @@ The simulator is a first-class part of the architecture, not an afterthought.
 On the current V2 path, steps 6 and 7 are in transition:
 
 - service scores are driven by witness-aligned aggregates when `consensus_v2` is enabled
-- ordering now includes proposal votes and quorum certificates, but canonical branch choice and sync are still not fully certificate-driven end to end
+- ordering now includes proposal votes, quorum certificates, and certified suffix sync, but canonical branch choice is still not fully certificate-driven end to end
 
 ## Process Model For Localnet
 

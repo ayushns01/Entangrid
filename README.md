@@ -131,8 +131,8 @@ Current V2 shape:
 The main remaining V2 blockers are now:
 
 - QC-backed ordering and fork choice
-- certified sync from the highest shared QC
 - validator-count-aware service coverage and convergence across the full `4/5/6/7/8` bursty matrix
+- service-gating enforcement at scale once repair succeeds
 - real PQ integration only after that matrix is green
 
 ## Current Recommended Prototype Policy
@@ -166,7 +166,7 @@ The current prototype proved the core Entangrid idea is implementable, and `main
 - the baseline local-receipt path is still too topology-sensitive at larger validator counts
 - V2 service gating must keep improving from confirmed prior-epoch committee evidence
 - fork choice must move further toward certificate-backed ordering instead of relying on ad hoc repair alone
-- certified sync still needs to become the default repair path for V2 suffix recovery
+- certified sync is now active in live recovery, but it is not enough by itself to make larger topologies converge
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
 Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.

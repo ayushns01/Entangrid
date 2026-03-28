@@ -16,6 +16,7 @@ Current benchmark gate on `main`:
 - healthy and degraded bursty localnets across `4/5/6/7/8` validators
 - `consensus_v2` is the implementation target
 - `codex/consensus-v1` is the benchmark/control line
+- Issue 1 certified-sync activation is now expected to be nonzero in live `6/7/8` runs
 - PQ integration stays out of scope until the V2 matrix is green
 
 ## Core Metrics
