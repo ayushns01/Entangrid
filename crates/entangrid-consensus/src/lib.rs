@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use entangrid_types::{
     Block, CommitmentSummary, Epoch, EpochAssignment, GenesisConfig, HashBytes, MessageClass,
-    RelayReceipt, ServiceCounters, ServiceScoreWeights, Slot, TopologyCommitment, ValidatorId,
-    canonical_hash, default_service_score_weights, hash_many, now_unix_millis,
+    RelayReceipt, ServiceAggregate, ServiceCounters, ServiceScoreWeights, Slot, TopologyCommitment,
+    ValidatorId, canonical_hash, default_service_score_weights, hash_many, now_unix_millis,
 };
 
 #[derive(Clone, Debug)]
@@ -191,6 +191,75 @@ impl ConsensusEngine {
             .clamp(0.0, 1.0)
     }
 
+    pub fn service_committee_for(
+        &self,
+        epoch: Epoch,
+        subject_validator_id: ValidatorId,
+    ) -> Vec<ValidatorId> {
+        self.assignment_for(epoch, subject_validator_id)
+            .map(|assignment| assignment.witnesses)
+            .unwrap_or_default()
+    }
+
+    pub fn validate_service_aggregate(&self, aggregate: &ServiceAggregate) -> Result<(), String> {
+        if !aggregate.is_well_formed() {
+            return Err("aggregate payload is malformed".into());
+        }
+        let committee = self.service_committee_for(aggregate.epoch, aggregate.subject_validator_id);
+        let threshold = service_committee_threshold(committee.len());
+        let committee_members: BTreeSet<_> = committee.into_iter().collect();
+        let mut attested_members = BTreeSet::new();
+        for attestation in &aggregate.attestations {
+            if !committee_members.contains(&attestation.committee_member_id) {
+                return Err("attestation signer is not in the service committee".into());
+            }
+            if !attested_members.insert(attestation.committee_member_id) {
+                return Err("duplicate committee attestation".into());
+            }
+        }
+        if attested_members.len() < threshold {
+            return Err("aggregate does not meet service committee threshold".into());
+        }
+        Ok(())
+    }
+
+    pub fn compute_service_score_from_aggregate(
+        &self,
+        aggregate: &ServiceAggregate,
+        weights: &ServiceScoreWeights,
+    ) -> f64 {
+        self.compute_service_score_with_weights(&aggregate.aggregate_counters, weights)
+    }
+
+    pub fn confirmed_service_score_for_epoch(
+        &self,
+        aggregate: Option<&ServiceAggregate>,
+        weights: &ServiceScoreWeights,
+        current_epoch: Epoch,
+    ) -> Option<f64> {
+        let aggregate = aggregate?;
+        if aggregate.epoch + 1 != current_epoch {
+            return None;
+        }
+        self.validate_service_aggregate(aggregate).ok()?;
+        Some(self.compute_service_score_from_aggregate(aggregate, weights))
+    }
+
+    pub fn proposer_is_service_eligible(
+        &self,
+        aggregate: Option<&ServiceAggregate>,
+        threshold: f64,
+        current_epoch: Epoch,
+    ) -> bool {
+        self.confirmed_service_score_for_epoch(
+            aggregate,
+            &default_service_score_weights(),
+            current_epoch,
+        )
+        .unwrap_or_default()
+            >= threshold
+    }
+
     pub fn counters_for_validator(
         &self,
         validator_id: ValidatorId,
@@ -207,6 +276,57 @@ impl ConsensusEngine {
             failed_sessions,
             invalid_receipts,
         )
+    }
+
+    pub fn counters_for_validator_from_observer(
+        &self,
+        validator_id: ValidatorId,
+        observer_validator_id: ValidatorId,
+        epoch: Epoch,
+        receipts: &[RelayReceipt],
+    ) -> ServiceCounters {
+        let assignment = self
+            .assignment_for(epoch, validator_id)
+            .unwrap_or(EpochAssignment {
+                epoch,
+                validator_id,
+                witnesses: Vec::new(),
+                relay_targets: Vec::new(),
+            });
+        if !assignment.witnesses.contains(&observer_validator_id) {
+            return ServiceCounters::default();
+        }
+
+        let mut heartbeat_slots = BTreeSet::new();
+        let mut timely_deliveries = 0;
+        let observed_receipts: Vec<_> = receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.source_validator_id == validator_id
+                    && receipt.epoch == epoch
+                    && receipt.witness_validator_id == observer_validator_id
+            })
+            .collect();
+
+        for receipt in &observed_receipts {
+            if receipt.message_class == MessageClass::Heartbeat {
+                heartbeat_slots.insert(receipt.slot);
+            }
+            if receipt.latency_bucket_ms <= self.genesis.slot_duration_millis {
+                timely_deliveries += 1;
+            }
+        }
+
+        ServiceCounters {
+            uptime_windows: heartbeat_slots.len() as u64,
+            total_windows: self.genesis.slots_per_epoch.max(1),
+            timely_deliveries,
+            expected_deliveries: self.genesis.slots_per_epoch.max(1),
+            distinct_peers: u64::from(!observed_receipts.is_empty()),
+            expected_peers: 1,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        }
     }
 
     pub fn counters_from_receipts(
@@ -379,12 +499,21 @@ fn capped_ratio(numerator: u64, denominator: u64) -> f64 {
     ratio(numerator.min(denominator), denominator)
 }
 
+fn service_committee_threshold(committee_size: usize) -> usize {
+    if committee_size == 0 {
+        return 0;
+    }
+    ((committee_size * 2) / 3) + 1
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use entangrid_types::{
-        GenesisConfig, MessageClass, RelayReceipt, ServiceScoreWeights, ValidatorConfig, empty_hash,
+        GenesisConfig, MessageClass, RelayReceipt, ServiceAggregate, ServiceAttestation,
+        ServiceScoreWeights, ValidatorConfig, aggregate_service_counters, empty_hash,
+        service_attestation_root,
     };
 
     use super::*;
@@ -428,6 +557,28 @@ mod tests {
                     public_identity: vec![],
                 },
             ],
+            initial_balances: BTreeMap::new(),
+        }
+    }
+
+    fn sample_genesis_with_validators(count: u64) -> GenesisConfig {
+        GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: (1..=count)
+                .map(|validator_id| ValidatorConfig {
+                    validator_id,
+                    stake: 100,
+                    address: format!("127.0.0.1:{}", 3000 + validator_id),
+                    dev_secret: format!("secret-{validator_id}"),
+                    public_identity: vec![],
+                })
+                .collect(),
             initial_balances: BTreeMap::new(),
         }
     }
@@ -529,5 +680,99 @@ mod tests {
         let mut wrong_witness = receipt;
         wrong_witness.witness_validator_id = 1;
         assert!(engine.validate_receipt_assignment(&wrong_witness).is_err());
+    }
+
+    #[test]
+    fn service_committee_matches_observable_witness_assignments() {
+        let four = ConsensusEngine::new(sample_genesis_with_validators(4));
+        let eight = ConsensusEngine::new(sample_genesis_with_validators(8));
+        let four_assignment = four.assignment_for(2, 1).unwrap();
+        let eight_assignment = eight.assignment_for(2, 1).unwrap();
+        assert_eq!(four.service_committee_for(2, 1), four_assignment.witnesses);
+        assert_eq!(
+            eight.service_committee_for(2, 1),
+            eight_assignment.witnesses
+        );
+        assert_eq!(
+            four.service_committee_for(2, 1).len(),
+            four.genesis().witness_count.min(3)
+        );
+        assert_eq!(
+            eight.service_committee_for(2, 1).len(),
+            eight.genesis().witness_count.min(7)
+        );
+    }
+
+    #[test]
+    fn aggregate_validation_requires_matching_committee_and_counters() {
+        let engine = ConsensusEngine::new(sample_genesis_with_validators(8));
+        let committee = engine.service_committee_for(4, 3);
+        let attestations: Vec<_> = committee
+            .iter()
+            .take(3)
+            .map(|committee_member_id| ServiceAttestation {
+                subject_validator_id: 3,
+                committee_member_id: *committee_member_id,
+                epoch: 4,
+                counters: ServiceCounters {
+                    uptime_windows: 1,
+                    total_windows: 1,
+                    timely_deliveries: 2,
+                    expected_deliveries: 2,
+                    distinct_peers: 1,
+                    expected_peers: 1,
+                    failed_sessions: 0,
+                    invalid_receipts: 0,
+                },
+                signature: vec![],
+            })
+            .collect();
+        let aggregate = ServiceAggregate {
+            subject_validator_id: 3,
+            epoch: 4,
+            attestation_root: service_attestation_root(&attestations),
+            aggregate_counters: aggregate_service_counters(&attestations),
+            attestations: attestations.clone(),
+        };
+        assert!(engine.validate_service_aggregate(&aggregate).is_ok());
+
+        let mut wrong_counters = aggregate.clone();
+        wrong_counters.aggregate_counters.failed_sessions = 1;
+        assert!(engine.validate_service_aggregate(&wrong_counters).is_err());
+    }
+
+    #[test]
+    fn proposer_eligibility_requires_prior_epoch_aggregate() {
+        let engine = ConsensusEngine::new(sample_genesis());
+        let committee = engine.service_committee_for(2, 1);
+        let attestations: Vec<_> = committee
+            .iter()
+            .map(|committee_member_id| ServiceAttestation {
+                subject_validator_id: 1,
+                committee_member_id: *committee_member_id,
+                epoch: 2,
+                counters: ServiceCounters {
+                    uptime_windows: 10,
+                    total_windows: 10,
+                    timely_deliveries: 10,
+                    expected_deliveries: 10,
+                    distinct_peers: 2,
+                    expected_peers: 2,
+                    failed_sessions: 0,
+                    invalid_receipts: 0,
+                },
+                signature: vec![],
+            })
+            .collect();
+        let aggregate = ServiceAggregate {
+            subject_validator_id: 1,
+            epoch: 2,
+            attestation_root: service_attestation_root(&attestations),
+            aggregate_counters: aggregate_service_counters(&attestations),
+            attestations,
+        };
+        assert!(engine.proposer_is_service_eligible(Some(&aggregate), 0.4, 3));
+        assert!(!engine.proposer_is_service_eligible(Some(&aggregate), 0.4, 2));
+        assert!(!engine.proposer_is_service_eligible(None, 0.4, 3));
     }
 }

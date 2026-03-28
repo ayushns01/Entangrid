@@ -27,6 +27,8 @@ pub enum MessageClass {
 pub struct FeatureFlags {
     pub enable_receipts: bool,
     pub enable_service_gating: bool,
+    #[serde(default = "default_consensus_v2")]
+    pub consensus_v2: bool,
     #[serde(default = "default_service_gating_start_epoch")]
     pub service_gating_start_epoch: Epoch,
     #[serde(default = "default_service_gating_threshold")]
@@ -202,10 +204,98 @@ pub struct ChainSegment {
     pub receipts: Vec<RelayReceipt>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProposalVote {
+    pub validator_id: ValidatorId,
+    pub block_hash: HashBytes,
+    pub block_number: u64,
+    pub epoch: Epoch,
+    pub slot: Slot,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QuorumCertificate {
+    pub block_hash: HashBytes,
+    pub block_number: u64,
+    pub epoch: Epoch,
+    pub slot: Slot,
+    pub vote_root: HashBytes,
+    pub votes: Vec<ProposalVote>,
+}
+
+impl QuorumCertificate {
+    pub fn is_well_formed(&self) -> bool {
+        !self.votes.is_empty()
+            && self.vote_root == quorum_certificate_vote_root(&self.votes)
+            && self.votes.iter().all(|vote| {
+                vote.block_hash == self.block_hash
+                    && vote.block_number == self.block_number
+                    && vote.epoch == self.epoch
+                    && vote.slot == self.slot
+            })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceAttestation {
+    pub subject_validator_id: ValidatorId,
+    pub committee_member_id: ValidatorId,
+    pub epoch: Epoch,
+    pub counters: ServiceCounters,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ServiceAggregate {
+    pub subject_validator_id: ValidatorId,
+    pub epoch: Epoch,
+    pub attestation_root: HashBytes,
+    pub attestations: Vec<ServiceAttestation>,
+    pub aggregate_counters: ServiceCounters,
+}
+
+impl ServiceAggregate {
+    pub fn is_well_formed(&self) -> bool {
+        !self.attestations.is_empty()
+            && self.attestation_root == service_attestation_root(&self.attestations)
+            && self.aggregate_counters == aggregate_service_counters(&self.attestations)
+            && self.attestations.iter().all(|attestation| {
+                attestation.subject_validator_id == self.subject_validator_id
+                    && attestation.epoch == self.epoch
+            })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CertifiedBlockHeader {
+    pub header: BlockHeader,
+    pub block_hash: HashBytes,
+    pub quorum_certificate: Option<QuorumCertificate>,
+    pub prior_service_aggregate: Option<ServiceAggregate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkedSyncRequest {
+    pub requester_id: ValidatorId,
+    pub from_height: u64,
+    pub want_certified_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ChunkedSyncResponse {
+    pub responder_id: ValidatorId,
+    pub headers: Vec<CertifiedBlockHeader>,
+    pub blocks: Vec<Block>,
+    pub service_aggregates: Vec<ServiceAggregate>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ProtocolMessage {
     TransactionBroadcast(SignedTransaction),
     BlockProposal(Block),
+    ProposalVote(ProposalVote),
+    QuorumCertificate(QuorumCertificate),
     SyncStatus {
         validator_id: ValidatorId,
         height: u64,
@@ -224,8 +314,12 @@ pub enum ProtocolMessage {
         responder_id: ValidatorId,
         chain: ChainSegment,
     },
+    CertifiedSyncRequest(ChunkedSyncRequest),
+    CertifiedSyncResponse(ChunkedSyncResponse),
     HeartbeatPulse(HeartbeatPulse),
     RelayReceipt(RelayReceipt),
+    ServiceAttestation(ServiceAttestation),
+    ServiceAggregate(ServiceAggregate),
     ReceiptFetch {
         requester_id: ValidatorId,
         epoch: Epoch,
@@ -294,11 +388,16 @@ pub struct NodeMetrics {
     pub blocks_validated: u64,
     pub missed_proposer_slots: u64,
     pub service_gating_rejections: u64,
+    pub service_gating_enforcement_skips: u64,
     pub duplicate_receipts_ignored: u64,
     pub tx_ingress: u64,
     pub tx_propagated: u64,
     pub receipts_created: u64,
     pub receipts_verified: u64,
+    pub service_attestations_emitted: u64,
+    pub service_attestations_imported: u64,
+    pub service_aggregates_published: u64,
+    pub service_aggregates_imported: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     pub last_local_service_score: f64,
@@ -329,7 +428,7 @@ pub struct LocalnetManifest {
     pub node_configs: Vec<String>,
 }
 
-pub fn canonical_hash<T: Serialize>(value: &T) -> HashBytes {
+pub fn canonical_hash<T: Serialize + ?Sized>(value: &T) -> HashBytes {
     let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
         .expect("canonical serialization should succeed");
     blake3::hash(&bytes).into()
@@ -349,6 +448,10 @@ pub fn empty_hash() -> HashBytes {
 
 pub fn default_service_gating_start_epoch() -> Epoch {
     RECOMMENDED_SERVICE_GATING_START_EPOCH
+}
+
+pub fn default_consensus_v2() -> bool {
+    false
 }
 
 pub fn default_service_gating_threshold() -> f64 {
@@ -386,6 +489,29 @@ pub fn default_service_score_weights() -> ServiceScoreWeights {
 
 pub fn validator_account(validator_id: ValidatorId) -> AccountId {
     format!("validator-{validator_id}")
+}
+
+pub fn quorum_certificate_vote_root(votes: &[ProposalVote]) -> HashBytes {
+    canonical_hash(votes)
+}
+
+pub fn service_attestation_root(attestations: &[ServiceAttestation]) -> HashBytes {
+    canonical_hash(attestations)
+}
+
+pub fn aggregate_service_counters(attestations: &[ServiceAttestation]) -> ServiceCounters {
+    let mut counters = ServiceCounters::default();
+    for attestation in attestations {
+        counters.uptime_windows += attestation.counters.uptime_windows;
+        counters.total_windows += attestation.counters.total_windows;
+        counters.timely_deliveries += attestation.counters.timely_deliveries;
+        counters.expected_deliveries += attestation.counters.expected_deliveries;
+        counters.distinct_peers += attestation.counters.distinct_peers;
+        counters.expected_peers += attestation.counters.expected_peers;
+        counters.failed_sessions += attestation.counters.failed_sessions;
+        counters.invalid_receipts += attestation.counters.invalid_receipts;
+    }
+    counters
 }
 
 pub fn now_unix_millis() -> u64 {
@@ -436,5 +562,77 @@ mod tests {
                 penalty_weight: RECOMMENDED_SERVICE_PENALTY_WEIGHT,
             }
         );
+    }
+
+    #[test]
+    fn feature_flags_default_consensus_v2_is_disabled() {
+        assert!(!FeatureFlags::default().consensus_v2);
+    }
+
+    #[test]
+    fn consensus_v2_objects_are_transportable_and_self_validating() {
+        let vote = ProposalVote {
+            validator_id: 1,
+            block_hash: [9; 32],
+            block_number: 7,
+            epoch: 3,
+            slot: 19,
+            signature: vec![1, 2, 3],
+        };
+        let qc = QuorumCertificate {
+            block_hash: vote.block_hash,
+            block_number: vote.block_number,
+            epoch: vote.epoch,
+            slot: vote.slot,
+            vote_root: quorum_certificate_vote_root(std::slice::from_ref(&vote)),
+            votes: vec![vote.clone()],
+        };
+        assert!(qc.is_well_formed());
+
+        let attestation = ServiceAttestation {
+            subject_validator_id: 3,
+            committee_member_id: 2,
+            epoch: 2,
+            counters: ServiceCounters {
+                uptime_windows: 4,
+                total_windows: 4,
+                timely_deliveries: 6,
+                expected_deliveries: 8,
+                distinct_peers: 2,
+                expected_peers: 3,
+                failed_sessions: 1,
+                invalid_receipts: 0,
+            },
+            signature: vec![4, 5, 6],
+        };
+        let aggregate = ServiceAggregate {
+            subject_validator_id: 3,
+            epoch: 2,
+            attestation_root: service_attestation_root(std::slice::from_ref(&attestation)),
+            attestations: vec![attestation.clone()],
+            aggregate_counters: aggregate_service_counters(std::slice::from_ref(&attestation)),
+        };
+        assert!(aggregate.is_well_formed());
+
+        let certified = CertifiedBlockHeader {
+            header: BlockHeader {
+                block_number: 7,
+                parent_hash: [8; 32],
+                slot: 19,
+                epoch: 3,
+                proposer_id: 1,
+                timestamp_unix_millis: 42,
+                state_root: [1; 32],
+                transactions_root: [2; 32],
+                topology_root: [3; 32],
+            },
+            block_hash: [9; 32],
+            quorum_certificate: Some(qc),
+            prior_service_aggregate: Some(aggregate),
+        };
+        let bytes = bincode::serde::encode_to_vec(&certified, bincode::config::standard()).unwrap();
+        let (decoded, _): (CertifiedBlockHeader, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, certified);
     }
 }

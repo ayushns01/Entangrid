@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
@@ -15,9 +16,10 @@ use entangrid_ledger::LedgerState;
 use entangrid_network::{NetworkEvent, NetworkFailureKind, NetworkHandle, spawn_network};
 use entangrid_types::{
     Block, BlockHeader, ChainSegment, ChainSnapshot, Epoch, EventLogEntry, GenesisConfig,
-    HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProtocolMessage,
-    RelayReceipt, ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment,
-    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
+    HashBytes, HeartbeatPulse, MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProposalVote,
+    ProtocolMessage, QuorumCertificate, RelayReceipt, ServiceAggregate, ServiceAttestation,
+    ServiceCounters, SignedTransaction, StateSnapshot, TopologyCommitment, ValidatorId,
+    canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -25,6 +27,8 @@ use tracing::info;
 const SNAPSHOT_FILE: &str = "state_snapshot.json";
 const BLOCKS_FILE: &str = "blocks.jsonl";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
+const SERVICE_ATTESTATIONS_FILE: &str = "service_attestations.jsonl";
+const SERVICE_AGGREGATES_FILE: &str = "service_aggregates.jsonl";
 const ORPHANS_FILE: &str = "orphans.jsonl";
 const MAX_INCREMENTAL_SYNC_BLOCKS: usize = 64;
 const MAX_PREFERRED_INCREMENTAL_SYNC_BLOCKS: usize = 12;
@@ -80,6 +84,8 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
     storage.init()?;
     let loaded_blocks = storage.load_blocks()?;
     let loaded_receipts = storage.load_receipts()?;
+    let loaded_service_attestations = storage.load_service_attestations()?;
+    let loaded_service_aggregates = storage.load_service_aggregates()?;
     let snapshot = storage.load_snapshot()?;
     let ledger = match snapshot {
         Some(snapshot) => LedgerState::from_snapshot(snapshot),
@@ -121,6 +127,12 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         seen_blocks: BTreeSet::new(),
         seen_receipts: BTreeSet::new(),
         seen_receipt_events: BTreeSet::new(),
+        service_attestations: BTreeMap::new(),
+        service_aggregates: BTreeMap::new(),
+        proposal_votes: BTreeMap::new(),
+        quorum_certificates: BTreeMap::new(),
+        seen_service_attestations: BTreeSet::new(),
+        seen_service_aggregates: BTreeSet::new(),
         last_processed_slot: None,
         last_logged_epoch: None,
         last_heartbeat_slot: None,
@@ -138,6 +150,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         peer_sync_repair_failures: BTreeMap::new(),
         peer_message_windows: BTreeMap::new(),
     };
+    runner.restore_service_evidence(loaded_service_attestations, loaded_service_aggregates)?;
     runner.rebuild_seen_sets();
     runner.run().await
 }
@@ -160,6 +173,12 @@ struct NodeRunner {
     seen_blocks: BTreeSet<HashBytes>,
     seen_receipts: BTreeSet<HashBytes>,
     seen_receipt_events: BTreeSet<HashBytes>,
+    service_attestations: BTreeMap<(ValidatorId, Epoch), BTreeMap<ValidatorId, ServiceAttestation>>,
+    service_aggregates: BTreeMap<(ValidatorId, Epoch), ServiceAggregate>,
+    proposal_votes: BTreeMap<HashBytes, BTreeMap<ValidatorId, ProposalVote>>,
+    quorum_certificates: BTreeMap<HashBytes, QuorumCertificate>,
+    seen_service_attestations: BTreeSet<HashBytes>,
+    seen_service_aggregates: BTreeSet<HashBytes>,
     last_processed_slot: Option<u64>,
     last_logged_epoch: Option<Epoch>,
     last_heartbeat_slot: Option<u64>,
@@ -190,6 +209,14 @@ enum BlockAcceptance {
     Accepted,
     Duplicate,
     Orphan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum V2GatingState {
+    AllowNoEvidence,
+    AllowInsufficientEvidence,
+    AllowScore(f64),
+    RejectScore(f64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,6 +339,9 @@ impl NodeRunner {
             if epoch > 0 {
                 self.request_receipt_reconciliation(epoch - 1)?;
             }
+            if epoch > 2 {
+                self.refresh_recent_service_attestations(epoch)?;
+            }
         }
 
         self.broadcast_heartbeat(slot, epoch)?;
@@ -364,40 +394,110 @@ impl NodeRunner {
                     ),
                 )?;
             } else {
-                let score = self.service_score_for_validator(self.config.validator_id);
                 let counters = self.local_service_counters();
-                self.log_event(
-                    "service-gating-check",
-                    format!(
-                        "slot {slot} local_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
-                        self.service_gating_threshold(),
-                        self.config.feature_flags.service_score_window_epochs,
-                        self.config.feature_flags.service_score_weights.uptime_weight,
-                        self.config.feature_flags.service_score_weights.delivery_weight,
-                        self.config.feature_flags.service_score_weights.diversity_weight,
-                        self.config.feature_flags.service_score_weights.penalty_weight,
-                        counters.uptime_windows,
-                        counters.total_windows,
-                        counters.timely_deliveries,
-                        counters.expected_deliveries,
-                        counters.distinct_peers,
-                        counters.expected_peers,
-                        counters.failed_sessions,
-                        counters.invalid_receipts
-                    ),
-                )?;
-                if score < self.service_gating_threshold() {
-                    self.update_metrics(|metrics| {
-                        metrics.missed_proposer_slots += 1;
-                        metrics.service_gating_rejections += 1;
-                        metrics.last_local_service_score = score;
-                        metrics.service_gating_threshold = self.service_gating_threshold();
-                        metrics.last_local_service_counters = counters.clone();
-                    });
+                if self.config.feature_flags.consensus_v2 {
+                    match self.v2_gating_state(self.config.validator_id, epoch) {
+                        V2GatingState::AllowNoEvidence => {
+                            self.update_metrics(|metrics| {
+                                metrics.service_gating_enforcement_skips += 1;
+                                metrics.last_local_service_score =
+                                    self.service_score_for_validator(self.config.validator_id);
+                                metrics.service_gating_threshold = self.service_gating_threshold();
+                                metrics.last_local_service_counters = counters.clone();
+                            });
+                            self.log_event(
+                                "service-gating-skip",
+                                format!(
+                                    "slot {slot} no confirmed aggregate for validator {} prior epoch {}",
+                                    self.config.validator_id,
+                                    epoch.saturating_sub(1)
+                                ),
+                            )?;
+                        }
+                        V2GatingState::AllowInsufficientEvidence => {
+                            self.update_metrics(|metrics| {
+                                metrics.service_gating_enforcement_skips += 1;
+                                metrics.last_local_service_score =
+                                    self.service_score_for_validator(self.config.validator_id);
+                                metrics.service_gating_threshold = self.service_gating_threshold();
+                                metrics.last_local_service_counters = counters.clone();
+                            });
+                            self.log_event(
+                                "service-gating-skip",
+                                format!(
+                                    "slot {slot} confirmed aggregate missing for validator {} prior epoch {} despite older evidence",
+                                    self.config.validator_id,
+                                    epoch.saturating_sub(1)
+                                ),
+                            )?;
+                        }
+                        V2GatingState::AllowScore(score) => {
+                            self.log_event(
+                                "service-gating-check",
+                                format!(
+                                    "slot {slot} confirmed_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                                    self.service_gating_threshold(),
+                                    self.config.feature_flags.service_score_window_epochs,
+                                    self.config.feature_flags.service_score_weights.uptime_weight,
+                                    self.config.feature_flags.service_score_weights.delivery_weight,
+                                    self.config.feature_flags.service_score_weights.diversity_weight,
+                                    self.config.feature_flags.service_score_weights.penalty_weight,
+                                    counters.uptime_windows,
+                                    counters.total_windows,
+                                    counters.timely_deliveries,
+                                    counters.expected_deliveries,
+                                    counters.distinct_peers,
+                                    counters.expected_peers,
+                                    counters.failed_sessions,
+                                    counters.invalid_receipts
+                                ),
+                            )?;
+                        }
+                        V2GatingState::RejectScore(score) => {
+                            self.update_metrics(|metrics| {
+                                metrics.missed_proposer_slots += 1;
+                                metrics.service_gating_rejections += 1;
+                                metrics.last_local_service_score = score;
+                                metrics.service_gating_threshold = self.service_gating_threshold();
+                                metrics.last_local_service_counters = counters.clone();
+                            });
+                            self.log_event(
+                                "service-gating-reject",
+                                format!(
+                                    "slot {slot} rejected due to confirmed service score {score:.3} below threshold {:.3}",
+                                    self.service_gating_threshold(),
+                                ),
+                            )?;
+                            self.log_event(
+                                "missed-slot",
+                                format!(
+                                    "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                                    self.service_gating_threshold(),
+                                    self.config.feature_flags.service_score_window_epochs,
+                                    self.config.feature_flags.service_score_weights.uptime_weight,
+                                    self.config.feature_flags.service_score_weights.delivery_weight,
+                                    self.config.feature_flags.service_score_weights.diversity_weight,
+                                    self.config.feature_flags.service_score_weights.penalty_weight,
+                                    counters.uptime_windows,
+                                    counters.total_windows,
+                                    counters.timely_deliveries,
+                                    counters.expected_deliveries,
+                                    counters.distinct_peers,
+                                    counters.expected_peers,
+                                    counters.failed_sessions,
+                                    counters.invalid_receipts
+                                ),
+                            )?;
+                            self.persist_metrics()?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    let score = self.service_score_for_validator(self.config.validator_id);
                     self.log_event(
-                        "missed-slot",
+                        "service-gating-check",
                         format!(
-                            "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                            "slot {slot} local_score {score:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
                             self.service_gating_threshold(),
                             self.config.feature_flags.service_score_window_epochs,
                             self.config.feature_flags.service_score_weights.uptime_weight,
@@ -414,8 +514,37 @@ impl NodeRunner {
                             counters.invalid_receipts
                         ),
                     )?;
-                    self.persist_metrics()?;
-                    return Ok(());
+                    if score < self.service_gating_threshold() {
+                        self.update_metrics(|metrics| {
+                            metrics.missed_proposer_slots += 1;
+                            metrics.service_gating_rejections += 1;
+                            metrics.last_local_service_score = score;
+                            metrics.service_gating_threshold = self.service_gating_threshold();
+                            metrics.last_local_service_counters = counters.clone();
+                        });
+                        self.log_event(
+                            "missed-slot",
+                            format!(
+                                "slot {slot} missed due to service score {score:.3} below threshold {:.3} with window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
+                                self.service_gating_threshold(),
+                                self.config.feature_flags.service_score_window_epochs,
+                                self.config.feature_flags.service_score_weights.uptime_weight,
+                                self.config.feature_flags.service_score_weights.delivery_weight,
+                                self.config.feature_flags.service_score_weights.diversity_weight,
+                                self.config.feature_flags.service_score_weights.penalty_weight,
+                                counters.uptime_windows,
+                                counters.total_windows,
+                                counters.timely_deliveries,
+                                counters.expected_deliveries,
+                                counters.distinct_peers,
+                                counters.expected_peers,
+                                counters.failed_sessions,
+                                counters.invalid_receipts
+                            ),
+                        )?;
+                        self.persist_metrics()?;
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -683,6 +812,32 @@ impl NodeRunner {
                     }
                 }
             }
+            ProtocolMessage::ProposalVote(vote) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_proposal_vote(vote.clone()) {
+                        self.log_event(
+                            "proposal-vote-rejected",
+                            format!(
+                                "from {from_validator_id} block {:02x?} detail {error}",
+                                &vote.block_hash[..4]
+                            ),
+                        )?;
+                    }
+                }
+            }
+            ProtocolMessage::QuorumCertificate(qc) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_quorum_certificate(qc.clone()) {
+                        self.log_event(
+                            "qc-rejected",
+                            format!(
+                                "from {from_validator_id} block {:02x?} detail {error}",
+                                &qc.block_hash[..4]
+                            ),
+                        )?;
+                    }
+                }
+            }
             ProtocolMessage::SyncStatus {
                 validator_id,
                 height,
@@ -828,10 +983,51 @@ impl NodeRunner {
                 )
                 .await?;
             }
+            ProtocolMessage::CertifiedSyncRequest(_) => {}
+            ProtocolMessage::CertifiedSyncResponse(_) => {}
             ProtocolMessage::RelayReceipt(receipt) => {
                 if self.store_receipt(receipt.clone())? {
                     self.network
                         .broadcast(&self.config.peers, ProtocolMessage::RelayReceipt(receipt))?;
+                }
+            }
+            ProtocolMessage::ServiceAttestation(attestation) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_service_attestation(attestation.clone()) {
+                        self.log_event(
+                            "service-attestation-rejected",
+                            format!(
+                                "from {from_validator_id} subject {} epoch {} detail {error}",
+                                attestation.subject_validator_id, attestation.epoch
+                            ),
+                        )?;
+                    } else {
+                        self.update_metrics(|metrics| {
+                            metrics.service_attestations_imported += 1;
+                        });
+                        self.maybe_publish_service_aggregate(
+                            attestation.subject_validator_id,
+                            attestation.epoch,
+                        )?;
+                    }
+                }
+            }
+            ProtocolMessage::ServiceAggregate(aggregate) => {
+                if self.config.feature_flags.consensus_v2 {
+                    if let Err(error) = self.import_service_aggregate(aggregate.clone()) {
+                        self.log_event(
+                            "service-aggregate-rejected",
+                            format!(
+                                "from {from_validator_id} subject {} epoch {} detail {error}",
+                                aggregate.subject_validator_id, aggregate.epoch
+                            ),
+                        )?;
+                    } else {
+                        self.update_metrics(|metrics| {
+                            metrics.service_aggregates_imported += 1;
+                        });
+                        self.refresh_service_scores();
+                    }
                 }
             }
             ProtocolMessage::ReceiptFetch {
@@ -1079,47 +1275,10 @@ impl NodeRunner {
         if !verified {
             return Err(anyhow!("invalid block signature"));
         }
-        if block.header.parent_hash != self.ledger.snapshot().tip_hash {
-            if !self
-                .orphan_blocks
-                .iter()
-                .any(|orphan| orphan.block_hash == block.block_hash)
-            {
-                self.orphan_blocks.push(block.clone());
-                self.storage
-                    .append_json_line(&self.storage.orphan_path, &block)?;
-                self.log_event(
-                    "fork-observed",
-                    format!(
-                        "orphan block {} parent {:02x?}",
-                        block.header.block_number,
-                        &block.header.parent_hash[..4]
-                    ),
-                )?;
-            }
-            return Ok(BlockAcceptance::Orphan);
+        let expected_proposer = self.consensus.proposer_for_slot(block.header.slot);
+        if block.header.proposer_id != expected_proposer {
+            return Err(anyhow!("unexpected proposer"));
         }
-
-        let service_gating_enforced = should_enforce_service_gating_for_block(
-            self.config.feature_flags.enable_service_gating,
-            local_proposal,
-            block.header.epoch,
-            self.config.feature_flags.service_gating_start_epoch,
-        );
-        let service_score = if service_gating_enforced {
-            Some(self.service_score_for_validator(block.header.proposer_id))
-        } else {
-            None
-        };
-        self.consensus
-            .validate_block_basic(
-                &block,
-                self.ledger.snapshot().tip_hash,
-                service_score,
-                service_gating_enforced,
-                self.service_gating_threshold(),
-            )
-            .map_err(|error| anyhow!(error))?;
 
         let transactions_root = canonical_hash(&block.transactions);
         if transactions_root != block.header.transactions_root {
@@ -1141,6 +1300,67 @@ impl NodeRunner {
             self.validate_commitment(commitment, &block.commitment_receipts)?;
         }
 
+        if block.header.parent_hash != self.ledger.snapshot().tip_hash {
+            if !self
+                .orphan_blocks
+                .iter()
+                .any(|orphan| orphan.block_hash == block.block_hash)
+            {
+                self.orphan_blocks.push(block.clone());
+                self.storage
+                    .append_json_line(&self.storage.orphan_path, &block)?;
+                self.log_event(
+                    "fork-observed",
+                    format!(
+                        "orphan block {} parent {:02x?}",
+                        block.header.block_number,
+                        &block.header.parent_hash[..4]
+                    ),
+                )?;
+            }
+            self.maybe_broadcast_vote_for_competing_block(&block)?;
+            let adopted = self.maybe_adopt_preferred_competing_branch(&block)?
+                || self.ledger.snapshot().tip_hash == block.block_hash;
+            if adopted {
+                return Ok(BlockAcceptance::Accepted);
+            }
+            return Ok(BlockAcceptance::Orphan);
+        }
+
+        let (service_gating_enforced, service_score) = if should_enforce_service_gating_for_block(
+            self.config.feature_flags.enable_service_gating,
+            local_proposal,
+            block.header.epoch,
+            self.config.feature_flags.service_gating_start_epoch,
+        ) {
+            if self.config.feature_flags.consensus_v2 {
+                match self.v2_gating_state(block.header.proposer_id, block.header.epoch) {
+                    V2GatingState::AllowNoEvidence | V2GatingState::AllowInsufficientEvidence => {
+                        (false, None)
+                    }
+                    V2GatingState::AllowScore(score) | V2GatingState::RejectScore(score) => {
+                        (true, Some(score))
+                    }
+                }
+            } else {
+                (
+                    true,
+                    Some(self.service_score_for_validator(block.header.proposer_id)),
+                )
+            }
+        } else {
+            (false, None)
+        };
+        self.consensus
+            .validate_block_basic(
+                &block,
+                self.ledger.snapshot().tip_hash,
+                service_score,
+                service_gating_enforced,
+                self.service_gating_threshold(),
+            )
+            .map_err(|error| anyhow!(error))?;
+
         let mut next_ledger = self.ledger.clone();
         next_ledger.apply_block(&block, self.crypto.as_ref())?;
         self.ledger = next_ledger;
@@ -1159,6 +1379,7 @@ impl NodeRunner {
                 metrics.blocks_proposed += 1;
             }
         });
+        self.maybe_broadcast_local_proposal_vote(&block)?;
         self.log_event(
             if local_proposal {
                 "block-proposed"
@@ -1174,6 +1395,456 @@ impl NodeRunner {
         )?;
         self.persist_metrics()?;
         Ok(BlockAcceptance::Accepted)
+    }
+
+    fn maybe_broadcast_vote_for_competing_block(&mut self, block: &Block) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+        if !self.can_vote_for_competing_block(block)? {
+            return Ok(());
+        }
+        self.maybe_broadcast_local_proposal_vote(block)
+    }
+
+    fn can_vote_for_competing_block(&self, block: &Block) -> Result<bool> {
+        let Some(mut parent_chain) = self.build_parent_chain_for_block(block)? else {
+            return Ok(false);
+        };
+        if let Some(locked_qc_hash) = self.highest_locked_qc_hash() {
+            let locked_in_chain = parent_chain
+                .iter()
+                .any(|ancestor| ancestor.block_hash == locked_qc_hash);
+            if !locked_in_chain {
+                return Ok(false);
+            }
+        }
+        let mut ledger =
+            LedgerState::replay_blocks(&self.genesis, &parent_chain, self.crypto.as_ref())?;
+        ledger.apply_block(block, self.crypto.as_ref())?;
+        parent_chain.push(block.clone());
+        let candidate_quality =
+            self.branch_quality_with_extra_tip_vote(&parent_chain, Some(block.block_hash));
+        let current_quality = self.branch_quality_with_extra_tip_vote(&self.blocks, None);
+        Ok(candidate_quality >= current_quality)
+    }
+
+    fn build_parent_chain_for_block(&self, block: &Block) -> Result<Option<Vec<Block>>> {
+        if block.header.block_number == 1 && block.header.parent_hash == empty_hash() {
+            return Ok(Some(Vec::new()));
+        }
+        Ok(self.build_chain_to_tip(block.header.parent_hash))
+    }
+
+    fn highest_locked_qc_hash(&self) -> Option<HashBytes> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|block| self.quorum_certificates.contains_key(&block.block_hash))
+            .map(|block| block.block_hash)
+    }
+
+    fn maybe_broadcast_local_proposal_vote(&mut self, block: &Block) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+        let vote = self.build_local_proposal_vote(block)?;
+        if self.import_proposal_vote(vote.clone())? {
+            self.network
+                .broadcast(&self.config.peers, ProtocolMessage::ProposalVote(vote))?;
+        }
+        Ok(())
+    }
+
+    fn build_local_proposal_vote(&self, block: &Block) -> Result<ProposalVote> {
+        let mut vote = ProposalVote {
+            validator_id: self.config.validator_id,
+            block_hash: block.block_hash,
+            block_number: block.header.block_number,
+            epoch: block.header.epoch,
+            slot: block.header.slot,
+            signature: Vec::new(),
+        };
+        let hash = proposal_vote_signing_hash(&vote);
+        vote.signature = self.crypto.sign(self.config.validator_id, &hash)?;
+        Ok(vote)
+    }
+
+    fn import_proposal_vote(&mut self, vote: ProposalVote) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("proposal votes require consensus_v2"));
+        }
+        self.validate_proposal_vote(&vote)?;
+        let inserted = self.store_proposal_vote(vote.clone())?;
+        if inserted {
+            if let Some(qc) = self.maybe_build_qc(vote.block_hash)? {
+                self.maybe_adopt_certified_branch(qc.block_hash)?;
+                self.network.broadcast(
+                    &self.config.peers,
+                    ProtocolMessage::QuorumCertificate(qc.clone()),
+                )?;
+                self.log_event(
+                    "qc-built",
+                    format!(
+                        "height {} slot {} block {:02x?} votes {}",
+                        qc.block_number,
+                        qc.slot,
+                        &qc.block_hash[..4],
+                        qc.votes.len()
+                    ),
+                )?;
+            } else {
+                self.maybe_adopt_vote_supported_branch(vote.block_hash)?;
+            }
+        }
+        Ok(inserted)
+    }
+
+    fn import_quorum_certificate(&mut self, qc: QuorumCertificate) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("quorum certificates require consensus_v2"));
+        }
+        let Some(block) = self.known_block(qc.block_hash) else {
+            return Err(anyhow!("quorum certificate references unknown block"));
+        };
+        if qc.block_number != block.header.block_number
+            || qc.epoch != block.header.epoch
+            || qc.slot != block.header.slot
+        {
+            return Err(anyhow!("quorum certificate metadata does not match block"));
+        }
+        if !qc.is_well_formed() {
+            return Err(anyhow!("malformed quorum certificate"));
+        }
+        let threshold = quorum_certificate_threshold(self.genesis.validators.len());
+        if qc.votes.len() < threshold {
+            return Err(anyhow!("quorum certificate does not meet threshold"));
+        }
+        if entangrid_types::quorum_certificate_vote_root(&qc.votes) != qc.vote_root {
+            return Err(anyhow!("quorum certificate vote root mismatch"));
+        }
+        for vote in &qc.votes {
+            self.validate_proposal_vote(vote)?;
+        }
+        for vote in qc.votes.iter().cloned() {
+            let _ = self.store_proposal_vote(vote)?;
+        }
+        if self.quorum_certificates.contains_key(&qc.block_hash) {
+            return Ok(false);
+        }
+        self.quorum_certificates.insert(qc.block_hash, qc.clone());
+        self.maybe_adopt_certified_branch(qc.block_hash)?;
+        self.log_event(
+            "qc-imported",
+            format!(
+                "height {} slot {} block {:02x?} votes {}",
+                qc.block_number,
+                qc.slot,
+                &qc.block_hash[..4],
+                qc.votes.len()
+            ),
+        )?;
+        Ok(true)
+    }
+
+    fn validate_proposal_vote(&self, vote: &ProposalVote) -> Result<()> {
+        let Some(block) = self.known_block(vote.block_hash) else {
+            return Err(anyhow!("proposal vote references unknown block"));
+        };
+        if vote.block_number != block.header.block_number
+            || vote.epoch != block.header.epoch
+            || vote.slot != block.header.slot
+        {
+            return Err(anyhow!("proposal vote metadata does not match block"));
+        }
+        if !self
+            .genesis
+            .validators
+            .iter()
+            .any(|validator| validator.validator_id == vote.validator_id)
+        {
+            return Err(anyhow!("proposal vote signer is not a validator"));
+        }
+        let hash = proposal_vote_signing_hash(vote);
+        let verified = self
+            .crypto
+            .verify(vote.validator_id, &hash, &vote.signature)?;
+        if !verified {
+            return Err(anyhow!("invalid proposal vote signature"));
+        }
+        Ok(())
+    }
+
+    fn store_proposal_vote(&mut self, vote: ProposalVote) -> Result<bool> {
+        for existing_votes in self.proposal_votes.values() {
+            if let Some(existing) = existing_votes.get(&vote.validator_id) {
+                if existing.epoch == vote.epoch
+                    && existing.slot == vote.slot
+                    && existing.block_hash != vote.block_hash
+                {
+                    return Err(anyhow!("conflicting proposal vote"));
+                }
+            }
+        }
+        let by_validator = self.proposal_votes.entry(vote.block_hash).or_default();
+        if let Some(existing) = by_validator.get(&vote.validator_id) {
+            if proposal_vote_signing_hash(existing) == proposal_vote_signing_hash(&vote)
+                && existing.signature == vote.signature
+            {
+                return Ok(false);
+            }
+            return Err(anyhow!("conflicting proposal vote"));
+        }
+        by_validator.insert(vote.validator_id, vote);
+        Ok(true)
+    }
+
+    fn maybe_build_qc(&mut self, block_hash: HashBytes) -> Result<Option<QuorumCertificate>> {
+        if let Some(existing) = self.quorum_certificates.get(&block_hash) {
+            return Ok(Some(existing.clone()));
+        }
+        let Some(block) = self.known_block(block_hash) else {
+            return Ok(None);
+        };
+        let block_number = block.header.block_number;
+        let epoch = block.header.epoch;
+        let slot = block.header.slot;
+        let Some(by_validator) = self.proposal_votes.get(&block_hash) else {
+            return Ok(None);
+        };
+        let threshold = quorum_certificate_threshold(self.genesis.validators.len());
+        if by_validator.len() < threshold {
+            return Ok(None);
+        }
+        let votes = by_validator.values().cloned().collect::<Vec<_>>();
+        let qc = QuorumCertificate {
+            block_hash,
+            block_number,
+            epoch,
+            slot,
+            vote_root: entangrid_types::quorum_certificate_vote_root(&votes),
+            votes,
+        };
+        if !qc.is_well_formed() {
+            return Err(anyhow!("built malformed quorum certificate"));
+        }
+        self.quorum_certificates.insert(block_hash, qc.clone());
+        Ok(Some(qc))
+    }
+
+    fn known_block(&self, block_hash: HashBytes) -> Option<&Block> {
+        self.blocks
+            .iter()
+            .find(|block| block.block_hash == block_hash)
+            .or_else(|| {
+                self.orphan_blocks
+                    .iter()
+                    .find(|block| block.block_hash == block_hash)
+            })
+    }
+
+    fn maybe_adopt_certified_branch(&mut self, candidate_tip_hash: HashBytes) -> Result<bool> {
+        let Some(candidate_chain) = self.build_chain_to_tip(candidate_tip_hash) else {
+            return Ok(false);
+        };
+        if candidate_chain.is_empty() {
+            return Ok(false);
+        }
+        if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
+            return Ok(false);
+        }
+        self.adopt_canonical_chain(candidate_chain, "certified-reorg")?;
+        Ok(true)
+    }
+
+    fn maybe_adopt_vote_supported_branch(&mut self, candidate_tip_hash: HashBytes) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
+            return Ok(false);
+        };
+        let Some(candidate_chain) = self.build_chain_to_tip(candidate_tip_hash) else {
+            return Ok(false);
+        };
+        if !candidate_chain
+            .iter()
+            .any(|block| block.block_hash == locked_qc_hash)
+        {
+            return Ok(false);
+        }
+        if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
+            return Ok(false);
+        }
+        self.adopt_canonical_chain(candidate_chain, "vote-supported-branch-adopted")?;
+        Ok(true)
+    }
+
+    fn maybe_adopt_preferred_competing_branch(&mut self, block: &Block) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
+            return Ok(false);
+        };
+        let Some(mut candidate_chain) = self.build_parent_chain_for_block(block)? else {
+            return Ok(false);
+        };
+        if !candidate_chain
+            .iter()
+            .any(|ancestor| ancestor.block_hash == locked_qc_hash)
+        {
+            return Ok(false);
+        }
+        let mut candidate_ledger =
+            LedgerState::replay_blocks(&self.genesis, &candidate_chain, self.crypto.as_ref())?;
+        candidate_ledger.apply_block(block, self.crypto.as_ref())?;
+        candidate_chain.push(block.clone());
+        if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
+            return Ok(false);
+        }
+        self.adopt_canonical_chain(candidate_chain, "preferred-branch-adopted")?;
+        Ok(true)
+    }
+
+    fn build_chain_to_tip(&self, tip_hash: HashBytes) -> Option<Vec<Block>> {
+        let mut by_hash = BTreeMap::new();
+        for block in self.blocks.iter().chain(self.orphan_blocks.iter()) {
+            by_hash.insert(block.block_hash, block.clone());
+        }
+
+        let mut chain = Vec::new();
+        let mut current_hash = tip_hash;
+        let mut visited = BTreeSet::new();
+        while current_hash != empty_hash() {
+            if !visited.insert(current_hash) {
+                return None;
+            }
+            let block = by_hash.get(&current_hash)?.clone();
+            current_hash = block.header.parent_hash;
+            chain.push(block);
+        }
+        chain.reverse();
+
+        let mut expected_parent = empty_hash();
+        let mut expected_height = 1u64;
+        for block in &chain {
+            if block.header.parent_hash != expected_parent
+                || block.header.block_number != expected_height
+            {
+                return None;
+            }
+            expected_parent = block.block_hash;
+            expected_height += 1;
+        }
+        Some(chain)
+    }
+
+    fn compare_branch_quality(
+        &self,
+        candidate_chain: &[Block],
+        current_chain: &[Block],
+    ) -> Ordering {
+        let candidate_certified_height = self.latest_certified_height(candidate_chain);
+        let current_certified_height = self.latest_certified_height(current_chain);
+        let certified_cmp = candidate_certified_height.cmp(&current_certified_height);
+        if certified_cmp != Ordering::Equal {
+            return certified_cmp;
+        }
+        if candidate_certified_height > 0 {
+            return Ordering::Equal;
+        }
+        let candidate_quality = self.branch_quality_with_extra_tip_vote(candidate_chain, None);
+        let current_quality = self.branch_quality_with_extra_tip_vote(current_chain, None);
+        candidate_quality.cmp(&current_quality)
+    }
+
+    fn latest_certified_height(&self, chain: &[Block]) -> u64 {
+        chain
+            .iter()
+            .rev()
+            .find(|block| self.quorum_certificates.contains_key(&block.block_hash))
+            .map(|block| block.header.block_number)
+            .unwrap_or(0)
+    }
+
+    fn branch_quality_with_extra_tip_vote(
+        &self,
+        chain: &[Block],
+        extra_tip_vote_for: Option<HashBytes>,
+    ) -> (u64, u64, usize, u64, HashBytes) {
+        let latest_certified_height = self.latest_certified_height(chain);
+        let tip = chain.last();
+        let tip_vote_count = tip
+            .map(|block| {
+                let existing = self
+                    .proposal_votes
+                    .get(&block.block_hash)
+                    .map(|votes| votes.len())
+                    .unwrap_or(0);
+                let receives_extra_local_vote = extra_tip_vote_for == Some(block.block_hash)
+                    && !self
+                        .proposal_votes
+                        .get(&block.block_hash)
+                        .map(|votes| votes.contains_key(&self.config.validator_id))
+                        .unwrap_or(false);
+                existing + usize::from(receives_extra_local_vote)
+            })
+            .unwrap_or(0);
+        (
+            latest_certified_height,
+            tip.map(|block| block.header.block_number).unwrap_or(0),
+            tip_vote_count,
+            tip.map(|block| block.header.slot).unwrap_or(0),
+            tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
+        )
+    }
+
+    fn adopt_canonical_chain(
+        &mut self,
+        candidate_chain: Vec<Block>,
+        event_name: &str,
+    ) -> Result<()> {
+        let ledger =
+            LedgerState::replay_blocks(&self.genesis, &candidate_chain, self.crypto.as_ref())?;
+        let candidate_hashes: BTreeSet<_> = candidate_chain
+            .iter()
+            .map(|block| block.block_hash)
+            .collect();
+        let orphan_blocks = self
+            .blocks
+            .iter()
+            .chain(self.orphan_blocks.iter())
+            .filter(|block| !candidate_hashes.contains(&block.block_hash))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        self.ledger = ledger;
+        self.blocks = candidate_chain;
+        self.orphan_blocks = orphan_blocks;
+        let receipts_to_import = self
+            .blocks
+            .iter()
+            .flat_map(|block| block.commitment_receipts.clone())
+            .collect::<Vec<_>>();
+        for receipt in receipts_to_import {
+            let _ = self.persist_receipt(receipt)?;
+        }
+        self.rebuild_seen_sets();
+        self.storage.write_snapshot(self.ledger.snapshot())?;
+        self.storage
+            .overwrite_json_lines(&self.storage.blocks_path, &self.blocks)?;
+        self.storage
+            .overwrite_json_lines(&self.storage.orphan_path, &self.orphan_blocks)?;
+        self.log_event(
+            event_name,
+            format!(
+                "adopted tip {:02x?} height {}",
+                &self.ledger.snapshot().tip_hash[..4],
+                self.ledger.snapshot().height
+            ),
+        )?;
+        Ok(())
     }
 
     fn validate_commitment(
@@ -1435,6 +2106,65 @@ impl NodeRunner {
             return;
         }
 
+        if self.config.feature_flags.consensus_v2 {
+            let mut local_service_epoch = 0;
+            let previous_scores = self.latest_service_scores.clone();
+            let previous_counters = self.latest_service_counters.clone();
+            let previous_completed_epoch = self.snapshot_metrics().last_completed_service_epoch;
+            for validator_id in validator_ids {
+                let aggregate = self
+                    .latest_service_aggregate_before_epoch(validator_id, current_epoch)
+                    .cloned();
+                if let Some(aggregate) = aggregate {
+                    let score = self.consensus.compute_service_score_from_aggregate(
+                        &aggregate,
+                        &self.config.feature_flags.service_score_weights,
+                    );
+                    self.latest_service_scores.insert(validator_id, score);
+                    if validator_id == self.config.validator_id {
+                        local_service_epoch = aggregate.epoch;
+                    }
+                    self.latest_service_counters
+                        .insert(validator_id, aggregate.aggregate_counters);
+                } else {
+                    self.latest_service_scores.insert(
+                        validator_id,
+                        previous_scores.get(&validator_id).copied().unwrap_or(1.0),
+                    );
+                    self.latest_service_counters.insert(
+                        validator_id,
+                        previous_counters
+                            .get(&validator_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    );
+                    if validator_id == self.config.validator_id {
+                        local_service_epoch = previous_completed_epoch;
+                    }
+                }
+            }
+            let scores = self.latest_service_scores.clone();
+            let local_score = scores
+                .get(&self.config.validator_id)
+                .copied()
+                .unwrap_or(0.0);
+            let local_counters = self.local_service_counters();
+            self.update_metrics(|metrics| {
+                metrics.relay_scores = scores;
+                metrics.last_local_service_score = local_score;
+                metrics.service_gating_threshold = self.service_gating_threshold();
+                metrics.last_completed_service_epoch = local_service_epoch;
+                metrics.service_gating_start_epoch =
+                    self.config.feature_flags.service_gating_start_epoch;
+                metrics.service_score_window_epochs =
+                    self.config.feature_flags.service_score_window_epochs;
+                metrics.service_score_weights =
+                    self.config.feature_flags.service_score_weights.clone();
+                metrics.last_local_service_counters = local_counters;
+            });
+            return;
+        }
+
         let window_epochs = self.config.feature_flags.service_score_window_epochs.max(1);
         let earliest_epoch = completed_epoch.saturating_sub(window_epochs.saturating_sub(1));
         self.prune_penalty_observations(earliest_epoch);
@@ -1478,6 +2208,49 @@ impl NodeRunner {
             metrics.service_score_weights = self.config.feature_flags.service_score_weights.clone();
             metrics.last_local_service_counters = local_counters;
         });
+    }
+
+    fn latest_service_aggregate_before_epoch(
+        &self,
+        validator_id: ValidatorId,
+        current_epoch: Epoch,
+    ) -> Option<&ServiceAggregate> {
+        if current_epoch == 0 {
+            return None;
+        }
+        self.service_aggregates
+            .range((validator_id, 0)..=(validator_id, current_epoch - 1))
+            .next_back()
+            .map(|(_, aggregate)| aggregate)
+    }
+
+    fn v2_gating_state(&self, validator_id: ValidatorId, epoch: Epoch) -> V2GatingState {
+        if epoch == 0 {
+            return V2GatingState::AllowNoEvidence;
+        }
+
+        let prior_epoch = epoch - 1;
+        if let Some(aggregate) = self.service_aggregates.get(&(validator_id, prior_epoch)) {
+            if let Some(score) = self.consensus.confirmed_service_score_for_epoch(
+                Some(aggregate),
+                &self.config.feature_flags.service_score_weights,
+                epoch,
+            ) {
+                if score < self.service_gating_threshold() {
+                    return V2GatingState::RejectScore(score);
+                }
+                return V2GatingState::AllowScore(score);
+            }
+        }
+
+        if self
+            .latest_service_aggregate_before_epoch(validator_id, epoch)
+            .is_some()
+        {
+            V2GatingState::AllowInsufficientEvidence
+        } else {
+            V2GatingState::AllowNoEvidence
+        }
     }
 
     fn service_score_for_validator(&self, validator_id: ValidatorId) -> f64 {
@@ -1684,11 +2457,282 @@ impl NodeRunner {
         self.seen_blocks = self.blocks.iter().map(|block| block.block_hash).collect();
         self.seen_receipts = self.receipts.iter().map(canonical_hash).collect();
         self.seen_receipt_events = self.receipts.iter().map(receipt_event_hash).collect();
+        self.seen_service_attestations = self
+            .service_attestations
+            .values()
+            .flat_map(|by_member| by_member.values().map(service_attestation_signing_hash))
+            .collect();
+        self.seen_service_aggregates = self
+            .service_aggregates
+            .values()
+            .map(canonical_hash)
+            .collect();
         for block in &self.blocks {
             for transaction in &block.transactions {
                 self.seen_transactions.insert(transaction.tx_hash);
             }
         }
+    }
+
+    fn restore_service_evidence(
+        &mut self,
+        attestations: Vec<ServiceAttestation>,
+        aggregates: Vec<ServiceAggregate>,
+    ) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+        for attestation in attestations {
+            self.validate_service_attestation(&attestation)?;
+            self.insert_service_attestation(attestation, false)?;
+        }
+        for aggregate in aggregates {
+            self.validate_service_aggregate(&aggregate)?;
+            self.insert_service_aggregate(aggregate, false)?;
+        }
+        Ok(())
+    }
+
+    fn emit_service_attestations_for_completed_epoch(&mut self, epoch: Epoch) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(());
+        }
+
+        let validator_ids: Vec<_> = self
+            .genesis
+            .validators
+            .iter()
+            .map(|validator| validator.validator_id)
+            .collect();
+        for subject_validator_id in validator_ids {
+            if subject_validator_id == self.config.validator_id {
+                continue;
+            }
+            let committee = self
+                .consensus
+                .service_committee_for(epoch, subject_validator_id);
+            if !committee.contains(&self.config.validator_id) {
+                continue;
+            }
+            let attestation = self.build_local_service_attestation(subject_validator_id, epoch)?;
+            if self.import_service_attestation(attestation.clone())? {
+                self.update_metrics(|metrics| {
+                    metrics.service_attestations_emitted += 1;
+                });
+                self.network.broadcast(
+                    &self.config.peers,
+                    ProtocolMessage::ServiceAttestation(attestation),
+                )?;
+            }
+            self.maybe_publish_service_aggregate(subject_validator_id, epoch)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_recent_service_attestations(&mut self, current_epoch: Epoch) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 || current_epoch <= 2 {
+            return Ok(());
+        }
+        let backfill_epochs = self.config.feature_flags.service_score_window_epochs.max(1);
+        let last_attestable_epoch = current_epoch.saturating_sub(3);
+        let first_attestable_epoch =
+            last_attestable_epoch.saturating_sub(backfill_epochs.saturating_sub(1));
+        for epoch in first_attestable_epoch..=last_attestable_epoch {
+            self.emit_service_attestations_for_completed_epoch(epoch)?;
+        }
+        Ok(())
+    }
+
+    fn build_local_service_attestation(
+        &self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<ServiceAttestation> {
+        let counters = self.consensus.counters_for_validator_from_observer(
+            subject_validator_id,
+            self.config.validator_id,
+            epoch,
+            &self.receipts,
+        );
+        let mut attestation = ServiceAttestation {
+            subject_validator_id,
+            committee_member_id: self.config.validator_id,
+            epoch,
+            counters,
+            signature: Vec::new(),
+        };
+        let hash = service_attestation_signing_hash(&attestation);
+        attestation.signature = self.crypto.sign(self.config.validator_id, &hash)?;
+        Ok(attestation)
+    }
+
+    fn import_service_attestation(&mut self, attestation: ServiceAttestation) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("service attestations require consensus_v2"));
+        }
+        self.validate_service_attestation(&attestation)?;
+        self.store_service_attestation(attestation)
+    }
+
+    fn validate_service_attestation(&self, attestation: &ServiceAttestation) -> Result<()> {
+        let committee = self
+            .consensus
+            .service_committee_for(attestation.epoch, attestation.subject_validator_id);
+        if !committee.contains(&attestation.committee_member_id) {
+            return Err(anyhow!(
+                "service attestation signer is not in the service committee"
+            ));
+        }
+        let hash = service_attestation_signing_hash(attestation);
+        let verified = self.crypto.verify(
+            attestation.committee_member_id,
+            &hash,
+            &attestation.signature,
+        )?;
+        if !verified {
+            return Err(anyhow!("invalid service attestation signature"));
+        }
+        Ok(())
+    }
+
+    fn store_service_attestation(&mut self, attestation: ServiceAttestation) -> Result<bool> {
+        self.insert_service_attestation(attestation, true)
+    }
+
+    fn insert_service_attestation(
+        &mut self,
+        attestation: ServiceAttestation,
+        persist: bool,
+    ) -> Result<bool> {
+        let key = (attestation.subject_validator_id, attestation.epoch);
+        let attestation_id = service_attestation_signing_hash(&attestation);
+        if self.seen_service_attestations.contains(&attestation_id) {
+            return Ok(false);
+        }
+        let by_member = self.service_attestations.entry(key).or_default();
+        if let Some(existing) = by_member.get(&attestation.committee_member_id) {
+            if service_attestation_signing_hash(existing) == attestation_id {
+                return Ok(false);
+            }
+            if !service_counters_dominate(&attestation.counters, &existing.counters) {
+                return Err(anyhow!("conflicting service attestation"));
+            }
+        }
+        by_member.insert(attestation.committee_member_id, attestation.clone());
+        self.seen_service_attestations.insert(attestation_id);
+        if persist {
+            self.storage
+                .append_json_line(&self.storage.service_attestations_path, &attestation)?;
+        }
+        Ok(true)
+    }
+
+    fn maybe_publish_service_aggregate(
+        &mut self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        let Some(aggregate) = self.build_service_aggregate(subject_validator_id, epoch)? else {
+            return Ok(false);
+        };
+        if self.import_service_aggregate(aggregate.clone())? {
+            self.update_metrics(|metrics| {
+                metrics.service_aggregates_published += 1;
+            });
+            self.network.broadcast(
+                &self.config.peers,
+                ProtocolMessage::ServiceAggregate(aggregate),
+            )?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn build_service_aggregate(
+        &self,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+    ) -> Result<Option<ServiceAggregate>> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Ok(None);
+        }
+        let Some(by_member) = self
+            .service_attestations
+            .get(&(subject_validator_id, epoch))
+        else {
+            return Ok(None);
+        };
+        let attestations = by_member.values().cloned().collect::<Vec<_>>();
+        let aggregate = ServiceAggregate {
+            subject_validator_id,
+            epoch,
+            attestation_root: entangrid_types::service_attestation_root(&attestations),
+            aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
+            attestations,
+        };
+        if self
+            .consensus
+            .validate_service_aggregate(&aggregate)
+            .is_err()
+        {
+            return Ok(None);
+        }
+        Ok(Some(aggregate))
+    }
+
+    fn import_service_aggregate(&mut self, aggregate: ServiceAggregate) -> Result<bool> {
+        if !self.config.feature_flags.consensus_v2 {
+            return Err(anyhow!("service aggregates require consensus_v2"));
+        }
+        self.validate_service_aggregate(&aggregate)?;
+        self.store_service_aggregate(aggregate)
+    }
+
+    fn validate_service_aggregate(&self, aggregate: &ServiceAggregate) -> Result<()> {
+        self.consensus
+            .validate_service_aggregate(aggregate)
+            .map_err(|error| anyhow!(error))?;
+        for attestation in &aggregate.attestations {
+            self.validate_service_attestation(attestation)?;
+        }
+        Ok(())
+    }
+
+    fn store_service_aggregate(&mut self, aggregate: ServiceAggregate) -> Result<bool> {
+        self.insert_service_aggregate(aggregate, true)
+    }
+
+    fn insert_service_aggregate(
+        &mut self,
+        aggregate: ServiceAggregate,
+        persist: bool,
+    ) -> Result<bool> {
+        let key = (aggregate.subject_validator_id, aggregate.epoch);
+        let aggregate_id = canonical_hash(&aggregate);
+        if self.seen_service_aggregates.contains(&aggregate_id) {
+            return Ok(false);
+        }
+        if let Some(existing) = self.service_aggregates.get(&key) {
+            if canonical_hash(existing) == aggregate_id {
+                return Ok(false);
+            }
+            if !service_counters_dominate(
+                &aggregate.aggregate_counters,
+                &existing.aggregate_counters,
+            ) {
+                return Err(anyhow!("conflicting service aggregate"));
+            }
+        }
+        self.service_aggregates.insert(key, aggregate.clone());
+        self.seen_service_aggregates.insert(aggregate_id);
+        if persist {
+            self.storage
+                .append_json_line(&self.storage.service_aggregates_path, &aggregate)?;
+        }
+        Ok(true)
     }
 
     fn record_failed_session(
@@ -1773,6 +2817,10 @@ impl NodeRunner {
 
     fn log_current_service_score(&self, epoch: Epoch) -> Result<()> {
         let counters = self.local_service_counters();
+        let v2_completed_epoch = self
+            .latest_service_aggregate_before_epoch(self.config.validator_id, epoch)
+            .map(|aggregate| aggregate.epoch)
+            .unwrap_or(epoch.saturating_sub(1));
         if epoch < self.config.feature_flags.service_gating_start_epoch {
             return self.log_event(
                 "service-score",
@@ -1802,7 +2850,11 @@ impl NodeRunner {
             "service-score",
             format!(
                 "epoch {epoch} completed_epoch {} local_score {:.3} threshold {:.3} window {} weights [{:.2},{:.2},{:.2},-{:.2}] uptime {}/{} timely {}/{} peers {}/{} failed_sessions {} invalid_receipts {}",
-                epoch.saturating_sub(1),
+                if self.config.feature_flags.consensus_v2 {
+                    v2_completed_epoch
+                } else {
+                    epoch.saturating_sub(1)
+                },
                 self.service_score_for_validator(self.config.validator_id),
                 self.service_gating_threshold(),
                 self.config.feature_flags.service_score_window_epochs,
@@ -1829,6 +2881,18 @@ fn receipt_signing_hash(receipt: &RelayReceipt) -> HashBytes {
     canonical_hash(&unsigned)
 }
 
+fn service_attestation_signing_hash(attestation: &ServiceAttestation) -> HashBytes {
+    let mut unsigned = attestation.clone();
+    unsigned.signature.clear();
+    canonical_hash(&unsigned)
+}
+
+fn proposal_vote_signing_hash(vote: &ProposalVote) -> HashBytes {
+    let mut unsigned = vote.clone();
+    unsigned.signature.clear();
+    canonical_hash(&unsigned)
+}
+
 fn receipt_event_hash(receipt: &RelayReceipt) -> HashBytes {
     canonical_hash(&(
         receipt.epoch,
@@ -1845,13 +2909,19 @@ fn classify_peer_message(payload: &ProtocolMessage) -> Option<PeerMessageClass> 
     match payload {
         ProtocolMessage::SyncStatus { .. }
         | ProtocolMessage::SyncRequest { .. }
+        | ProtocolMessage::CertifiedSyncRequest(_)
         | ProtocolMessage::ReceiptFetch { .. } => Some(PeerMessageClass::SyncControl),
         ProtocolMessage::TransactionBroadcast(_) => Some(PeerMessageClass::TransactionGossip),
         ProtocolMessage::RelayReceipt(_) => Some(PeerMessageClass::ReceiptGossip),
         ProtocolMessage::BlockProposal(_)
+        | ProtocolMessage::ProposalVote(_)
+        | ProtocolMessage::QuorumCertificate(_)
         | ProtocolMessage::SyncResponse { .. }
         | ProtocolMessage::SyncBlocks { .. }
+        | ProtocolMessage::CertifiedSyncResponse(_)
         | ProtocolMessage::HeartbeatPulse(_)
+        | ProtocolMessage::ServiceAttestation(_)
+        | ProtocolMessage::ServiceAggregate(_)
         | ProtocolMessage::ReceiptResponse { .. } => None,
     }
 }
@@ -1862,6 +2932,24 @@ fn peer_message_class_label(message_class: PeerMessageClass) -> &'static str {
         PeerMessageClass::TransactionGossip => "tx-gossip",
         PeerMessageClass::ReceiptGossip => "receipt-gossip",
     }
+}
+
+fn quorum_certificate_threshold(validator_count: usize) -> usize {
+    if validator_count == 0 {
+        return 0;
+    }
+    ((validator_count * 2) / 3) + 1
+}
+
+fn service_counters_dominate(candidate: &ServiceCounters, existing: &ServiceCounters) -> bool {
+    candidate.total_windows == existing.total_windows
+        && candidate.expected_deliveries == existing.expected_deliveries
+        && candidate.expected_peers == existing.expected_peers
+        && candidate.uptime_windows >= existing.uptime_windows
+        && candidate.timely_deliveries >= existing.timely_deliveries
+        && candidate.distinct_peers >= existing.distinct_peers
+        && candidate.failed_sessions >= existing.failed_sessions
+        && candidate.invalid_receipts >= existing.invalid_receipts
 }
 
 fn allow_peer_message_in_window(
@@ -2317,6 +3405,8 @@ struct Storage {
     processed_dir: PathBuf,
     blocks_path: PathBuf,
     receipts_path: PathBuf,
+    service_attestations_path: PathBuf,
+    service_aggregates_path: PathBuf,
     orphan_path: PathBuf,
     snapshot_path: PathBuf,
     log_path: PathBuf,
@@ -2331,6 +3421,8 @@ impl Storage {
             processed_dir: data_dir.join("processed"),
             blocks_path: data_dir.join(BLOCKS_FILE),
             receipts_path: data_dir.join(RECEIPTS_FILE),
+            service_attestations_path: data_dir.join(SERVICE_ATTESTATIONS_FILE),
+            service_aggregates_path: data_dir.join(SERVICE_AGGREGATES_FILE),
             orphan_path: data_dir.join(ORPHANS_FILE),
             snapshot_path: data_dir.join(SNAPSHOT_FILE),
             log_path: PathBuf::from(&config.log_path),
@@ -2352,6 +3444,14 @@ impl Storage {
 
     fn load_receipts(&self) -> Result<Vec<RelayReceipt>> {
         self.load_json_lines(&self.receipts_path)
+    }
+
+    fn load_service_attestations(&self) -> Result<Vec<ServiceAttestation>> {
+        self.load_json_lines(&self.service_attestations_path)
+    }
+
+    fn load_service_aggregates(&self) -> Result<Vec<ServiceAggregate>> {
+        self.load_json_lines(&self.service_aggregates_path)
     }
 
     fn load_snapshot(&self) -> Result<Option<StateSnapshot>> {
@@ -2460,13 +3560,20 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use entangrid_crypto::{DeterministicCryptoBackend, Signer};
-    use entangrid_types::{
-        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, empty_hash,
-        validator_account,
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Mutex},
+        time::Duration,
     };
+
+    use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend, Signer};
+    use entangrid_network::{NetworkEvent, spawn_network};
+    use entangrid_types::{
+        FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PeerConfig, ProposalVote,
+        ProtocolMessage, ServiceAggregate, ServiceAttestation, ServiceCounters, SignedTransaction,
+        Transaction, ValidatorConfig, empty_hash, validator_account,
+    };
+    use tokio::{sync::mpsc, time::timeout};
 
     use super::*;
 
@@ -2562,6 +3669,1405 @@ mod tests {
         }
     }
 
+    fn valid_empty_block_on_parent(
+        genesis: &GenesisConfig,
+        parent_hash: HashBytes,
+        block_number: u64,
+        proposer_id: ValidatorId,
+        min_slot: u64,
+    ) -> Block {
+        let crypto = DeterministicCryptoBackend::from_genesis(genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let ledger = LedgerState::from_genesis(genesis);
+        let slot = (min_slot..(min_slot + 50))
+            .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = Vec::new();
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number,
+            parent_hash,
+            slot,
+            epoch,
+            proposer_id,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+            block_hash,
+        }
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "entangrid-node-{label}-{}-{}",
+            std::process::id(),
+            now_unix_millis()
+        ))
+    }
+
+    fn reserve_local_address() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        address
+    }
+
+    fn sample_node_config(
+        validator_id: ValidatorId,
+        listen_address: String,
+        peers: Vec<PeerConfig>,
+        data_label: &str,
+    ) -> NodeConfig {
+        let data_dir = unique_test_dir(data_label);
+        NodeConfig {
+            validator_id,
+            data_dir: data_dir.display().to_string(),
+            genesis_path: data_dir.join("genesis.toml").display().to_string(),
+            listen_address,
+            peers,
+            log_path: data_dir.join("events.log").display().to_string(),
+            metrics_path: data_dir.join("metrics.json").display().to_string(),
+            feature_flags: FeatureFlags {
+                enable_receipts: true,
+                enable_service_gating: true,
+                consensus_v2: true,
+                service_gating_start_epoch: 1,
+                service_gating_threshold: entangrid_types::default_service_gating_threshold(),
+                service_score_window_epochs: entangrid_types::default_service_score_window_epochs(),
+                service_score_weights: entangrid_types::default_service_score_weights(),
+                ..FeatureFlags::default()
+            },
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: false,
+        }
+    }
+
+    async fn spawn_test_network(
+        validator_id: ValidatorId,
+        listen_address: String,
+        peers: Vec<PeerConfig>,
+        genesis: &GenesisConfig,
+    ) -> (
+        Arc<dyn CryptoBackend>,
+        NetworkHandle,
+        Arc<Mutex<NodeMetrics>>,
+        mpsc::UnboundedReceiver<NetworkEvent>,
+    ) {
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_genesis(genesis));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id,
+            ..NodeMetrics::default()
+        }));
+        let (network_event_tx, network_event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            validator_id,
+            listen_address,
+            peers,
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            Arc::clone(&metrics),
+            network_event_tx,
+        )
+        .await
+        .unwrap();
+        (crypto, network, metrics, network_event_rx)
+    }
+
+    async fn build_test_runner(
+        validator_id: ValidatorId,
+        config: NodeConfig,
+        genesis: GenesisConfig,
+    ) -> NodeRunner {
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let ledger = LedgerState::from_genesis(&genesis);
+        let (crypto, network, metrics, network_event_rx) = spawn_test_network(
+            validator_id,
+            config.listen_address.clone(),
+            config.peers.clone(),
+            &genesis,
+        )
+        .await;
+        let storage = Storage::new(&config).unwrap();
+        storage.init().unwrap();
+        NodeRunner {
+            config,
+            genesis: genesis.clone(),
+            consensus,
+            crypto,
+            storage,
+            network,
+            network_event_rx,
+            metrics,
+            ledger,
+            blocks: Vec::new(),
+            receipts: Vec::new(),
+            orphan_blocks: Vec::new(),
+            mempool: BTreeMap::new(),
+            seen_transactions: BTreeSet::new(),
+            seen_blocks: BTreeSet::new(),
+            seen_receipts: BTreeSet::new(),
+            seen_receipt_events: BTreeSet::new(),
+            service_attestations: BTreeMap::new(),
+            service_aggregates: BTreeMap::new(),
+            proposal_votes: BTreeMap::new(),
+            quorum_certificates: BTreeMap::new(),
+            seen_service_attestations: BTreeSet::new(),
+            seen_service_aggregates: BTreeSet::new(),
+            last_processed_slot: None,
+            last_logged_epoch: None,
+            last_heartbeat_slot: None,
+            last_proposed_slot: None,
+            latest_service_scores: BTreeMap::new(),
+            latest_service_counters: BTreeMap::new(),
+            failed_sessions: 0,
+            invalid_receipts: 0,
+            observed_failed_sessions: BTreeSet::new(),
+            observed_successful_sessions: BTreeSet::new(),
+            observed_invalid_receipts: BTreeMap::new(),
+            known_live_peers: BTreeSet::new(),
+            last_sync_request_served: BTreeMap::new(),
+            peer_sync_status: BTreeMap::new(),
+            peer_sync_repair_failures: BTreeMap::new(),
+            peer_message_windows: BTreeMap::new(),
+        }
+    }
+
+    fn signed_service_attestation(
+        crypto: &dyn CryptoBackend,
+        subject_validator_id: ValidatorId,
+        committee_member_id: ValidatorId,
+        epoch: Epoch,
+        counters: ServiceCounters,
+    ) -> ServiceAttestation {
+        let mut attestation = ServiceAttestation {
+            subject_validator_id,
+            committee_member_id,
+            epoch,
+            counters,
+            signature: Vec::new(),
+        };
+        let hash = service_attestation_signing_hash(&attestation);
+        attestation.signature = crypto.sign(committee_member_id, &hash).unwrap();
+        attestation
+    }
+
+    fn service_aggregate_for_subject(
+        crypto: &dyn CryptoBackend,
+        consensus: &ConsensusEngine,
+        subject_validator_id: ValidatorId,
+        epoch: Epoch,
+        counters: ServiceCounters,
+    ) -> ServiceAggregate {
+        let attestations = consensus
+            .service_committee_for(epoch, subject_validator_id)
+            .into_iter()
+            .map(|committee_member_id| {
+                signed_service_attestation(
+                    crypto,
+                    subject_validator_id,
+                    committee_member_id,
+                    epoch,
+                    counters.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ServiceAggregate {
+            subject_validator_id,
+            epoch,
+            attestation_root: entangrid_types::service_attestation_root(&attestations),
+            aggregate_counters: entangrid_types::aggregate_service_counters(&attestations),
+            attestations,
+        }
+    }
+
+    fn signed_proposal_vote(
+        crypto: &dyn CryptoBackend,
+        validator_id: ValidatorId,
+        block: &Block,
+    ) -> ProposalVote {
+        let mut vote = ProposalVote {
+            validator_id,
+            block_hash: block.block_hash,
+            block_number: block.header.block_number,
+            epoch: block.header.epoch,
+            slot: block.header.slot,
+            signature: Vec::new(),
+        };
+        let hash = proposal_vote_signing_hash(&vote);
+        vote.signature = crypto.sign(validator_id, &hash).unwrap();
+        vote
+    }
+
+    async fn recv_protocol_message(
+        events: &mut mpsc::UnboundedReceiver<NetworkEvent>,
+    ) -> ProtocolMessage {
+        loop {
+            let event = timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .expect("peer network should stay alive");
+            if let NetworkEvent::Received { payload, .. } = event {
+                return payload;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committee_member_emits_lagged_attestation_after_reconciliation_in_v2_mode() {
+        let mut genesis = sample_genesis();
+        genesis.genesis_time_unix_millis = now_unix_millis()
+            .saturating_sub(genesis.slots_per_epoch * genesis.slot_duration_millis * 3);
+        let local_address = reserve_local_address();
+        let peer_address = reserve_local_address();
+        let peer = PeerConfig {
+            validator_id: 2,
+            address: peer_address.clone(),
+        };
+        let config = sample_node_config(1, local_address, vec![peer], "attestation-emission");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let expected_subjects: BTreeSet<_> = genesis
+            .validators
+            .iter()
+            .map(|validator| validator.validator_id)
+            .filter(|subject_validator_id| *subject_validator_id != 1)
+            .filter(|subject_validator_id| {
+                runner
+                    .consensus
+                    .service_committee_for(0, *subject_validator_id)
+                    .contains(&1)
+            })
+            .collect();
+
+        runner.process_slot_tick().await.unwrap();
+
+        let mut seen_subjects = BTreeSet::new();
+        while seen_subjects.len() < expected_subjects.len() {
+            match recv_protocol_message(&mut peer_events).await {
+                ProtocolMessage::ServiceAttestation(attestation) => {
+                    assert_eq!(attestation.epoch, 0);
+                    assert_eq!(attestation.committee_member_id, 1);
+                    seen_subjects.insert(attestation.subject_validator_id);
+                }
+                ProtocolMessage::ReceiptFetch { .. } | ProtocolMessage::HeartbeatPulse(_) => {}
+                other => panic!("expected service attestation, got {other:?}"),
+            }
+        }
+        assert_eq!(seen_subjects, expected_subjects);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aggregate_import_updates_local_v2_service_score_view() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-view");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 2);
+
+        let counters = ServiceCounters {
+            uptime_windows: 5,
+            total_windows: 5,
+            timely_deliveries: 5,
+            expected_deliveries: 5,
+            distinct_peers: 2,
+            expected_peers: 2,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        };
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            counters,
+        );
+
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+        runner.refresh_service_scores();
+
+        let expected_score = runner.consensus.compute_service_score_from_aggregate(
+            &aggregate,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert_eq!(runner.service_score_for_validator(1), expected_score);
+        assert_eq!(
+            runner.local_service_counters(),
+            aggregate.aggregate_counters
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proposal_votes_build_qc_at_supermajority_threshold() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-assembly");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner.accept_block(block.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(runner.quorum_certificates.get(&block.block_hash).is_none());
+
+        let vote_2 = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
+        let vote_3 = signed_proposal_vote(runner.crypto.as_ref(), 3, &block);
+
+        assert!(runner.import_proposal_vote(vote_2).unwrap());
+        assert!(runner.quorum_certificates.get(&block.block_hash).is_none());
+        assert!(runner.import_proposal_vote(vote_3).unwrap());
+
+        let qc = runner.quorum_certificates.get(&block.block_hash).unwrap();
+        assert_eq!(qc.block_hash, block.block_hash);
+        assert_eq!(qc.block_number, block.header.block_number);
+        assert_eq!(qc.slot, block.header.slot);
+        assert_eq!(qc.epoch, block.header.epoch);
+        assert_eq!(qc.votes.len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certified_competing_branch_reorgs_uncertified_current_tip() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-reorg");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_tip = first_valid_block(&genesis);
+        let competing_tip =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
+
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+        assert_eq!(runner.blocks.len(), 1);
+        assert_eq!(runner.blocks[0].block_hash, competing_tip.block_hash);
+        assert!(
+            runner
+                .orphan_blocks
+                .iter()
+                .any(|block| block.block_hash == current_tip.block_hash)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn imported_quorum_certificate_reorgs_competing_branch() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-import");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_tip = first_valid_block(&genesis);
+        let competing_tip =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+
+        let votes = vec![
+            signed_proposal_vote(runner.crypto.as_ref(), 2, &competing_tip),
+            signed_proposal_vote(runner.crypto.as_ref(), 3, &competing_tip),
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &competing_tip),
+        ];
+        let qc = QuorumCertificate {
+            block_hash: competing_tip.block_hash,
+            block_number: competing_tip.header.block_number,
+            epoch: competing_tip.header.epoch,
+            slot: competing_tip.header.slot,
+            vote_root: entangrid_types::quorum_certificate_vote_root(&votes),
+            votes,
+        };
+
+        assert!(runner.import_quorum_certificate(qc).unwrap());
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayable_branch_stays_orphan_until_certified_in_v2() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "prefer-branch");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+        let current_tip = build_child(2, certified_root.header.slot + 1);
+        let competing_tip = build_child(3, current_tip.header.slot + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        let mut competing_chain = runner
+            .build_parent_chain_for_block(&competing_tip)
+            .unwrap()
+            .unwrap();
+        competing_chain.push(competing_tip.clone());
+        assert_eq!(
+            runner.highest_locked_qc_hash(),
+            Some(certified_root.block_hash)
+        );
+        assert_eq!(runner.proposal_votes[&current_tip.block_hash].len(), 1);
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .is_none()
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(
+            runner.blocks.last().unwrap().block_hash,
+            current_tip.block_hash
+        );
+        assert!(
+            runner
+                .orphan_blocks
+                .iter()
+                .any(|block| block.block_hash == competing_tip.block_hash)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn equal_qc_height_keeps_current_branch_until_certified_suffix_is_better() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "vote-branch");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let competing_tip = build_child(2, certified_root.header.slot + 1);
+        let current_tip = build_child(3, competing_tip.header.slot + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
+        assert!(
+            !runner
+                .quorum_certificates
+                .contains_key(&competing_tip.block_hash)
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayable_orphan_block_records_local_vote_in_v2_mode() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "orphan-vote");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_tip = first_valid_block(&genesis);
+        let competing_tip =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+
+        let vote = runner
+            .proposal_votes
+            .get(&competing_tip.block_hash)
+            .and_then(|votes| votes.get(&runner.config.validator_id))
+            .expect("replayable orphan should receive a local vote");
+        assert_eq!(vote.block_hash, competing_tip.block_hash);
+        assert_eq!(vote.slot, competing_tip.header.slot);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_orphan_block_does_not_record_local_vote() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "orphan-no-vote");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let disconnected_tip =
+            valid_empty_block_on_parent(&genesis, [9u8; 32], 2, 2, genesis.slots_per_epoch + 1);
+
+        assert_eq!(
+            runner
+                .accept_block(disconnected_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+
+        assert!(
+            runner
+                .proposal_votes
+                .get(&disconnected_tip.block_hash)
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn competing_branch_without_locked_qc_does_not_receive_local_vote() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-lock");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let locked_tip = first_valid_block(&genesis);
+        let competing_tip =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, locked_tip.header.slot + 1);
+
+        assert_eq!(
+            runner.accept_block(locked_tip.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 2, &locked_tip))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 3, &locked_tip))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&locked_tip.block_hash)
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(competing_tip.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_proposal_vote_signature_is_rejected() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "bad-vote");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner.accept_block(block.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+
+        let mut vote = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
+        vote.signature = vec![7, 7, 7];
+
+        let error = runner.import_proposal_vote(vote).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid proposal vote signature")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn improved_service_attestation_supersedes_prior_observation() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "attestation-update");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let original = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 0,
+                total_windows: 6,
+                timely_deliveries: 0,
+                expected_deliveries: 6,
+                distinct_peers: 0,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        let improved = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 6,
+                timely_deliveries: 5,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        assert!(runner.import_service_attestation(original).unwrap());
+        assert!(runner.import_service_attestation(improved.clone()).unwrap());
+        assert_eq!(
+            runner
+                .service_attestations
+                .get(&(1, 1))
+                .and_then(|by_member| by_member.get(&2))
+                .unwrap()
+                .counters,
+            improved.counters
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn improved_service_aggregate_supersedes_prior_version() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-update");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let original = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 0,
+                total_windows: 6,
+                timely_deliveries: 0,
+                expected_deliveries: 6,
+                distinct_peers: 0,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        let improved = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 6,
+                timely_deliveries: 5,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        assert!(runner.import_service_aggregate(original).unwrap());
+        assert!(runner.import_service_aggregate(improved.clone()).unwrap());
+        assert_eq!(
+            runner
+                .service_aggregates
+                .get(&(1, 1))
+                .unwrap()
+                .aggregate_counters,
+            improved.aggregate_counters
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reemitting_completed_epoch_attestations_refreshes_improved_receipts() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            2,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-backfill",
+        );
+        let mut runner = build_test_runner(2, config, genesis).await;
+
+        runner
+            .emit_service_attestations_for_completed_epoch(1)
+            .unwrap();
+        let initial = runner
+            .service_attestations
+            .get(&(1, 1))
+            .and_then(|by_member| by_member.get(&2))
+            .unwrap()
+            .counters
+            .clone();
+        assert_eq!(initial.uptime_windows, 0);
+
+        let mut receipt = sample_receipt();
+        receipt.epoch = 1;
+        receipt.slot = 11;
+        receipt.source_validator_id = 1;
+        receipt.destination_validator_id = 2;
+        receipt.witness_validator_id = 2;
+        receipt.message_class = MessageClass::Heartbeat;
+        runner.persist_receipt(receipt).unwrap();
+
+        runner
+            .emit_service_attestations_for_completed_epoch(1)
+            .unwrap();
+        let refreshed = runner
+            .service_attestations
+            .get(&(1, 1))
+            .and_then(|by_member| by_member.get(&2))
+            .unwrap()
+            .counters
+            .clone();
+        assert!(refreshed.uptime_windows > initial.uptime_windows);
+        assert!(refreshed.timely_deliveries > initial.timely_deliveries);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_attestations_only_score_observable_witness_obligations() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(2, reserve_local_address(), Vec::new(), "witness-v2");
+        let runner = build_test_runner(2, config, genesis.clone()).await;
+
+        let attestation = runner.build_local_service_attestation(1, 1).unwrap();
+
+        assert_eq!(attestation.committee_member_id, 2);
+        assert_eq!(attestation.counters.total_windows, genesis.slots_per_epoch);
+        assert_eq!(
+            attestation.counters.expected_deliveries,
+            genesis.slots_per_epoch
+        );
+        assert_eq!(attestation.counters.expected_peers, 1);
+        assert_eq!(attestation.counters.failed_sessions, 0);
+        assert_eq!(attestation.counters.invalid_receipts, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_scores_fall_back_to_latest_available_prior_aggregate() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-fallback");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 3);
+
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 5,
+                timely_deliveries: 5,
+                expected_deliveries: 5,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+        runner.refresh_service_scores();
+
+        let expected_score = runner.consensus.compute_service_score_from_aggregate(
+            &aggregate,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert_eq!(runner.service_score_for_validator(1), expected_score);
+        assert_eq!(runner.snapshot_metrics().last_completed_service_epoch, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_scores_preserve_last_known_value_when_no_aggregate_is_available() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-preserve");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * 4);
+        let prior_counters = ServiceCounters {
+            uptime_windows: 3,
+            total_windows: 5,
+            timely_deliveries: 4,
+            expected_deliveries: 5,
+            distinct_peers: 2,
+            expected_peers: 2,
+            failed_sessions: 0,
+            invalid_receipts: 0,
+        };
+        runner.latest_service_scores.insert(1, 0.73);
+        runner
+            .latest_service_counters
+            .insert(1, prior_counters.clone());
+
+        runner.refresh_service_scores();
+
+        assert_eq!(runner.service_score_for_validator(1), 0.73);
+        assert_eq!(runner.local_service_counters(), prior_counters);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v2_local_proposer_gating_uses_prior_epoch_aggregate_instead_of_legacy_rolling_score() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "v2-gating");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (proposal_epoch, slot) = (2..8)
+            .find_map(|epoch| {
+                let start = genesis.slots_per_epoch * epoch;
+                let end = genesis.slots_per_epoch * (epoch + 1);
+                (start..end)
+                    .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+                    .map(|slot| (epoch, slot))
+            })
+            .unwrap();
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+        runner
+            .observed_invalid_receipts
+            .insert((proposal_epoch - 1, 1), 100);
+        runner
+            .observed_failed_sessions
+            .insert((proposal_epoch - 1, 1, 2));
+        runner.known_live_peers.insert(2);
+
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            proposal_epoch - 1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 5,
+                timely_deliveries: 5,
+                expected_deliveries: 5,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        runner.import_service_aggregate(aggregate).unwrap();
+        runner.refresh_service_scores();
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.last_proposed_slot, Some(slot));
+        assert_eq!(runner.blocks.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_v2_proposer_is_rejected_when_confirmed_aggregate_score_is_below_threshold() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "v2-confirmed-reject",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (proposal_epoch, slot) = (2..8)
+            .find_map(|epoch| {
+                let start = genesis.slots_per_epoch * epoch;
+                let end = genesis.slots_per_epoch * (epoch + 1);
+                (start..end)
+                    .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+                    .map(|slot| (epoch, slot))
+            })
+            .unwrap();
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            proposal_epoch - 1,
+            ServiceCounters {
+                uptime_windows: 0,
+                total_windows: 5,
+                timely_deliveries: 0,
+                expected_deliveries: 5,
+                distinct_peers: 0,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        runner.import_service_aggregate(aggregate).unwrap();
+        runner.refresh_service_scores();
+
+        let aggregate = runner
+            .service_aggregates
+            .get(&(1, proposal_epoch - 1))
+            .unwrap();
+        let score = runner.consensus.compute_service_score_from_aggregate(
+            aggregate,
+            &runner.config.feature_flags.service_score_weights,
+        );
+        assert!(
+            score < runner.service_gating_threshold(),
+            "expected low score, got score={score:?} counters={:?}",
+            aggregate.aggregate_counters
+        );
+
+        assert!(matches!(
+            runner.v2_gating_state(1, proposal_epoch),
+            V2GatingState::RejectScore(score) if score < runner.service_gating_threshold()
+        ));
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        let metrics = runner.snapshot_metrics();
+        assert_eq!(runner.last_proposed_slot, None);
+        assert!(runner.blocks.is_empty());
+        assert_eq!(metrics.service_gating_rejections, 1);
+        assert_eq!(metrics.service_gating_enforcement_skips, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_v2_low_score_without_confirmed_prior_epoch_aggregate_skips_gating() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "v2-gating-skip");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (proposal_epoch, slot) = (3..8)
+            .find_map(|epoch| {
+                let start = genesis.slots_per_epoch * epoch;
+                let end = genesis.slots_per_epoch * (epoch + 1);
+                (start..end)
+                    .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+                    .map(|slot| (epoch, slot))
+            })
+            .unwrap();
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+
+        let stale_low_aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            proposal_epoch - 2,
+            ServiceCounters {
+                uptime_windows: 0,
+                total_windows: 5,
+                timely_deliveries: 0,
+                expected_deliveries: 5,
+                distinct_peers: 0,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        runner
+            .import_service_aggregate(stale_low_aggregate)
+            .unwrap();
+        runner.refresh_service_scores();
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        let metrics = runner.snapshot_metrics();
+        assert_eq!(runner.last_proposed_slot, Some(slot));
+        assert_eq!(runner.blocks.len(), 1);
+        assert_eq!(metrics.service_gating_rejections, 0);
+        assert_eq!(metrics.service_gating_enforcement_skips, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_service_attestation_signature_is_rejected() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "bad-attestation");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let mut attestation =
+            signed_service_attestation(runner.crypto.as_ref(), 1, 2, 1, ServiceCounters::default());
+        attestation.signature = vec![9, 9, 9];
+
+        let error = runner.import_service_attestation(attestation).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid service attestation signature")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_service_aggregate_payload_is_rejected() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "bad-aggregate");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let mut aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+        aggregate.attestation_root = [7u8; 32];
+
+        let error = runner.import_service_aggregate(aggregate).unwrap_err();
+
+        assert!(error.to_string().contains("aggregate payload is malformed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_mode_ignores_and_rejects_v2_service_evidence() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "legacy-v2-ignore");
+        config.feature_flags.consensus_v2 = false;
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let committee_member_id = runner.consensus.service_committee_for(1, 1)[0];
+        let attestation = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            committee_member_id,
+            1,
+            ServiceCounters::default(),
+        );
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: committee_member_id,
+                payload: ProtocolMessage::ServiceAttestation(attestation.clone()),
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: committee_member_id,
+                payload: ProtocolMessage::ServiceAggregate(aggregate.clone()),
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(runner.service_attestations.is_empty());
+        assert!(runner.service_aggregates.is_empty());
+        assert!(
+            runner
+                .import_service_attestation(attestation)
+                .unwrap_err()
+                .to_string()
+                .contains("require consensus_v2")
+        );
+        assert!(
+            runner
+                .import_service_aggregate(aggregate)
+                .unwrap_err()
+                .to_string()
+                .contains("require consensus_v2")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restore_service_evidence_rebuilds_state_without_reappending_files() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "restore-v2");
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let aggregate = service_aggregate_for_subject(
+            runner.crypto.as_ref(),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters {
+                uptime_windows: 4,
+                total_windows: 4,
+                timely_deliveries: 4,
+                expected_deliveries: 4,
+                distinct_peers: 2,
+                expected_peers: 2,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        for attestation in aggregate.attestations.clone() {
+            runner.import_service_attestation(attestation).unwrap();
+        }
+        runner.import_service_aggregate(aggregate.clone()).unwrap();
+
+        let loaded_attestations = runner.storage.load_service_attestations().unwrap();
+        let loaded_aggregates = runner.storage.load_service_aggregates().unwrap();
+        let attestation_lines_before =
+            fs::read_to_string(&runner.storage.service_attestations_path)
+                .unwrap()
+                .lines()
+                .count();
+        let aggregate_lines_before = fs::read_to_string(&runner.storage.service_aggregates_path)
+            .unwrap()
+            .lines()
+            .count();
+
+        runner.service_attestations.clear();
+        runner.service_aggregates.clear();
+        runner.seen_service_attestations.clear();
+        runner.seen_service_aggregates.clear();
+
+        runner
+            .restore_service_evidence(loaded_attestations, loaded_aggregates)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&runner.storage.service_attestations_path)
+                .unwrap()
+                .lines()
+                .count(),
+            attestation_lines_before
+        );
+        assert_eq!(
+            fs::read_to_string(&runner.storage.service_aggregates_path)
+                .unwrap()
+                .lines()
+                .count(),
+            aggregate_lines_before
+        );
+        assert_eq!(
+            runner.service_attestations.get(&(1, 1)).unwrap().len(),
+            aggregate.attestations.len()
+        );
+        assert_eq!(runner.service_aggregates.get(&(1, 1)).unwrap(), &aggregate);
+    }
+
     #[test]
     fn receipt_event_hash_ignores_non_identity_fields() {
         let mut first = sample_receipt();
@@ -2588,6 +5094,8 @@ mod tests {
             processed_dir: unique_dir.join("processed"),
             blocks_path: unique_dir.join(BLOCKS_FILE),
             receipts_path: unique_dir.join(RECEIPTS_FILE),
+            service_attestations_path: unique_dir.join(SERVICE_ATTESTATIONS_FILE),
+            service_aggregates_path: unique_dir.join(SERVICE_AGGREGATES_FILE),
             orphan_path: unique_dir.join(ORPHANS_FILE),
             snapshot_path: unique_dir.join(SNAPSHOT_FILE),
             log_path: unique_dir.join("events.log"),

@@ -49,6 +49,8 @@ enum Commands {
         start_delay_millis: u64,
         #[arg(long, default_value_t = false)]
         enable_service_gating: bool,
+        #[arg(long, default_value_t = false)]
+        consensus_v2: bool,
         #[arg(long, default_value_t = default_service_gating_start_epoch())]
         service_gating_start_epoch: u64,
         #[arg(long, default_value_t = default_service_gating_threshold())]
@@ -165,6 +167,7 @@ pub async fn cli_main() -> Result<()> {
             slots_per_epoch,
             start_delay_millis,
             enable_service_gating,
+            consensus_v2,
             service_gating_start_epoch,
             service_gating_threshold,
             service_score_window_epochs,
@@ -200,6 +203,7 @@ pub async fn cli_main() -> Result<()> {
                 degraded_delay_ms,
                 degraded_drop_probability,
                 degraded_disable_outbound,
+                consensus_v2,
             )
         }
         Commands::Up { base_dir } => up_localnet(&base_dir).await,
@@ -232,6 +236,7 @@ pub fn init_localnet(
     degraded_delay_ms: u64,
     degraded_drop_probability: f64,
     degraded_disable_outbound: bool,
+    consensus_v2: bool,
 ) -> Result<()> {
     if validators < 4 {
         return Err(anyhow!("at least 4 validators are recommended"));
@@ -306,6 +311,7 @@ pub fn init_localnet(
             feature_flags: FeatureFlags {
                 enable_receipts: true,
                 enable_service_gating,
+                consensus_v2,
                 service_gating_start_epoch,
                 service_gating_threshold,
                 service_score_window_epochs,
@@ -524,6 +530,7 @@ async fn run_matrix_scenario(
         scenario.degraded_delay_ms,
         scenario.degraded_drop_probability,
         scenario.degraded_disable_outbound,
+        false,
     )?;
 
     let mut children = spawn_localnet_children(base_dir).await?;
@@ -1403,6 +1410,10 @@ struct ValidatorReport {
     blocks_validated: u64,
     tx_ingress: u64,
     receipts_created: u64,
+    service_attestations_emitted: u64,
+    service_attestations_imported: u64,
+    service_aggregates_published: u64,
+    service_aggregates_imported: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1416,6 +1427,10 @@ struct LocalnetReport {
     total_duplicate_receipts_ignored: u64,
     total_peer_rate_limit_drops: u64,
     total_inbound_session_drops: u64,
+    total_service_attestations_emitted: u64,
+    total_service_attestations_imported: u64,
+    total_service_aggregates_published: u64,
+    total_service_aggregates_imported: u64,
     lowest_score: Option<(u64, f64)>,
     highest_score: Option<(u64, f64)>,
     validators: Vec<ValidatorReport>,
@@ -1482,6 +1497,74 @@ struct MatrixReport {
     scenarios: Vec<MatrixScenarioResult>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct BenchmarkTarget {
+    name: String,
+    variant: String,
+    mode: String,
+    validators: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BranchComparisonCase {
+    name: String,
+    variant: String,
+    mode: String,
+    validators: usize,
+    same_chain_count: usize,
+    configured_validators: usize,
+    distinct_tip_count: usize,
+    height_spread: usize,
+    target_validator: Option<u64>,
+    target_score: Option<f64>,
+    target_gating_rejections: u64,
+    honest_min_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BranchComparisonReport {
+    cases: Vec<BranchComparisonCase>,
+    benchmark_cases: Vec<BranchComparisonCase>,
+}
+
+fn v1_benchmark_targets() -> Vec<BenchmarkTarget> {
+    vec![
+        BenchmarkTarget {
+            name: "v1-degraded-4".into(),
+            variant: "v1".into(),
+            mode: "degraded".into(),
+            validators: 4,
+        },
+        BenchmarkTarget {
+            name: "v1-degraded-5".into(),
+            variant: "v1".into(),
+            mode: "degraded".into(),
+            validators: 5,
+        },
+    ]
+}
+
+fn build_branch_comparison_report(cases: Vec<BranchComparisonCase>) -> BranchComparisonReport {
+    let benchmark_targets = v1_benchmark_targets();
+    let benchmark_cases = cases
+        .iter()
+        .filter(|case| {
+            benchmark_targets.iter().any(|target| {
+                target.name == case.name
+                    && target.variant == case.variant
+                    && target.mode == case.mode
+                    && target.validators == case.validators
+            })
+        })
+        .cloned()
+        .collect();
+
+    BranchComparisonReport {
+        cases,
+        benchmark_cases,
+    }
+}
+
 impl LocalnetReport {
     fn render_text(&self) -> String {
         let mut lines = vec![
@@ -1505,6 +1588,22 @@ impl LocalnetReport {
                 "total inbound session drops: {}",
                 self.total_inbound_session_drops
             ),
+            format!(
+                "total service attestations emitted: {}",
+                self.total_service_attestations_emitted
+            ),
+            format!(
+                "total service attestations imported: {}",
+                self.total_service_attestations_imported
+            ),
+            format!(
+                "total service aggregates published: {}",
+                self.total_service_aggregates_published
+            ),
+            format!(
+                "total service aggregates imported: {}",
+                self.total_service_aggregates_imported
+            ),
         ];
         if let Some((validator_id, score)) = self.highest_score {
             lines.push(format!(
@@ -1518,7 +1617,7 @@ impl LocalnetReport {
         }
         for validator in &self.validators {
             lines.push(format!(
-                "validator {}: epoch {} slot {} score {:.3} weights [{:.2},{:.2},{:.2},-{:.2}] failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} missed {} gated {} duplicate_receipts {} peer_rate_limited {} inbound_session_drops {}",
+                "validator {}: epoch {} slot {} score {:.3} weights [{:.2},{:.2},{:.2},-{:.2}] failed_sessions {} invalid_receipts {} proposed {} validated {} txs {} receipts {} attestations_emitted {} attestations_imported {} aggregates_published {} aggregates_imported {} missed {} gated {} duplicate_receipts {} peer_rate_limited {} inbound_session_drops {}",
                 validator.validator_id,
                 validator.current_epoch,
                 validator.current_slot,
@@ -1533,6 +1632,10 @@ impl LocalnetReport {
                 validator.blocks_validated,
                 validator.tx_ingress,
                 validator.receipts_created,
+                validator.service_attestations_emitted,
+                validator.service_attestations_imported,
+                validator.service_aggregates_published,
+                validator.service_aggregates_imported,
                 validator.missed_proposer_slots,
                 validator.service_gating_rejections,
                 validator.duplicate_receipts_ignored,
@@ -1787,6 +1890,10 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
     let mut total_duplicate_receipts_ignored = 0;
     let mut total_peer_rate_limit_drops = 0;
     let mut total_inbound_session_drops = 0;
+    let mut total_service_attestations_emitted = 0;
+    let mut total_service_attestations_imported = 0;
+    let mut total_service_aggregates_published = 0;
+    let mut total_service_aggregates_imported = 0;
 
     for config_path in &manifest.node_configs {
         let contents = fs::read_to_string(config_path)?;
@@ -1802,6 +1909,10 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
         total_duplicate_receipts_ignored += metrics.duplicate_receipts_ignored;
         total_peer_rate_limit_drops += metrics.peer_rate_limit_drops;
         total_inbound_session_drops += metrics.inbound_session_drops;
+        total_service_attestations_emitted += metrics.service_attestations_emitted;
+        total_service_attestations_imported += metrics.service_attestations_imported;
+        total_service_aggregates_published += metrics.service_aggregates_published;
+        total_service_aggregates_imported += metrics.service_aggregates_imported;
         validators.push(ValidatorReport {
             validator_id: metrics.validator_id,
             current_epoch: metrics.current_epoch,
@@ -1819,6 +1930,10 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
             blocks_validated: metrics.blocks_validated,
             tx_ingress: metrics.tx_ingress,
             receipts_created: metrics.receipts_created,
+            service_attestations_emitted: metrics.service_attestations_emitted,
+            service_attestations_imported: metrics.service_attestations_imported,
+            service_aggregates_published: metrics.service_aggregates_published,
+            service_aggregates_imported: metrics.service_aggregates_imported,
         });
     }
 
@@ -1842,6 +1957,10 @@ fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result
         total_duplicate_receipts_ignored,
         total_peer_rate_limit_drops,
         total_inbound_session_drops,
+        total_service_attestations_emitted,
+        total_service_attestations_imported,
+        total_service_aggregates_published,
+        total_service_aggregates_imported,
         lowest_score,
         highest_score,
         validators,
@@ -2170,6 +2289,7 @@ mod tests {
             0,
             0.0,
             false,
+            false,
         )
         .unwrap();
         assert!(manifest_path(&unique_dir).exists());
@@ -2225,6 +2345,7 @@ mod tests {
             0,
             0.75,
             false,
+            false,
         )
         .unwrap();
         let node_three_path = unique_dir.join("node-3").join("node.toml");
@@ -2239,6 +2360,36 @@ mod tests {
             default_service_score_weights()
         );
         assert_eq!(node_config.fault_profile.outbound_drop_probability, 0.75);
+    }
+
+    #[test]
+    fn init_localnet_can_enable_consensus_v2() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-consensus-v2-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            true,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert!(node_config.feature_flags.consensus_v2);
     }
 
     #[test]
@@ -2259,6 +2410,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
@@ -2283,6 +2435,10 @@ mod tests {
                 blocks_validated: 7,
                 tx_ingress: 11,
                 receipts_created: 9,
+                service_attestations_emitted: 5,
+                service_attestations_imported: 8,
+                service_aggregates_published: 2,
+                service_aggregates_imported: 4,
                 missed_proposer_slots: 0,
                 service_gating_rejections: 0,
                 duplicate_receipts_ignored: 1,
@@ -2306,6 +2462,10 @@ mod tests {
                 blocks_validated: 6,
                 tx_ingress: 8,
                 receipts_created: 7,
+                service_attestations_emitted: 3,
+                service_attestations_imported: 6,
+                service_aggregates_published: 1,
+                service_aggregates_imported: 3,
                 missed_proposer_slots: 2,
                 service_gating_rejections: 2,
                 duplicate_receipts_ignored: 3,
@@ -2321,10 +2481,21 @@ mod tests {
         assert_eq!(report.total_missed_slots, 2);
         assert_eq!(report.total_gating_rejections, 2);
         assert_eq!(report.total_duplicate_receipts_ignored, 4);
+        assert_eq!(report.total_service_attestations_emitted, 8);
+        assert_eq!(report.total_service_attestations_imported, 14);
+        assert_eq!(report.total_service_aggregates_published, 3);
+        assert_eq!(report.total_service_aggregates_imported, 7);
         assert_eq!(report.highest_score, Some((1, 0.85)));
         assert_eq!(report.lowest_score, Some((2, 0.25)));
         assert_eq!(report.validators[0].failed_sessions, 1);
         assert_eq!(report.validators[1].invalid_receipts, 2);
+        let rendered = report.render_text();
+        assert!(rendered.contains("total service aggregates imported: 7"));
+        assert!(
+            rendered.contains(
+                "attestations_emitted 5 attestations_imported 8 aggregates_published 2 aggregates_imported 4"
+            )
+        );
     }
 
     #[test]
@@ -2347,6 +2518,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
@@ -2461,6 +2633,10 @@ mod tests {
                     total_duplicate_receipts_ignored: 0,
                     total_peer_rate_limit_drops: 0,
                     total_inbound_session_drops: 0,
+                    total_service_attestations_emitted: 0,
+                    total_service_attestations_imported: 0,
+                    total_service_aggregates_published: 0,
+                    total_service_aggregates_imported: 0,
                     lowest_score: Some((4, 0.25)),
                     highest_score: Some((1, 1.0)),
                     validators: vec![ValidatorReport {
@@ -2480,6 +2656,10 @@ mod tests {
                         blocks_validated: 6,
                         tx_ingress: 8,
                         receipts_created: 7,
+                        service_attestations_emitted: 0,
+                        service_attestations_imported: 0,
+                        service_aggregates_published: 0,
+                        service_aggregates_imported: 0,
                     }],
                 },
                 structural_report: StructuralReport {
@@ -2506,6 +2686,48 @@ mod tests {
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
         assert!(markdown.contains("| Scenario | Status | Signal | Validators |"));
+    }
+
+    #[test]
+    fn comparison_report_marks_v1_degraded_4_as_benchmark_case() {
+        let report = build_branch_comparison_report(vec![
+            BranchComparisonCase {
+                name: "v1-degraded-4".into(),
+                variant: "v1".into(),
+                mode: "degraded".into(),
+                validators: 4,
+                same_chain_count: 4,
+                configured_validators: 4,
+                distinct_tip_count: 1,
+                height_spread: 0,
+                target_validator: Some(3),
+                target_score: Some(0.083),
+                target_gating_rejections: 9,
+                honest_min_score: Some(0.925),
+            },
+            BranchComparisonCase {
+                name: "v2-degraded-4".into(),
+                variant: "v2".into(),
+                mode: "degraded".into(),
+                validators: 4,
+                same_chain_count: 4,
+                configured_validators: 4,
+                distinct_tip_count: 1,
+                height_spread: 0,
+                target_validator: Some(3),
+                target_score: Some(0.375),
+                target_gating_rejections: 9,
+                honest_min_score: Some(1.0),
+            },
+        ]);
+
+        assert_eq!(report.benchmark_cases.len(), 1);
+        assert!(
+            report
+                .benchmark_cases
+                .iter()
+                .any(|case| case.name == "v1-degraded-4")
+        );
     }
 
     #[test]
@@ -2542,6 +2764,10 @@ mod tests {
                 total_duplicate_receipts_ignored: 0,
                 total_peer_rate_limit_drops: 0,
                 total_inbound_session_drops: 0,
+                total_service_attestations_emitted: 0,
+                total_service_attestations_imported: 0,
+                total_service_aggregates_published: 0,
+                total_service_aggregates_imported: 0,
                 lowest_score: Some((4, 0.35)),
                 highest_score: Some((1, 1.0)),
                 validators: vec![ValidatorReport {
@@ -2561,6 +2787,10 @@ mod tests {
                     blocks_validated: 6,
                     tx_ingress: 8,
                     receipts_created: 7,
+                    service_attestations_emitted: 0,
+                    service_attestations_imported: 0,
+                    service_aggregates_published: 0,
+                    service_aggregates_imported: 0,
                 }],
             },
             structural_report: StructuralReport {
@@ -2603,6 +2833,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
         )
         .unwrap();
@@ -2672,6 +2903,10 @@ mod tests {
                 total_duplicate_receipts_ignored: 0,
                 total_peer_rate_limit_drops: 0,
                 total_inbound_session_drops: 0,
+                total_service_attestations_emitted: 0,
+                total_service_attestations_imported: 0,
+                total_service_aggregates_published: 0,
+                total_service_aggregates_imported: 0,
                 lowest_score: Some((1, 0.90)),
                 highest_score: Some((2, 1.0)),
                 validators: vec![],

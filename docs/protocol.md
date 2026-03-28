@@ -18,6 +18,13 @@ Current status note:
 - the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
 - the latest status update for that redesign is in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md)
 
+On the experimental `consensus_v2` path in this branch, the protocol direction is tightening further:
+
+- witnesses produce scoped `ServiceAttestation` records for the validators they were actually assigned to observe
+- nodes build `ServiceAggregate` records from those attestations
+- proposer gating reads prior-epoch aggregate evidence instead of raw local receipt views
+- ordering is planned to move to proposal votes plus quorum certificates, but that part is not live yet
+
 ## Protocol Goals
 
 - keep the system post-quantum from the application layer upward
@@ -94,6 +101,12 @@ Each validator aggregates these into a topology commitment for the epoch.
 
 The next proposer selection step uses stake plus the rolling relay score derived from recent commitments.
 
+Current V2 runtime detail:
+
+- witnesses first reconcile receipts for the just-finished epoch
+- attestations are then published for the prior completed epoch with a one-epoch lag
+- this is deliberate and avoids false zero-score epochs caused by late receipt propagation
+
 ## Relay Receipts
 
 A relay receipt is a compact, signed record proving that a validator relayed a required message under a specific witness assignment.
@@ -152,6 +165,10 @@ Important constraints:
 - use rolling windows so short failures do not permanently destroy eligibility
 - make all score inputs verifiable from on-chain commitments and signed receipts
 
+Current V2 constraint:
+
+- if prior-epoch aggregate evidence is still incomplete, the runtime preserves the last known score instead of treating temporary evidence delay as confirmed service failure
+
 ## Proposer Eligibility
 
 The proposer rule should combine stake, public randomness, and relay performance.
@@ -165,6 +182,11 @@ or
 `effective_stake = stake * service_multiplier(relay_score)`
 
 This lets the chain preserve public randomness while still punishing validators that do not contribute to network health.
+
+Current V2 note:
+
+- the service side of this rule is partially live on this branch
+- the ordering side is still the older orphan-and-sync model until proposal votes and quorum certificates are wired in
 
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 

@@ -68,6 +68,11 @@ This is the most distinctive subsystem in the project.
 
 The witness engine turns "network entanglement" into measurable protocol evidence instead of private local state.
 
+Current V2 branch detail:
+
+- witness-derived service evidence is now moving from raw receipt views to explicit `ServiceAttestation` and `ServiceAggregate` objects
+- attestations are intentionally lagged by one epoch after receipt reconciliation so the evidence plane uses settled observations instead of freshest-gossip guesses
+
 ### 5. Ledger Layer
 
 Responsibilities:
@@ -94,6 +99,11 @@ Responsibilities:
 Consensus should use public randomness and verifiable inputs.
 
 The relay score should affect proposer eligibility or rewards, but not replace auditable randomness.
+
+Current V2 branch detail:
+
+- service-evidence gating is partially live behind `consensus_v2`
+- QC-backed ordering is still the next consensus milestone and is the main remaining reason larger bursty `6/8` validator runs can still diverge structurally
 
 ### 7. Storage Layer
 
@@ -128,6 +138,11 @@ The simulator is a first-class part of the architecture, not an afterthought.
 6. Each validator aggregates receipt hashes into a topology commitment.
 7. The consensus layer validates blocks, commitments, and service scores.
 8. Metrics and logs are exported for stress analysis.
+
+On the current V2 path, steps 6 and 7 are in transition:
+
+- service scores are increasingly driven by witness-aligned aggregates
+- fork choice is still legacy until proposal votes and quorum certificates are added
 
 ## Process Model For Localnet
 
