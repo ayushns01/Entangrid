@@ -1497,6 +1497,74 @@ struct MatrixReport {
     scenarios: Vec<MatrixScenarioResult>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct BenchmarkTarget {
+    name: String,
+    variant: String,
+    mode: String,
+    validators: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BranchComparisonCase {
+    name: String,
+    variant: String,
+    mode: String,
+    validators: usize,
+    same_chain_count: usize,
+    configured_validators: usize,
+    distinct_tip_count: usize,
+    height_spread: usize,
+    target_validator: Option<u64>,
+    target_score: Option<f64>,
+    target_gating_rejections: u64,
+    honest_min_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct BranchComparisonReport {
+    cases: Vec<BranchComparisonCase>,
+    benchmark_cases: Vec<BranchComparisonCase>,
+}
+
+fn v1_benchmark_targets() -> Vec<BenchmarkTarget> {
+    vec![
+        BenchmarkTarget {
+            name: "v1-degraded-4".into(),
+            variant: "v1".into(),
+            mode: "degraded".into(),
+            validators: 4,
+        },
+        BenchmarkTarget {
+            name: "v1-degraded-5".into(),
+            variant: "v1".into(),
+            mode: "degraded".into(),
+            validators: 5,
+        },
+    ]
+}
+
+fn build_branch_comparison_report(cases: Vec<BranchComparisonCase>) -> BranchComparisonReport {
+    let benchmark_targets = v1_benchmark_targets();
+    let benchmark_cases = cases
+        .iter()
+        .filter(|case| {
+            benchmark_targets.iter().any(|target| {
+                target.name == case.name
+                    && target.variant == case.variant
+                    && target.mode == case.mode
+                    && target.validators == case.validators
+            })
+        })
+        .cloned()
+        .collect();
+
+    BranchComparisonReport {
+        cases,
+        benchmark_cases,
+    }
+}
+
 impl LocalnetReport {
     fn render_text(&self) -> String {
         let mut lines = vec![
@@ -2618,6 +2686,48 @@ mod tests {
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
         assert!(markdown.contains("| Scenario | Status | Signal | Validators |"));
+    }
+
+    #[test]
+    fn comparison_report_marks_v1_degraded_4_as_benchmark_case() {
+        let report = build_branch_comparison_report(vec![
+            BranchComparisonCase {
+                name: "v1-degraded-4".into(),
+                variant: "v1".into(),
+                mode: "degraded".into(),
+                validators: 4,
+                same_chain_count: 4,
+                configured_validators: 4,
+                distinct_tip_count: 1,
+                height_spread: 0,
+                target_validator: Some(3),
+                target_score: Some(0.083),
+                target_gating_rejections: 9,
+                honest_min_score: Some(0.925),
+            },
+            BranchComparisonCase {
+                name: "v2-degraded-4".into(),
+                variant: "v2".into(),
+                mode: "degraded".into(),
+                validators: 4,
+                same_chain_count: 4,
+                configured_validators: 4,
+                distinct_tip_count: 1,
+                height_spread: 0,
+                target_validator: Some(3),
+                target_score: Some(0.375),
+                target_gating_rejections: 9,
+                honest_min_score: Some(1.0),
+            },
+        ]);
+
+        assert_eq!(report.benchmark_cases.len(), 1);
+        assert!(
+            report
+                .benchmark_cases
+                .iter()
+                .any(|case| case.name == "v1-degraded-4")
+        );
     }
 
     #[test]

@@ -231,22 +231,32 @@ impl ConsensusEngine {
         self.compute_service_score_with_weights(&aggregate.aggregate_counters, weights)
     }
 
+    pub fn confirmed_service_score_for_epoch(
+        &self,
+        aggregate: Option<&ServiceAggregate>,
+        weights: &ServiceScoreWeights,
+        current_epoch: Epoch,
+    ) -> Option<f64> {
+        let aggregate = aggregate?;
+        if aggregate.epoch + 1 != current_epoch {
+            return None;
+        }
+        self.validate_service_aggregate(aggregate).ok()?;
+        Some(self.compute_service_score_from_aggregate(aggregate, weights))
+    }
+
     pub fn proposer_is_service_eligible(
         &self,
         aggregate: Option<&ServiceAggregate>,
         threshold: f64,
         current_epoch: Epoch,
     ) -> bool {
-        let Some(aggregate) = aggregate else {
-            return false;
-        };
-        if aggregate.epoch >= current_epoch {
-            return false;
-        }
-        if self.validate_service_aggregate(aggregate).is_err() {
-            return false;
-        }
-        self.compute_service_score_from_aggregate(aggregate, &default_service_score_weights())
+        self.confirmed_service_score_for_epoch(
+            aggregate,
+            &default_service_score_weights(),
+            current_epoch,
+        )
+        .unwrap_or_default()
             >= threshold
     }
 
