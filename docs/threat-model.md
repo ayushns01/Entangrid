@@ -164,7 +164,7 @@ Mitigations:
 - a very harsh relay threshold could make consensus brittle
 - a very soft relay threshold could make entanglement meaningless
 - multi-hop witness corridors may be much harder to validate efficiently than pairwise receipts
-- larger-validator V2 convergence is still not strong enough yet without better certified sync and stronger QC-dominant branch recovery
+- larger-validator V2 service scoring and gating are still not strong enough yet even though certified sync and QC-dominant branch recovery are now live
 
 ## What Must Be Tested Early
 

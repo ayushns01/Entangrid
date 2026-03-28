@@ -123,6 +123,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         blocks: loaded_blocks,
         receipts: loaded_receipts,
         orphan_blocks: Vec::new(),
+        pending_certified_children: Vec::new(),
         mempool: BTreeMap::new(),
         seen_transactions: BTreeSet::new(),
         seen_blocks: BTreeSet::new(),
@@ -131,6 +132,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
         service_attestations: BTreeMap::new(),
         service_aggregates: BTreeMap::new(),
         proposal_votes: BTreeMap::new(),
+        buffered_proposal_votes: BTreeMap::new(),
         quorum_certificates: BTreeMap::new(),
         seen_service_attestations: BTreeSet::new(),
         seen_service_aggregates: BTreeSet::new(),
@@ -169,6 +171,7 @@ struct NodeRunner {
     blocks: Vec<Block>,
     receipts: Vec<RelayReceipt>,
     orphan_blocks: Vec<Block>,
+    pending_certified_children: Vec<Block>,
     mempool: BTreeMap<HashBytes, SignedTransaction>,
     seen_transactions: BTreeSet<HashBytes>,
     seen_blocks: BTreeSet<HashBytes>,
@@ -177,6 +180,7 @@ struct NodeRunner {
     service_attestations: BTreeMap<(ValidatorId, Epoch), BTreeMap<ValidatorId, ServiceAttestation>>,
     service_aggregates: BTreeMap<(ValidatorId, Epoch), ServiceAggregate>,
     proposal_votes: BTreeMap<HashBytes, BTreeMap<ValidatorId, ProposalVote>>,
+    buffered_proposal_votes: BTreeMap<HashBytes, BTreeMap<ValidatorId, ProposalVote>>,
     quorum_certificates: BTreeMap<HashBytes, QuorumCertificate>,
     seen_service_attestations: BTreeSet<HashBytes>,
     seen_service_aggregates: BTreeSet<HashBytes>,
@@ -562,6 +566,23 @@ impl NodeRunner {
         }
 
         self.last_proposed_slot = Some(slot);
+        if let Some(pending_child) = self.preferred_pending_child_for_certified_head() {
+            self.maybe_broadcast_local_proposal_vote(&pending_child)?;
+            self.network.broadcast(
+                &self.config.peers,
+                ProtocolMessage::BlockProposal(pending_child.clone()),
+            )?;
+            self.log_event(
+                "pending-block-rebroadcast",
+                format!(
+                    "height {} slot {} block {:02x?}",
+                    pending_child.header.block_number,
+                    pending_child.header.slot,
+                    &pending_child.block_hash[..4]
+                ),
+            )?;
+            return Ok(());
+        }
         let (commitment, commitment_receipts) =
             if self.config.feature_flags.enable_receipts && epoch > 0 {
                 let commitment_receipts = self.consensus.receipts_for_validator(
@@ -622,11 +643,14 @@ impl NodeRunner {
             block_hash,
         };
 
-        if matches!(
-            self.accept_block(block.clone(), true).await?,
-            BlockAcceptance::Accepted
-        ) {
-            self.try_promote_orphans().await?;
+        let acceptance = self.accept_block(block.clone(), true).await?;
+        if matches!(acceptance, BlockAcceptance::Accepted)
+            || (matches!(acceptance, BlockAcceptance::Orphan)
+                && self.is_pending_certified_head_block(&block))
+        {
+            if matches!(acceptance, BlockAcceptance::Accepted) {
+                self.try_promote_orphans().await?;
+            }
             self.network
                 .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
         }
@@ -797,6 +821,9 @@ impl NodeRunner {
                             .broadcast(&self.config.peers, ProtocolMessage::BlockProposal(block))?;
                     }
                     Ok(BlockAcceptance::Orphan) => {
+                        if self.is_pending_certified_head_block(&block) {
+                            return Ok(());
+                        }
                         let peer_height = block.header.block_number.saturating_sub(1);
                         let peer_tip_hash = block.header.parent_hash;
                         self.record_sync_repair_failure(from_validator_id);
@@ -1345,7 +1372,7 @@ impl NodeRunner {
         block: Block,
         local_proposal: bool,
     ) -> Result<BlockAcceptance> {
-        if self.seen_blocks.contains(&block.block_hash) {
+        if self.known_block(block.block_hash).is_some() {
             return Ok(BlockAcceptance::Duplicate);
         }
         let expected_hash =
@@ -1449,6 +1476,40 @@ impl NodeRunner {
 
         let mut next_ledger = self.ledger.clone();
         next_ledger.apply_block(&block, self.crypto.as_ref())?;
+        if self.certified_head_only_active()
+            && !self.quorum_certificates.contains_key(&block.block_hash)
+        {
+            if !self
+                .pending_certified_children
+                .iter()
+                .any(|pending| pending.block_hash == block.block_hash)
+            {
+                self.pending_certified_children.push(block.clone());
+                self.log_event(
+                    "certified-head-pending",
+                    format!(
+                        "height {} slot {} parent {:02x?}",
+                        block.header.block_number,
+                        block.header.slot,
+                        &block.header.parent_hash[..4]
+                    ),
+                )?;
+            }
+            self.import_buffered_proposal_votes_for_block(&block)?;
+            let should_support_block = self
+                .preferred_pending_child_for_certified_head()
+                .map(|pending| pending.block_hash == block.block_hash)
+                .unwrap_or(false);
+            if should_support_block {
+                self.maybe_broadcast_local_proposal_vote(&block)?;
+            }
+            let _ = self.maybe_finalize_quorum_certificate(block.block_hash)?;
+            if self.ledger.snapshot().tip_hash == block.block_hash {
+                return Ok(BlockAcceptance::Accepted);
+            }
+            self.persist_metrics()?;
+            return Ok(BlockAcceptance::Orphan);
+        }
         self.ledger = next_ledger;
         self.seen_blocks.insert(block.block_hash);
         self.blocks.push(block.clone());
@@ -1456,6 +1517,8 @@ impl NodeRunner {
             .append_json_line(&self.storage.blocks_path, &block)?;
         self.storage.write_snapshot(self.ledger.snapshot())?;
         self.import_commitment_receipts(&block.commitment_receipts)?;
+        self.import_buffered_proposal_votes_for_block(&block)?;
+        let _ = self.maybe_finalize_quorum_certificate(block.block_hash)?;
         for transaction in &block.transactions {
             self.mempool.remove(&transaction.tx_hash);
         }
@@ -1530,12 +1593,63 @@ impl NodeRunner {
             .map(|block| block.block_hash)
     }
 
+    fn certified_head_only_active(&self) -> bool {
+        self.config.feature_flags.consensus_v2 && self.highest_locked_qc_hash().is_some()
+    }
+
+    fn is_pending_certified_head_block(&self, block: &Block) -> bool {
+        self.certified_head_only_active()
+            && block.header.parent_hash == self.ledger.snapshot().tip_hash
+            && self
+                .pending_certified_children
+                .iter()
+                .any(|pending| pending.block_hash == block.block_hash)
+    }
+
+    fn preferred_pending_child_for_certified_head(&self) -> Option<Block> {
+        if !self.certified_head_only_active() {
+            return None;
+        }
+        let parent_hash = self.ledger.snapshot().tip_hash;
+        let block_number = self.ledger.block_height() + 1;
+        self.pending_certified_children
+            .iter()
+            .filter(|block| {
+                block.header.parent_hash == parent_hash && block.header.block_number == block_number
+            })
+            .min_by(|left, right| {
+                left.header
+                    .slot
+                    .cmp(&right.header.slot)
+                    .then_with(|| left.block_hash.cmp(&right.block_hash))
+            })
+            .cloned()
+    }
+
     fn maybe_broadcast_local_proposal_vote(&mut self, block: &Block) -> Result<()> {
         if !self.config.feature_flags.consensus_v2 {
             return Ok(());
         }
         let vote = self.build_local_proposal_vote(block)?;
-        if self.import_proposal_vote(vote.clone())? {
+        let imported = match self.import_proposal_vote(vote.clone()) {
+            Ok(imported) => imported,
+            Err(error) if error.to_string().contains("conflicting proposal vote") => {
+                self.log_event(
+                    "proposal-vote-skipped",
+                    format!(
+                        "block {:02x?} height {} slot {} validator {} detail {}",
+                        &block.block_hash[..4],
+                        block.header.block_number,
+                        block.header.slot,
+                        self.config.validator_id,
+                        error
+                    ),
+                )?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if imported {
             self.network
                 .broadcast(&self.config.peers, ProtocolMessage::ProposalVote(vote))?;
         }
@@ -1560,26 +1674,14 @@ impl NodeRunner {
         if !self.config.feature_flags.consensus_v2 {
             return Err(anyhow!("proposal votes require consensus_v2"));
         }
-        self.validate_proposal_vote(&vote)?;
+        self.validate_proposal_vote_signature_and_signer(&vote)?;
+        let Some(block) = self.known_block(vote.block_hash).cloned() else {
+            return self.store_buffered_proposal_vote(vote);
+        };
+        self.validate_proposal_vote_for_block(&vote, &block)?;
         let inserted = self.store_proposal_vote(vote.clone())?;
         if inserted {
-            if let Some(qc) = self.maybe_build_qc(vote.block_hash)? {
-                self.maybe_adopt_certified_branch(qc.block_hash)?;
-                self.network.broadcast(
-                    &self.config.peers,
-                    ProtocolMessage::QuorumCertificate(qc.clone()),
-                )?;
-                self.log_event(
-                    "qc-built",
-                    format!(
-                        "height {} slot {} block {:02x?} votes {}",
-                        qc.block_number,
-                        qc.slot,
-                        &qc.block_hash[..4],
-                        qc.votes.len()
-                    ),
-                )?;
-            } else {
+            if self.maybe_finalize_quorum_certificate(vote.block_hash)?.is_none() {
                 self.maybe_adopt_vote_supported_branch(vote.block_hash)?;
             }
         }
@@ -1595,6 +1697,7 @@ impl NodeRunner {
         };
         self.validate_quorum_certificate_for_block(&qc, block)?;
         for vote in qc.votes.iter().cloned() {
+            self.remove_conflicting_votes_for_certified_vote(&vote);
             let _ = self.store_proposal_vote(vote)?;
         }
         if self.quorum_certificates.contains_key(&qc.block_hash) {
@@ -1615,20 +1718,7 @@ impl NodeRunner {
         Ok(true)
     }
 
-    fn validate_proposal_vote(&self, vote: &ProposalVote) -> Result<()> {
-        let Some(block) = self.known_block(vote.block_hash) else {
-            return Err(anyhow!("proposal vote references unknown block"));
-        };
-        self.validate_proposal_vote_for_block(vote, block)
-    }
-
-    fn validate_proposal_vote_for_block(&self, vote: &ProposalVote, block: &Block) -> Result<()> {
-        if vote.block_number != block.header.block_number
-            || vote.epoch != block.header.epoch
-            || vote.slot != block.header.slot
-        {
-            return Err(anyhow!("proposal vote metadata does not match block"));
-        }
+    fn validate_proposal_vote_signature_and_signer(&self, vote: &ProposalVote) -> Result<()> {
         if !self
             .genesis
             .validators
@@ -1643,6 +1733,40 @@ impl NodeRunner {
             .verify(vote.validator_id, &hash, &vote.signature)?;
         if !verified {
             return Err(anyhow!("invalid proposal vote signature"));
+        }
+        Ok(())
+    }
+
+    fn remove_conflicting_votes_for_certified_vote(&mut self, vote: &ProposalVote) {
+        self.proposal_votes.retain(|block_hash, by_validator| {
+            if *block_hash != vote.block_hash {
+                by_validator.retain(|validator_id, existing| {
+                    !(*validator_id == vote.validator_id
+                        && existing.block_hash != vote.block_hash
+                        && existing.block_number == vote.block_number)
+                });
+            }
+            !by_validator.is_empty()
+        });
+        self.buffered_proposal_votes.retain(|block_hash, by_validator| {
+            if *block_hash != vote.block_hash {
+                by_validator.retain(|validator_id, existing| {
+                    !(*validator_id == vote.validator_id
+                        && existing.block_hash != vote.block_hash
+                        && existing.block_number == vote.block_number)
+                });
+            }
+            !by_validator.is_empty()
+        });
+    }
+
+    fn validate_proposal_vote_for_block(&self, vote: &ProposalVote, block: &Block) -> Result<()> {
+        self.validate_proposal_vote_signature_and_signer(vote)?;
+        if vote.block_number != block.header.block_number
+            || vote.epoch != block.header.epoch
+            || vote.slot != block.header.slot
+        {
+            return Err(anyhow!("proposal vote metadata does not match block"));
         }
         Ok(())
     }
@@ -1676,16 +1800,7 @@ impl NodeRunner {
     }
 
     fn store_proposal_vote(&mut self, vote: ProposalVote) -> Result<bool> {
-        for existing_votes in self.proposal_votes.values() {
-            if let Some(existing) = existing_votes.get(&vote.validator_id) {
-                if existing.epoch == vote.epoch
-                    && existing.slot == vote.slot
-                    && existing.block_hash != vote.block_hash
-                {
-                    return Err(anyhow!("conflicting proposal vote"));
-                }
-            }
-        }
+        self.ensure_no_conflicting_proposal_vote(&vote)?;
         let by_validator = self.proposal_votes.entry(vote.block_hash).or_default();
         if let Some(existing) = by_validator.get(&vote.validator_id) {
             if proposal_vote_signing_hash(existing) == proposal_vote_signing_hash(&vote)
@@ -1697,6 +1812,49 @@ impl NodeRunner {
         }
         by_validator.insert(vote.validator_id, vote);
         Ok(true)
+    }
+
+    fn store_buffered_proposal_vote(&mut self, vote: ProposalVote) -> Result<bool> {
+        self.ensure_no_conflicting_proposal_vote(&vote)?;
+        let by_validator = self.buffered_proposal_votes.entry(vote.block_hash).or_default();
+        if let Some(existing) = by_validator.get(&vote.validator_id) {
+            if proposal_vote_signing_hash(existing) == proposal_vote_signing_hash(&vote)
+                && existing.signature == vote.signature
+            {
+                return Ok(false);
+            }
+            return Err(anyhow!("conflicting proposal vote"));
+        }
+        by_validator.insert(vote.validator_id, vote.clone());
+        self.log_event(
+            "proposal-vote-buffered",
+            format!(
+                "block {:02x?} height {} slot {} validator {}",
+                &vote.block_hash[..4],
+                vote.block_number,
+                vote.slot,
+                vote.validator_id
+            ),
+        )?;
+        Ok(true)
+    }
+
+    fn ensure_no_conflicting_proposal_vote(&self, vote: &ProposalVote) -> Result<()> {
+        for existing_votes in self
+            .proposal_votes
+            .values()
+            .chain(self.buffered_proposal_votes.values())
+        {
+            if let Some(existing) = existing_votes.get(&vote.validator_id) {
+                if existing.block_hash != vote.block_hash
+                    && (existing.block_number == vote.block_number
+                        || (existing.epoch == vote.epoch && existing.slot == vote.slot))
+                {
+                    return Err(anyhow!("conflicting proposal vote"));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn maybe_build_qc(&mut self, block_hash: HashBytes) -> Result<Option<QuorumCertificate>> {
@@ -1732,10 +1890,73 @@ impl NodeRunner {
         Ok(Some(qc))
     }
 
+    fn maybe_finalize_quorum_certificate(
+        &mut self,
+        block_hash: HashBytes,
+    ) -> Result<Option<QuorumCertificate>> {
+        let already_had_qc = self.quorum_certificates.contains_key(&block_hash);
+        let Some(qc) = self.maybe_build_qc(block_hash)? else {
+            return Ok(None);
+        };
+        self.maybe_adopt_certified_branch(qc.block_hash)?;
+        if !already_had_qc {
+            self.network.broadcast(
+                &self.config.peers,
+                ProtocolMessage::QuorumCertificate(qc.clone()),
+            )?;
+            self.log_event(
+                "qc-built",
+                format!(
+                    "height {} slot {} block {:02x?} votes {}",
+                    qc.block_number,
+                    qc.slot,
+                    &qc.block_hash[..4],
+                    qc.votes.len()
+                ),
+            )?;
+        }
+        Ok(Some(qc))
+    }
+
+    fn import_buffered_proposal_votes_for_block(&mut self, block: &Block) -> Result<()> {
+        let Some(by_validator) = self.buffered_proposal_votes.remove(&block.block_hash) else {
+            return Ok(());
+        };
+        for vote in by_validator.into_values() {
+            if let Err(error) = self.validate_proposal_vote_for_block(&vote, block) {
+                self.log_event(
+                    "proposal-vote-buffer-dropped",
+                    format!(
+                        "block {:02x?} validator {} detail {error}",
+                        &vote.block_hash[..4],
+                        vote.validator_id
+                    ),
+                )?;
+                continue;
+            }
+            if let Err(error) = self.store_proposal_vote(vote.clone()) {
+                self.log_event(
+                    "proposal-vote-buffer-dropped",
+                    format!(
+                        "block {:02x?} validator {} detail {error}",
+                        &vote.block_hash[..4],
+                        vote.validator_id
+                    ),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn known_block(&self, block_hash: HashBytes) -> Option<&Block> {
         self.blocks
             .iter()
             .find(|block| block.block_hash == block_hash)
+            .or_else(|| {
+                self.pending_certified_children
+                    .iter()
+                    .find(|block| block.block_hash == block_hash)
+            })
             .or_else(|| {
                 self.orphan_blocks
                     .iter()
@@ -1761,6 +1982,9 @@ impl NodeRunner {
         if !self.config.feature_flags.consensus_v2 {
             return Ok(false);
         }
+        if self.certified_head_only_active() {
+            return Ok(false);
+        }
         let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
             return Ok(false);
         };
@@ -1782,6 +2006,9 @@ impl NodeRunner {
 
     fn maybe_adopt_preferred_competing_branch(&mut self, block: &Block) -> Result<bool> {
         if !self.config.feature_flags.consensus_v2 {
+            return Ok(false);
+        }
+        if self.certified_head_only_active() {
             return Ok(false);
         }
         let Some(locked_qc_hash) = self.highest_locked_qc_hash() else {
@@ -1809,7 +2036,12 @@ impl NodeRunner {
 
     fn build_chain_to_tip(&self, tip_hash: HashBytes) -> Option<Vec<Block>> {
         let mut by_hash = BTreeMap::new();
-        for block in self.blocks.iter().chain(self.orphan_blocks.iter()) {
+        for block in self
+            .blocks
+            .iter()
+            .chain(self.pending_certified_children.iter())
+            .chain(self.orphan_blocks.iter())
+        {
             by_hash.insert(block.block_hash, block.clone());
         }
 
@@ -1845,25 +2077,53 @@ impl NodeRunner {
         candidate_chain: &[Block],
         current_chain: &[Block],
     ) -> Ordering {
-        let candidate_certified_height = self.latest_certified_height(candidate_chain);
-        let current_certified_height = self.latest_certified_height(current_chain);
+        let candidate_certified = self.latest_certified_block(candidate_chain);
+        let current_certified = self.latest_certified_block(current_chain);
+        let candidate_certified_height = candidate_certified
+            .map(|block| block.header.block_number)
+            .unwrap_or(0);
+        let current_certified_height = current_certified
+            .map(|block| block.header.block_number)
+            .unwrap_or(0);
         let certified_cmp = candidate_certified_height.cmp(&current_certified_height);
         if certified_cmp != Ordering::Equal {
             return certified_cmp;
         }
         if candidate_certified_height > 0 {
-            return Ordering::Equal;
+            let candidate_tip_certified = candidate_chain
+                .last()
+                .map(|block| self.quorum_certificates.contains_key(&block.block_hash))
+                .unwrap_or(false);
+            let current_tip_certified = current_chain
+                .last()
+                .map(|block| self.quorum_certificates.contains_key(&block.block_hash))
+                .unwrap_or(false);
+            let tip_certified_cmp = candidate_tip_certified.cmp(&current_tip_certified);
+            if tip_certified_cmp != Ordering::Equal {
+                return tip_certified_cmp;
+            }
+            let candidate_certified_hash = candidate_certified
+                .map(|block| block.block_hash)
+                .unwrap_or_else(empty_hash);
+            let current_certified_hash = current_certified
+                .map(|block| block.block_hash)
+                .unwrap_or_else(empty_hash);
+            return candidate_certified_hash.cmp(&current_certified_hash);
         }
         let candidate_quality = self.branch_quality_with_extra_tip_vote(candidate_chain, None);
         let current_quality = self.branch_quality_with_extra_tip_vote(current_chain, None);
         candidate_quality.cmp(&current_quality)
     }
 
-    fn latest_certified_height(&self, chain: &[Block]) -> u64 {
+    fn latest_certified_block<'a>(&self, chain: &'a [Block]) -> Option<&'a Block> {
         chain
             .iter()
             .rev()
             .find(|block| self.quorum_certificates.contains_key(&block.block_hash))
+    }
+
+    fn latest_certified_height(&self, chain: &[Block]) -> u64 {
+        self.latest_certified_block(chain)
             .map(|block| block.header.block_number)
             .unwrap_or(0)
     }
@@ -1915,6 +2175,7 @@ impl NodeRunner {
             .blocks
             .iter()
             .chain(self.orphan_blocks.iter())
+            .chain(self.pending_certified_children.iter())
             .filter(|block| !candidate_hashes.contains(&block.block_hash))
             .cloned()
             .collect::<Vec<_>>();
@@ -1922,6 +2183,7 @@ impl NodeRunner {
         self.ledger = ledger;
         self.blocks = candidate_chain;
         self.orphan_blocks = orphan_blocks;
+        self.pending_certified_children.clear();
         let receipts_to_import = self
             .blocks
             .iter()
@@ -2055,10 +2317,15 @@ impl NodeRunner {
         self.ledger = ledger;
         self.blocks = chain.blocks;
         self.receipts = receipts;
+        self.orphan_blocks.clear();
+        self.pending_certified_children.clear();
+        self.buffered_proposal_votes.clear();
         self.rebuild_seen_sets();
         self.storage.write_snapshot(self.ledger.snapshot())?;
         self.storage
             .overwrite_json_lines(&self.storage.blocks_path, &self.blocks)?;
+        self.storage
+            .overwrite_json_lines(&self.storage.orphan_path, &self.orphan_blocks)?;
         self.storage
             .overwrite_json_lines(&self.storage.receipts_path, &self.receipts)?;
         Ok(())
@@ -2092,10 +2359,15 @@ impl NodeRunner {
 
         self.ledger = ledger;
         self.blocks.extend(chain.blocks);
+        self.orphan_blocks.clear();
+        self.pending_certified_children.clear();
+        self.buffered_proposal_votes.clear();
         self.rebuild_seen_sets();
         self.storage.write_snapshot(self.ledger.snapshot())?;
         self.storage
             .overwrite_json_lines(&self.storage.blocks_path, &self.blocks)?;
+        self.storage
+            .overwrite_json_lines(&self.storage.orphan_path, &self.orphan_blocks)?;
         for receipt in receipts {
             self.store_receipt(receipt)?;
         }
@@ -4257,6 +4529,7 @@ mod tests {
             blocks: Vec::new(),
             receipts: Vec::new(),
             orphan_blocks: Vec::new(),
+            pending_certified_children: Vec::new(),
             mempool: BTreeMap::new(),
             seen_transactions: BTreeSet::new(),
             seen_blocks: BTreeSet::new(),
@@ -4265,6 +4538,7 @@ mod tests {
             service_attestations: BTreeMap::new(),
             service_aggregates: BTreeMap::new(),
             proposal_votes: BTreeMap::new(),
+            buffered_proposal_votes: BTreeMap::new(),
             quorum_certificates: BTreeMap::new(),
             seen_service_attestations: BTreeSet::new(),
             seen_service_aggregates: BTreeSet::new(),
@@ -4586,6 +4860,335 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn uncertified_extension_of_certified_head_stays_pending_until_qc() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "certified-head-only",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let slot = ((certified_root.header.slot + 1)..(certified_root.header.slot + 51))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 2)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = Vec::new();
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number: 2,
+            parent_hash: certified_root.block_hash,
+            slot,
+            epoch,
+            proposer_id: 2,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: root_ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        let child = Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(2, &block_hash).unwrap(),
+            block_hash,
+        };
+
+        assert_eq!(
+            runner.accept_block(child.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        assert!(runner.orphan_blocks.is_empty());
+        assert_eq!(
+            runner
+                .preferred_pending_child_for_certified_head()
+                .map(|block| block.block_hash),
+            Some(child.block_hash)
+        );
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &child
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &child
+                ))
+                .unwrap()
+        );
+
+        assert_eq!(runner.ledger.snapshot().tip_hash, child.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_certified_child_is_not_requeued_by_orphan_promotion() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "pending-certified-child-lane",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let slot = ((certified_root.header.slot + 1)..(certified_root.header.slot + 51))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 2)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = Vec::new();
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number: 2,
+            parent_hash: certified_root.block_hash,
+            slot,
+            epoch,
+            proposer_id: 2,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: root_ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        let child = Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(2, &block_hash).unwrap(),
+            block_hash,
+        };
+
+        assert_eq!(
+            runner.accept_block(child.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert!(runner.orphan_blocks.is_empty());
+        assert_eq!(
+            runner
+                .preferred_pending_child_for_certified_head()
+                .map(|block| block.block_hash),
+            Some(child.block_hash)
+        );
+
+        runner.try_promote_orphans().await.unwrap();
+
+        assert!(runner.orphan_blocks.is_empty());
+        assert_eq!(
+            runner
+                .preferred_pending_child_for_certified_head()
+                .map(|block| block.block_hash),
+            Some(child.block_hash)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proposal_vote_for_unknown_block_is_buffered_until_block_arrives() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "buffer-unknown-vote",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 2, &block))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 3, &block))
+                .unwrap()
+        );
+
+        assert_eq!(
+            runner.accept_block(block.clone(), false).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(runner.quorum_certificates.contains_key(&block.block_hash));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validator_cannot_vote_for_two_children_at_same_block_height() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "same-height-vote-conflict",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let child_a = build_child(2, certified_root.header.slot + 1);
+        let child_b = build_child(3, child_a.header.slot + 1);
+
+        assert_eq!(
+            runner.accept_block(child_a.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(
+            runner.accept_block(child_b.clone(), false).await.unwrap(),
+            BlockAcceptance::Orphan
+        );
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 4, &child_a))
+                .unwrap()
+        );
+        assert!(runner
+            .import_proposal_vote(signed_proposal_vote(runner.crypto.as_ref(), 4, &child_b))
+            .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn replayable_branch_stays_orphan_until_certified_in_v2() {
         let genesis = sample_genesis();
         let config = sample_node_config(1, reserve_local_address(), Vec::new(), "prefer-branch");
@@ -4663,9 +5266,9 @@ mod tests {
                 .accept_block(current_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
         let mut competing_chain = runner
             .build_parent_chain_for_block(&competing_tip)
             .unwrap()
@@ -4690,14 +5293,11 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
-        assert_eq!(
-            runner.blocks.last().unwrap().block_hash,
-            current_tip.block_hash
-        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        assert_eq!(runner.blocks.last().unwrap().block_hash, certified_root.block_hash);
         assert!(
             runner
-                .orphan_blocks
+                .pending_certified_children
                 .iter()
                 .any(|block| block.block_hash == competing_tip.block_hash)
         );
@@ -4782,7 +5382,7 @@ mod tests {
                 .accept_block(current_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert_eq!(
             runner
@@ -4791,7 +5391,7 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
 
         assert!(
             runner
@@ -4802,8 +5402,17 @@ mod tests {
                 ))
                 .unwrap()
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
 
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &competing_tip
+                ))
+                .unwrap()
+        );
         assert!(
             runner
                 .import_proposal_vote(signed_proposal_vote(
@@ -4814,15 +5423,15 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            !runner
+            runner
                 .quorum_certificates
                 .contains_key(&competing_tip.block_hash)
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn replayable_orphan_block_records_local_vote_in_v2_mode() {
+    async fn replayable_orphan_block_skips_local_vote_if_validator_already_voted_at_height() {
         let genesis = sample_genesis();
         let config = sample_node_config(1, reserve_local_address(), Vec::new(), "orphan-vote");
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
@@ -4845,13 +5454,13 @@ mod tests {
             BlockAcceptance::Orphan
         );
 
-        let vote = runner
-            .proposal_votes
-            .get(&competing_tip.block_hash)
-            .and_then(|votes| votes.get(&runner.config.validator_id))
-            .expect("replayable orphan should receive a local vote");
-        assert_eq!(vote.block_hash, competing_tip.block_hash);
-        assert_eq!(vote.slot, competing_tip.header.slot);
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5039,14 +5648,14 @@ mod tests {
                 .accept_block(local_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert_eq!(
             responder
                 .accept_block(certified_peer_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert!(
             responder
@@ -5071,7 +5680,7 @@ mod tests {
                 .quorum_certificates
                 .contains_key(&certified_peer_tip.block_hash)
         );
-        assert_eq!(requester.ledger.snapshot().tip_hash, local_tip.block_hash);
+        assert_eq!(requester.ledger.snapshot().tip_hash, shared_root.block_hash);
 
         let response = responder.build_certified_sync_response_for_peer(&[SyncQcAnchor {
             block_hash: shared_root.block_hash,
@@ -5190,7 +5799,7 @@ mod tests {
                 .accept_block(requester_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert!(
             requester
@@ -5216,7 +5825,7 @@ mod tests {
                 .accept_block(responder_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert!(
             responder
@@ -5356,7 +5965,7 @@ mod tests {
                 .accept_block(certified_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert!(
             runner
@@ -5497,7 +6106,7 @@ mod tests {
                 .accept_block(certified_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Accepted
+            BlockAcceptance::Orphan
         );
         assert!(
             runner
@@ -6070,6 +6679,199 @@ mod tests {
         assert_eq!(runner.blocks.len(), 1);
         assert_eq!(metrics.service_gating_rejections, 0);
         assert_eq!(metrics.service_gating_enforcement_skips, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_local_v2_proposal_is_broadcast_after_qc_lock() {
+        let genesis = sample_genesis();
+        let local_address = reserve_local_address();
+        let peer_address = reserve_local_address();
+        let peer = PeerConfig {
+            validator_id: 2,
+            address: peer_address.clone(),
+        };
+        let config = sample_node_config(1, local_address, vec![peer], "pending-proposal-broadcast");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let certified_root = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+
+        let slot = ((certified_root.header.slot + 1)..(certified_root.header.slot + 50))
+            .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+            .unwrap();
+        let proposal_epoch = runner.consensus.epoch_for_slot(slot);
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.blocks.len(), 1);
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        let pending = runner
+            .preferred_pending_child_for_certified_head()
+            .expect("pending child should stay pending until certified");
+
+        loop {
+            match recv_protocol_message(&mut peer_events).await {
+                ProtocolMessage::BlockProposal(block) => {
+                    assert_eq!(block.block_hash, pending.block_hash);
+                    break;
+                }
+                ProtocolMessage::ProposalVote(_)
+                | ProtocolMessage::QuorumCertificate(_)
+                | ProtocolMessage::HeartbeatPulse(_)
+                | ProtocolMessage::ReceiptFetch { .. } => {}
+                other => panic!("expected pending block proposal broadcast, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proposer_rebroadcasts_existing_pending_child_instead_of_creating_sibling() {
+        let genesis = sample_genesis();
+        let local_address = reserve_local_address();
+        let peer_address = reserve_local_address();
+        let peer = PeerConfig {
+            validator_id: 2,
+            address: peer_address.clone(),
+        };
+        let config =
+            sample_node_config(1, local_address, vec![peer], "pending-child-rebroadcast");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let slot = ((certified_root.header.slot + 1)..(certified_root.header.slot + 50))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 3)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = Vec::new();
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number: 2,
+            parent_hash: certified_root.block_hash,
+            slot,
+            epoch,
+            proposer_id: 3,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: root_ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        let pending_child = Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(3, &block_hash).unwrap(),
+            block_hash,
+        };
+        assert_eq!(
+            runner
+                .accept_block(pending_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.orphan_blocks.len(), 0);
+        assert_eq!(
+            runner
+                .preferred_pending_child_for_certified_head()
+                .map(|block| block.block_hash),
+            Some(pending_child.block_hash)
+        );
+
+        let slot = ((pending_child.header.slot + 1)..(pending_child.header.slot + 50))
+            .find(|slot| runner.consensus.proposer_for_slot(*slot) == 1)
+            .unwrap();
+        let proposal_epoch = runner.consensus.epoch_for_slot(slot);
+        runner.last_processed_slot = Some(genesis.slots_per_epoch * proposal_epoch);
+
+        runner
+            .maybe_propose_block(slot, proposal_epoch)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.orphan_blocks.len(), 0);
+        assert_eq!(
+            runner
+                .preferred_pending_child_for_certified_head()
+                .map(|block| block.block_hash),
+            Some(pending_child.block_hash)
+        );
+
+        loop {
+            match recv_protocol_message(&mut peer_events).await {
+                ProtocolMessage::BlockProposal(block) => {
+                    assert_eq!(block.block_hash, pending_child.block_hash);
+                    break;
+                }
+                ProtocolMessage::ProposalVote(_)
+                | ProtocolMessage::QuorumCertificate(_)
+                | ProtocolMessage::HeartbeatPulse(_)
+                | ProtocolMessage::ReceiptFetch { .. } => {}
+                other => panic!("expected pending child rebroadcast, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

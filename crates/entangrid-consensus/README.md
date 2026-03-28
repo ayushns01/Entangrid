@@ -160,7 +160,8 @@ Important current limit:
 
 - the baseline receipt-driven scoring model is still useful as the benchmark path on `codex/consensus-v1`
 - `main` now carries the active V2 scoring work behind `consensus_v2`
-- service-evidence gating from prior-epoch aggregates is live, and certified sync is now active, but the ordering story is still incomplete at larger validator counts
+- service-evidence gating from prior-epoch aggregates is live, and the node/runtime path now has certified sync plus QC-dominant branch choice
+- the main remaining limit at larger validator counts is no longer activating ordering recovery, but stabilizing service evidence and gating semantics once ordering converges
 - the active redesign and stabilization work live in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## Why this crate matters

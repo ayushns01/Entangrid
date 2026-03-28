@@ -80,14 +80,23 @@ Latest verified outcome:
 
 ### Issue 2: Canonical Branch Selection
 
-Problem:
+Status:
 
-- even after the first QC-ordering slices, `6/7/8` still end on too many distinct tips
+- completed enough on `main` to move focus to Issue 3
 
-Goal:
+What was fixed:
 
-- highest QC-backed branch must dominate live canonical choice
-- uncertified local drift must stop beating shared certified state
+- dedicated pending certified-child lane instead of recycling post-QC children through orphan promotion
+- buffering for proposal votes that arrive before the corresponding block
+- same-height vote discipline so one validator cannot keep multiple children alive at the same block height
+- QC import now evicts weaker same-height votes on losing branches
+- local conflicting auto-votes are treated as safe skips instead of aborting block processing
+
+Latest verified outcome:
+
+- healthy `6`: `same_chain = 6/6`, height `26`, certified sync active, full snapshot `0`
+- healthy `7`: `same_chain = 7/7`, height `17`, certified sync active, full snapshot `0`
+- healthy `8`: `same_chain = 8/8`, height `11`, certified sync active, full snapshot `0`
 
 ### Issue 3: Service-Gating Enforcement At Scale
 
@@ -114,14 +123,20 @@ Goal:
 
 ### Current Focus
 
-Work on **Issue 2** next.
+Work on **Issue 3** next.
 
 Issue 1 is now complete enough to close because:
 
 - live bursty runs show nonzero certified sync activity on `6/7/8`
 - certified repair is no longer stuck behind legacy snapshot repair
 
-The next blocker is no longer sync activation. It is canonical branch selection and convergence after repair.
+Issue 2 is now complete enough to close because:
+
+- healthy `6/7/8` bursty runs now finish on one tip
+- certified sync remains active during those runs
+- full snapshot fallback no longer drives the healthy live-recovery path
+
+The next blocker is no longer sync activation or canonical branch choice. It is service-gating enforcement and score stability after recovery.
 
 ## File Structure
 

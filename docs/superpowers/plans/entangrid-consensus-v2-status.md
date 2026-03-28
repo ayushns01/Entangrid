@@ -90,7 +90,7 @@ So the active V2 code has strong unit/integration coverage for:
 Comparative bursty testing now shows two different truths at once:
 
 - certified sync activation is now real in live runs
-- larger-validator convergence is still not where it needs to be
+- larger-validator convergence is now much healthier structurally
 
 Most importantly:
 
@@ -100,23 +100,24 @@ Most importantly:
 
 Latest repeated healthy `6/7/8` bursty validation on `main` showed:
 
-- `6`: `certified_sync_served = 104`, `certified_sync_applied = 81`, `full_sync_applied = 2`
-- `7`: `certified_sync_served = 80`, `certified_sync_applied = 77`, `full_sync_applied = 8`
-- `8`: `certified_sync_served = 438`, `certified_sync_applied = 158`, `full_sync_applied = 0`
+- `6`: `same_chain = 6/6`, height `26`, `certified_sync_applied > 0`, `full_sync_applied = 0`
+- `7`: `same_chain = 7/7`, height `17`, `certified_sync_applied > 0`, `full_sync_applied = 0`
+- `8`: `same_chain = 8/8`, height `11`, `certified_sync_applied > 0`, `full_sync_applied = 0`
 
-That means the sync-activation blocker has been cut down substantially. The remaining failures are now mostly about what happens after repair: nodes still do not choose the same canonical branch strongly enough.
+That means both Issue 1 and Issue 2 have been cut down substantially:
+
+- certified sync is active in live recovery
+- QC-dominant branch choice plus the pending-certified-child lane now keep healthy `6/7/8` runs on one tip
 
 ## What Is Still Broken
 
-The biggest remaining blocker is still structural ordering and repair at larger validator counts.
+The biggest remaining blocker is now service-score stability and gating semantics at larger validator counts.
 
-The latest branch-comparison matrix makes that pretty clear:
+The latest healthy bursty runs on `main` make that pretty clear:
 
-- `v1` still performs better overall as the benchmark/control line
-- `v2` is the right architecture direction, but it still trails `v1` on overall convergence
-- healthy and degraded `6/7/8` runs still show too many split tips
-- QC objects are being built, but QC-backed canonical reorg behavior is still not strong enough
-- certified sync is now live, but it is not enough by itself to make `6/7/8` converge
+- structural convergence is now much better than the older `3/6`, `2/7`, `3/8` shapes
+- certified sync is active and full-snapshot fallback is no longer driving these healthy `6/7/8` runs
+- but `7` and especially `8` still show service-score collapse and `0` gating rejections
 
 In the latest cross-branch comparison:
 
@@ -125,7 +126,7 @@ In the latest cross-branch comparison:
 - `v1 degraded` average target score was `0.090`
 - `v2 degraded` average target score was `0.217`
 
-So the service side is moving in the right direction, but the full live matrix is not green yet and `v1` still sets the benchmark we need `v2` to beat.
+So the service side is still the next thing to beat: the full live matrix is not green yet because larger healthy runs can converge structurally while still ending with incorrect score/gating behavior.
 
 ## What This Means
 
@@ -135,18 +136,17 @@ The honest status is:
 
 - V2 service evidence is substantially better than the legacy model
 - degraded punishment is working in smaller benchmark cases but is still not reliable enough across the full matrix
-- the ordering side is still incomplete
-- the remaining pre-PQ blockers are QC-backed canonical fork choice, service-gating enforcement at scale, and stronger `6/7/8` bursty convergence
+- Issue 1 certified-sync activation is effectively closed
+- Issue 2 QC-backed canonical branch selection is effectively closed for the healthy `6/7/8` structural runs we just repeated
+- the remaining pre-PQ blocker is service-gating enforcement at scale
 
 ## Next Work
 
 The next implementation priorities are:
 
-1. make QCs actually drive canonical branch selection
-2. add stronger certified reorg behavior
-3. tighten service-gating enforcement at scale
-4. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification against the V1 benchmark line
-5. only after that move to PQ-safe signature/session integration
+1. tighten service-gating enforcement at scale
+2. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification against the V1 benchmark line
+3. only after that move to PQ-safe signature/session integration
 
 ## Recommended Reading Order
 

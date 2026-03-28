@@ -53,7 +53,7 @@ The current recommended prototype gating profile emitted by default is:
 - `service_score_window_epochs = 4`
 - weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-That default is still the best current 4-validator baseline, but the latest live matrix now keeps a healthy 6-validator gated case in the suite precisely because larger bursty topologies are still the open convergence problem before PQ work.
+That default is still the best current 4-validator baseline, but the live matrix now keeps healthy `6/7/8` cases in the suite because the remaining pre-PQ problem has shifted from structural reconvergence to service-score and gating behavior at larger validator counts.
 
 Current branch focus:
 

@@ -15,15 +15,16 @@ Current status note:
 
 - `main` now carries the active `consensus_v2` work behind config
 - the baseline receipt-driven path still exists for comparison when `consensus_v2` is disabled and is preserved on `codex/consensus-v1`
-- committee-attested service evidence, confirmed prior-epoch gating, and the first QC-ordering slices are live on `main`
-- the remaining work is certificate-dominant fork choice across the full matrix, certified sync, and only then PQ integration
+- committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
+- the remaining work is service-gating enforcement and score stability across the full matrix, and only then PQ integration
 
 On the active `consensus_v2` path on `main`, the protocol direction is tightening further:
 
 - witnesses produce scoped `ServiceAttestation` records for the validators they were actually assigned to observe
 - nodes build `ServiceAggregate` records from those attestations
 - proposer gating reads prior-epoch aggregate evidence instead of raw local receipt views
-- proposal votes and quorum certificates are live, but fork choice and sync are still only partially certificate-driven
+- proposal votes, quorum certificates, certified sync, and QC-dominant canonical branch choice are live
+- the next blocker is not branch recovery itself, but stable service-evidence interpretation once recovery succeeds at `7/8`
 
 ## Protocol Goals
 
@@ -187,7 +188,8 @@ This lets the chain preserve public randomness while still punishing validators 
 Current V2 note:
 
 - the service side of this rule is live on `main` behind `consensus_v2`
-- the ordering side now has proposal votes and quorum certificates, but still needs stronger certified branch selection and certified sync
+- the ordering side now includes proposal votes, quorum certificates, certified sync, and QC-dominant branch selection
+- the remaining pre-PQ gap is reliable service scoring and gating behavior at larger validator counts
 
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 

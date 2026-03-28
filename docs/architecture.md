@@ -10,7 +10,8 @@ Current status note:
 
 - `main` now carries the active V2-focused architecture work behind `consensus_v2`
 - the baseline receipt-driven path is still available when `consensus_v2` is disabled and is preserved as the benchmark line on `codex/consensus-v1`
-- committee-attested service evidence and the first QC-ordering slices are live on `main`, but certified sync and full validator-count convergence are still unfinished
+- committee-attested service evidence, certified sync, and QC-dominant branch choice are now live on `main`
+- healthy `6/7/8` bursty runs now reconverge structurally on one tip, but larger-topology service scoring and gating are still unfinished
 - the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## High-Level Components
@@ -104,7 +105,8 @@ Current V2 detail on `main`:
 
 - service-evidence gating is partially live behind `consensus_v2`
 - certified sync is now live behind `consensus_v2`
-- QC-backed canonical branch selection is still the next consensus milestone and is the main remaining reason larger bursty `6/7/8` validator runs can still diverge structurally
+- QC-backed canonical branch selection is now active behind `consensus_v2`
+- the main remaining consensus/runtime gap is service-gating behavior at larger validator counts, not fork choice activation
 
 ### 7. Storage Layer
 
@@ -143,7 +145,8 @@ The simulator is a first-class part of the architecture, not an afterthought.
 On the current V2 path, steps 6 and 7 are in transition:
 
 - service scores are driven by witness-aligned aggregates when `consensus_v2` is enabled
-- ordering now includes proposal votes, quorum certificates, and certified suffix sync, but canonical branch choice is still not fully certificate-driven end to end
+- ordering now includes proposal votes, quorum certificates, certified suffix sync, and QC-dominant canonical branch choice
+- the remaining instability is in service evidence and gating at `7/8`, not in whether certified state can dominate local drift
 
 ## Process Model For Localnet
 

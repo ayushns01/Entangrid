@@ -242,7 +242,7 @@ This is why bursty runs can temporarily split the network into short competing b
 
 The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
 
-But fork repair is still mostly reactive because certified sync is not finished yet.
+Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. The next open problem is service-evidence/gating behavior at larger validator counts.
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 
