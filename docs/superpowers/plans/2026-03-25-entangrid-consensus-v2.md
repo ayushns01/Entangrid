@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+Historical note:
+
+- this plan was written before the first V2 slices were merged to `main`
+- `main` now carries the active V2 line behind `consensus_v2`
+- branch/worktree references below should be read as staging guidance, not as a claim that V2 still lives only off-main
+
 **Goal:** Replace local-receipt-driven proposer gating with committee-attested service evidence and certificate-backed ordering that stays correct across changing validator counts.
 
 **Architecture:** Keep the current ledger, simulator, and validator process model, but split the protocol into three explicit planes: ordering, service evidence, and sync. Ordering moves from ad hoc fork repair to quorum certificates on proposals; service gating moves from local receipt views to prior-epoch committee aggregates; sync moves certified blocks and service aggregates first, with chunked snapshot fallback only when necessary.

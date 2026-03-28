@@ -64,6 +64,12 @@ It is not good enough for:
 - public deployment
 - meaningful cryptographic claims
 
+Current main-branch focus:
+
+- stabilize the V2 protocol path on `main` first
+- keep the crypto boundary clean while consensus, ordering, and sync are still changing
+- only move to real PQ integration after the single-machine V2 matrix is green
+
 ## Why this crate matters
 
 This abstraction is important because it lets the rest of the blockchain move forward without being blocked on the final PQ stack.

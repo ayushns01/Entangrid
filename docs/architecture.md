@@ -8,10 +8,10 @@ Instead of treating networking as a side detail, the protocol records and scores
 
 Current status note:
 
-- the `main` branch architecture is still centered on the first working receipt-driven prototype
-- that prototype is enough for localnet experiments, but it is not yet the final architecture for larger validator counts
-- the active redesign toward committee-attested service evidence, certificate-backed ordering, and cleaner separation of ordering/service/sync planes is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
-- the latest implementation status for that redesign is in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md)
+- `main` now carries the active V2-focused architecture work behind `consensus_v2`
+- the baseline receipt-driven path is still available when `consensus_v2` is disabled and is preserved as the benchmark line on `codex/consensus-v1`
+- committee-attested service evidence and the first QC-ordering slices are live on `main`, but certified sync and full validator-count convergence are still unfinished
+- the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## High-Level Components
 
@@ -68,7 +68,7 @@ This is the most distinctive subsystem in the project.
 
 The witness engine turns "network entanglement" into measurable protocol evidence instead of private local state.
 
-Current V2 branch detail:
+Current V2 detail on `main`:
 
 - witness-derived service evidence is now moving from raw receipt views to explicit `ServiceAttestation` and `ServiceAggregate` objects
 - attestations are intentionally lagged by one epoch after receipt reconciliation so the evidence plane uses settled observations instead of freshest-gossip guesses
@@ -100,7 +100,7 @@ Consensus should use public randomness and verifiable inputs.
 
 The relay score should affect proposer eligibility or rewards, but not replace auditable randomness.
 
-Current V2 branch detail:
+Current V2 detail on `main`:
 
 - service-evidence gating is partially live behind `consensus_v2`
 - QC-backed ordering is still the next consensus milestone and is the main remaining reason larger bursty `6/8` validator runs can still diverge structurally
@@ -141,8 +141,8 @@ The simulator is a first-class part of the architecture, not an afterthought.
 
 On the current V2 path, steps 6 and 7 are in transition:
 
-- service scores are increasingly driven by witness-aligned aggregates
-- fork choice is still legacy until proposal votes and quorum certificates are added
+- service scores are driven by witness-aligned aggregates when `consensus_v2` is enabled
+- ordering now includes proposal votes and quorum certificates, but canonical branch choice and sync are still not fully certificate-driven end to end
 
 ## Process Model For Localnet
 

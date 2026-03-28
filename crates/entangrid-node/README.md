@@ -113,13 +113,16 @@ The node also:
 - drops and logs invalid peer receipts, invalid peer transactions, and invalid peer blocks instead of crashing the process
 - writes metrics more eagerly around block and slot transitions so localnet reports stay closer to the saved chain state
 
-Experimental `consensus_v2` additions:
+Current `consensus_v2` additions on `main`:
 
 - committee witnesses emit `ServiceAttestation` records for validators they were actually assigned to observe
 - nodes import and store those attestations, then publish/import `ServiceAggregate` records
 - at epoch transition, the node first reconciles receipts for `epoch - 1`, then emits attestations for `epoch - 2`
 - this one-epoch lag is intentional: it prevents witnesses from publishing empty evidence before the prior epoch's receipts have finished propagating
-- when no newer usable aggregate exists yet, the node now preserves the last known service score instead of forcing a temporary zero
+- local proposer gating now distinguishes confirmed low-score rejection from no-evidence and insufficient-evidence skips
+- when no newer usable aggregate exists yet, the node now preserves the last known score for observability while skipping enforcement unless the immediately prior epoch is confirmed
+- proposal votes and quorum certificates are live in the runtime
+- equal-QC uncertified sibling branches no longer replace the current canonical tip just because they gained extra local vote support
 
 That means the node can now explain service gating in a much more concrete way:
 
@@ -167,9 +170,10 @@ That profile is still the shared default emitted by `init-localnet`, but it shou
 
 Important current limit:
 
-- the `main` branch node runtime still uses the legacy receipt-driven service-gating path
-- that path is useful for localnet experiments, but it is not yet the final validator-count-scalable design
-- the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
+- the baseline receipt-driven path still exists and is preserved as the benchmark line on `codex/consensus-v1`
+- `main` is now the active V2-focused node runtime line
+- certified sync and full larger-validator convergence are still not finished
+- the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking:
 
@@ -182,13 +186,8 @@ The recent validation-focused improvement in this crate was about correctness un
 - repeated sync requests from the same peer are throttled, which makes the prototype harder to abuse without breaking recovery
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
-- the latest rigorous testing still shows a remaining open issue in 6-validator bursty runs: the node can survive and keep scoring honest validators correctly, but larger-topology peers still do not always reconverge within the normal settle window
-
-The latest V2-specific bursty runs on this branch now look like this:
-
-- `4 validators`: healthy service scores, zero false gating, converged
-- `6 validators`: service scores are healthy again, but fork choice is still weak enough that bursty peers diverge
-- `8 validators`: service evidence is no longer collapsing to all-zero immediately, but validator-count-aware coverage is still not strong enough to keep all honest validators healthy
+- the active matrix focus on `main` is the V2 `4/5/6/7/8` healthy and degraded bursty sweep, using `codex/consensus-v1` as the benchmark/control line
+- larger-topology peers still do not always reconverge within the normal settle window, which is why QC-backed ordering and certified sync remain the next node-runtime milestones
 
 So the next node-runtime milestone is no longer just "make scores less noisy". It is:
 

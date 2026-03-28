@@ -4,9 +4,9 @@ This document explains how the current `main` branch of `Entangrid` works from s
 
 Important note:
 
-- this is the flow of the current working prototype on `main`
-- it is not the final V2 consensus architecture
-- it is the receipt-driven version that runs today
+- `main` now carries both the baseline receipt-driven flow and the newer `consensus_v2` path
+- this document mainly explains the baseline/default flow, with V2 callouts where the behavior changes
+- the V2 path is the active development focus, but it is still not the final certified-sync / PQ-ready architecture
 
 ## 1. A Local Network Is Created
 
@@ -158,6 +158,8 @@ While the network is running, nodes also exchange and observe:
 
 Assigned witnesses can issue relay receipts when they observe the required behavior.
 
+When `consensus_v2` is enabled, witnesses also emit scoped `ServiceAttestation` records and nodes build `ServiceAggregate` records from those attestations.
+
 Those receipts are later used to compute service scores.
 
 That is how the project tries to connect network usefulness to consensus participation.
@@ -180,7 +182,14 @@ If service gating is enabled, there is one more check:
 
 - is my current service score above the configured threshold?
 
-If the score is too low:
+In the baseline path, that score comes from the rolling receipt-driven counters.
+
+In `consensus_v2`, local proposer gating now behaves more carefully:
+
+- a confirmed low prior-epoch aggregate can reject the proposer
+- missing or insufficient prior-epoch evidence skips enforcement instead of forcing a false rejection
+
+If the confirmed score is too low:
 
 - the node misses the slot
 - this counts as a gating rejection
@@ -231,7 +240,9 @@ If the received block's parent does not match the node's current tip:
 
 This is why bursty runs can temporarily split the network into short competing branches.
 
-The current prototype does not yet use QC-backed ordering, so fork repair is still mostly reactive.
+The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
+
+But fork repair is still mostly reactive because certified sync is not finished yet.
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 
@@ -258,7 +269,7 @@ So today the single chain emerges from:
 - local block acceptance rules
 - sync-based convergence
 
-not from finality certificates yet.
+and, on the V2 path, the first QC-backed branch constraints.
 
 ## 14. Service Scores Are Refreshed
 

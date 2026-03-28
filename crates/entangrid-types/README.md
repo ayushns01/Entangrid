@@ -53,13 +53,16 @@ Right now this crate is intentionally simple and very central.
 - `ProtocolMessage` is the current network message enum:
   - transaction broadcast
   - block proposal
+  - proposal votes and quorum certificates
   - sync status, sync request/response, and incremental sync blocks
   - heartbeat pulse
   - relay receipt
   - receipt fetch/response
+  - service attestations and service aggregates for `consensus_v2`
 - `FeatureFlags` currently includes:
   - receipt enablement
   - service-gating enablement
+  - `consensus_v2` enablement
   - the epoch where gating should start
   - the score threshold used by service gating
   - the number of epochs included in the rolling service-score window
@@ -72,6 +75,7 @@ Right now this crate is intentionally simple and very central.
 - `NodeMetrics` now carries both:
   - the latest local service score
   - the latest local service counters used to explain that score
+  - service-gating rejection and enforcement-skip counts
   - duplicate receipt counts that were ignored by the node
   - sync-throttle, peer-rate-limit, inbound-session-drop, and sync-mode counters so recovery behavior is visible in reports
 
@@ -123,6 +127,12 @@ One recent example of the type layer evolving with recovery behavior is sync:
 - `ProtocolMessage` now distinguishes small `SyncStatus` announcements from heavier sync payloads
 - `ChainSegment` lets same-chain peers exchange only the missing block suffix plus recent receipts
 - full `ChainSnapshot` is still available as the fallback for unknown or divergent peers
+
+One recent example of the type layer evolving with the active main-branch V2 work is ordering and evidence:
+
+- `ProposalVote` and `QuorumCertificate` now travel through the shared type layer
+- `ServiceAttestation` and `ServiceAggregate` now carry the witness-aligned evidence needed for the V2 path
+- `NodeMetrics` now distinguishes actual gating rejections from enforcement skips when evidence is missing or insufficient
 
 ## Where we want to take it
 

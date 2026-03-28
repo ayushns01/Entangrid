@@ -4,17 +4,18 @@ This document is a status update for the active `consensus_v2` redesign work. It
 
 Important note:
 
-- this work is currently happening on the `codex/consensus-v2` branch
-- it is not merged into `main` yet
-- it is a progress snapshot, not a claim that V2 is finished
+- this work now exists on `main` as the active protocol line
+- the older V1 benchmark line is preserved on `codex/consensus-v1`
+- `codex/consensus-v2` remains the staging branch for continued V2 work
+- this is still a progress snapshot, not a claim that V2 is finished
 
 ## What Was Implemented
 
-The V2 branch now includes real protocol groundwork beyond the original plan document.
+The active V2 code on `main` now includes real protocol groundwork beyond the original plan document.
 
 ### 1. Shared V2 protocol objects and config
 
-Implemented in the V2 branch:
+Implemented in the active V2 code:
 
 - `consensus_v2` feature flag
 - `ProposalVote`
@@ -23,7 +24,7 @@ Implemented in the V2 branch:
 - `ServiceAggregate`
 - certified sync placeholder types
 
-This means the redesign is no longer only theoretical. The branch has concrete transportable objects for certificate-backed ordering and committee-attested service evidence.
+The redesign is no longer only theoretical. `main` now has concrete transportable objects for certificate-backed ordering and committee-attested service evidence.
 
 ### 2. Committee-attested service evidence
 
@@ -47,7 +48,7 @@ This was important because earlier V2 runs were freezing zeroed evidence too ear
 
 ### 4. First QC-ordering slice
 
-The V2 branch now also has:
+The active V2 code now also has:
 
 - `ProposalVote` verification
 - vote storage
@@ -60,19 +61,20 @@ This is the beginning of certificate-backed ordering, but not the finished fork-
 
 ## What Was Verified
 
-The following package test suite passed on the V2 branch:
+The following package test suite passed on the active V2 code:
 
 ```bash
-cargo test -p entangrid-consensus -p entangrid-node -p entangrid-sim
+cargo test -p entangrid-types -p entangrid-consensus -p entangrid-node -p entangrid-sim
 ```
 
 Passing counts in the latest verified run:
 
+- `entangrid-types`: `4/4`
 - `entangrid-consensus`: `9/9`
-- `entangrid-node`: `39/39`
-- `entangrid-sim`: `12/12`
+- `entangrid-node`: `44/44`
+- `entangrid-sim`: `13/13`
 
-So the branch has strong unit/integration coverage for:
+So the active V2 code has strong unit/integration coverage for:
 
 - V2 service evidence validation
 - V2 score refresh behavior
@@ -82,48 +84,47 @@ So the branch has strong unit/integration coverage for:
 
 ## What Improved In Live Testing
 
-Healthy V2 bursty testing improved on the service side.
+Comparative bursty testing shows real progress on the service side even though convergence is still not where it needs to be.
 
-In the latest healthy `6`-validator bursty run on the V2 branch:
+Most importantly:
 
-- healthy validators no longer collapsed to universal `0.000` service scores
-- total gating rejections dropped to `0`
-- final service scores were around `0.583` across validators
+- `v2` can now punish degraded validators in the smaller benchmark topologies instead of leaving them at `1.000`
+- `degraded/4` and `degraded/5` on `v2` already produce real gating while keeping honest validators at `1.0`
+- healthy `6`-validator runs keep honest service scores high much more often than the older V2 service-collapse cases
 
-That is a meaningful improvement over earlier V2 runs where healthy larger-topology bursty networks were collapsing into zero scores and broad false gating.
+That means the service-evidence plane is materially healthier than the first V2 slices, even though the ordering and sync story still needs more work.
 
 ## What Is Still Broken
 
-The biggest remaining blocker is still structural ordering.
+The biggest remaining blocker is still structural ordering and repair at larger validator counts.
 
-Even after the recent service-evidence fixes, a frozen healthy `6`-validator bursty run still ended with:
+The latest branch-comparison matrix makes that pretty clear:
 
-- `same_chain_count = 2/6`
-- `distinct_tips = 5`
-- `height_spread = 42`
-
-That means:
-
-- service evidence is healthier
-- healthy validators are not being unfairly gated as aggressively
-- but the network still does not converge reliably on one final branch in the larger bursty case
-
-Also important:
-
-- QC objects are being built
-- but QC-backed canonical reorg behavior is still not strong enough
+- `v1` still performs better overall as the benchmark/control line
+- `v2` is the right architecture direction, but it still trails `v1` on overall convergence
+- healthy and degraded `6/7/8` runs still show too many split tips
+- QC objects are being built, but QC-backed canonical reorg behavior is still not strong enough
 - certified sync is still incomplete
+
+In the latest cross-branch comparison:
+
+- `v1 degraded` average same-chain ratio was `0.587`
+- `v2 degraded` average same-chain ratio was `0.487`
+- `v1 degraded` average target score was `0.090`
+- `v2 degraded` average target score was `0.217`
+
+So the service side is moving in the right direction, but the full live matrix is not green yet and `v1` still sets the benchmark we need `v2` to beat.
 
 ## What This Means
 
-The redesign direction still looks correct, but the branch is not ready for PQ integration yet.
+The redesign direction still looks correct, but `main` is not ready for PQ integration yet.
 
 The honest status is:
 
 - V2 service evidence is substantially better than the legacy model
-- the service-side collapse in healthy larger topologies has improved
+- degraded punishment is working in smaller benchmark cases but is still not reliable enough across the full matrix
 - the ordering side is still incomplete
-- the remaining pre-PQ blocker is QC-backed canonical fork choice and certified sync
+- the remaining pre-PQ blockers are QC-backed canonical fork choice, certified sync, and stronger `6/7/8` bursty convergence
 
 ## Next Work
 
@@ -132,7 +133,7 @@ The next implementation priorities are:
 1. make QCs actually drive canonical branch selection
 2. add stronger certified reorg behavior
 3. add certified sync for QC-backed suffix repair
-4. rerun healthy and degraded V2 `4/6/8` bursty verification
+4. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification against the V1 benchmark line
 5. only after that move to PQ-safe signature/session integration
 
 ## Recommended Reading Order

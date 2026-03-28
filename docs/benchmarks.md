@@ -11,6 +11,13 @@ The purpose is to learn:
 - whether witness entanglement improves or harms liveness
 - how the protocol reacts under churn, congestion, and partial isolation
 
+Current benchmark gate on `main`:
+
+- healthy and degraded bursty localnets across `4/5/6/7/8` validators
+- `consensus_v2` is the implementation target
+- `codex/consensus-v1` is the benchmark/control line
+- PQ integration stays out of scope until the V2 matrix is green
+
 ## Core Metrics
 
 ### Cryptography
@@ -153,6 +160,7 @@ Run these in order:
 3. four-node witness receipt benchmark
 4. four-node degraded-link benchmark
 5. seven-node churn and isolation benchmark
+6. `4/5/6/7/8` healthy and degraded bursty V2 matrix against the V1 benchmark line
 
 ## Rule For Interpreting Results
 

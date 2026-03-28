@@ -123,6 +123,16 @@ Recommended order:
 7. attack harness
 8. score tuning
 
+## Current Main-Branch Focus
+
+The current focus on `main` is no longer "invent V2 on a side branch." It is:
+
+- stabilize `consensus_v2` on `main`
+- keep `codex/consensus-v1` as the benchmark/control line
+- make the single-machine `4/5/6/7/8` healthy and degraded bursty matrix go green
+- finish certified sync and stronger QC-dominant convergence
+- only then move to PQ-safe crypto integration
+
 ## What Not To Build Too Early
 
 - smart contracts

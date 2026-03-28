@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+Historical note:
+
+- this stabilization plan was drafted while `codex/consensus-v2` was still the primary staging branch
+- `main` now carries the active V2 implementation line
+- branch/worktree references below should be read as execution context from that time, not as the current repository focus
+
 **Goal:** Make `consensus_v2` the active protocol path by restoring `v1`-level degraded-validator punishment at `4/5` validators while materially improving `6/7/8` validator convergence under bursty load.
 
 **Architecture:** Keep `v1` as the benchmark and keep `v2` as the implementation target. The next V2 phase should stop treating service evidence, branch choice, and sync as loosely coupled local heuristics. Instead, service evidence must become enforceable proposer policy from confirmed aggregates, QC state must become the dominant canonical-branch truth, and sync must repair from the highest shared certified point instead of waiting for legacy drift repair.

@@ -49,6 +49,11 @@ When a block is applied:
 
 The crate also supports replaying blocks from genesis and parsing stored snapshots.
 
+Current main-branch focus:
+
+- keep the ledger intentionally stable while the active work on `main` is still in consensus, evidence, ordering, and sync
+- preserve deterministic replay so V1 and V2 branch comparisons stay meaningful
+
 ## What the ledger currently supports
 
 Today this crate supports only:

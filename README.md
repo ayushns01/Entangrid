@@ -53,6 +53,7 @@ This repository instead documents a more defensible design:
 - [Benchmarking Plan](docs/benchmarks.md)
 - [Consensus V2 Redesign Plan](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
 - [Consensus V2 Status Update](docs/superpowers/plans/entangrid-consensus-v2-status.md)
+- [Consensus V2 Stabilization Plan](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## MVP Scope
 
@@ -99,36 +100,40 @@ The repository now includes a working Rust workspace with:
 - a CLI node binary and localnet simulator
 - block commitments backed by explicit receipt bundles in the runtime prototype
 - a direct-delivery witness model where relay targets act as the current prototype witnesses for receipt generation
-- an experimental `consensus_v2` path that replaces local receipt-driven gating with witness-aligned service attestations and prior-epoch service aggregates
+- a baseline receipt-driven path that still remains available when `consensus_v2` is disabled
+- an active `consensus_v2` path on `main` that replaces raw local receipt-driven gating with witness-aligned service attestations, prior-epoch service aggregates, and the first QC-ordering slices
 
 Important:
 
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
 - real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
-- the current `main` branch still uses the legacy receipt-driven gating prototype; the active redesign toward committee-attested service evidence and certificate-backed ordering is documented in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
-- the latest branch-level implementation progress and blockers are summarized in [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md)
+- the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
+- the active protocol work now happens on `main`
+- `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back
+- the redesign direction and the latest implementation status are documented in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
-## Experimental Consensus V2 Status
+## Current Main-Branch V2 Status
 
-This branch also carries the first real `consensus_v2` implementation behind config.
+`main` now carries the active `consensus_v2` implementation behind config.
 
 Current V2 shape:
 
 - service evidence is produced by the validator's actual assigned witnesses, not by a separate ad hoc observer set
 - each witness attests only to the obligations it can really observe for that validator
 - nodes reconcile receipts for the just-finished epoch first, then publish attestations for the prior completed epoch with a one-epoch lag
-- proposer gating reads the latest available aggregate from an earlier epoch instead of dropping straight to zero when the newest aggregate is still in flight
+- local proposer gating distinguishes:
+  - confirmed low-score rejection
+  - insufficient-evidence skip
+  - no-evidence skip
+- proposal votes and quorum certificates are live in the node runtime
+- equal-QC uncertified sibling branches no longer replace the current canonical tip just because they gained extra local votes
 
-Current live V2 bursty status is mixed:
-
-- `4 validators`: healthy, converged, and no false gating in the latest run
-- `6 validators`: service scores are now healthy, but ordering still diverges under bursty load
-- `8 validators`: service evidence is much better than before, but still not strong enough to avoid some score collapse and partial convergence trouble
-
-So the main remaining V2 blockers are now:
+The main remaining V2 blockers are now:
 
 - QC-backed ordering and fork choice
-- further validator-count-aware service coverage improvement at larger topologies
+- certified sync from the highest shared QC
+- validator-count-aware service coverage and convergence across the full `4/5/6/7/8` bursty matrix
+- real PQ integration only after that matrix is green
 
 ## Current Recommended Prototype Policy
 
@@ -151,20 +156,20 @@ This is still the best current 4-validator policy baseline:
 Important:
 
 - the harsh 4-validator Entangrid scenarios and abuse scenarios are currently in a much better place than before
-- the current live matrix still shows that 6-validator bursty scenarios do not reconverge quickly enough after the normal settle window
-- because of that, this policy should be treated as the current 4-validator pre-PQ baseline, not as a final all-topology signoff
+- the current active correctness gate is still the single-machine healthy and degraded bursty matrix across `4/5/6/7/8`
+- because of that, this policy should be treated as the current pre-PQ baseline, not as a final all-topology signoff
 
 ## Active Redesign Direction
 
-The current prototype proved the core Entangrid idea is implementable, but it also exposed a real scaling limitation:
+The current prototype proved the core Entangrid idea is implementable, and `main` now carries the first real V2 stabilization slices, but the scaling work is not finished yet:
 
-- the current local-receipt-driven score path is still too topology-sensitive at larger validator counts
-- the next protocol step should move proposer gating onto prior-epoch committee-attested service aggregates
-- fork choice should eventually prefer certificate-backed ordering instead of relying on ad hoc repair alone
+- the baseline local-receipt path is still too topology-sensitive at larger validator counts
+- V2 service gating must keep improving from confirmed prior-epoch committee evidence
+- fork choice must move further toward certificate-backed ordering instead of relying on ad hoc repair alone
+- certified sync still needs to become the default repair path for V2 suffix recovery
 
-That redesign is planned in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md).
-The latest status update for that work lives in [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md).
-Until that work lands, treat the current `main` branch as the strongest validated research prototype, not the final consensus architecture.
+That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
+Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.
 
 ## Quickstart
 
@@ -179,6 +184,9 @@ Generate a four-node localnet:
 ```bash
 cargo run -p entangrid-sim -- init-localnet --validators 4 --base-dir var/localnet
 ```
+
+That default localnet still starts in the baseline path.
+To run the active V2 line on `main`, pass `--consensus-v2` when you initialize the network.
 
 Start the localnet:
 
@@ -257,7 +265,7 @@ Then inspect:
 - `node-4/events.log` for missed slots due to low service score
 - `node-4/metrics.json` for `service_gating_rejections`, `duplicate_receipts_ignored`, `peer_rate_limit_drops`, `inbound_session_drops`, `service_gating_start_epoch`, the latest local score, and the latest local service counters, including any failed-session or invalid-receipt penalties that contributed to that score
 
-To initialize a localnet with the experimental V2 path enabled:
+To initialize a localnet with the active V2 path enabled on `main`:
 
 ```bash
 cargo run -p entangrid-sim -- init-localnet \

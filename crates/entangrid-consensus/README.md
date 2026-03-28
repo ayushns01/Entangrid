@@ -58,7 +58,7 @@ Current prototype detail:
 - that is because only the receiving relay target actually observes the message today
 - this keeps the witness rules consistent with what the runtime can really prove, instead of assuming third-party observers that the current network layer does not yet model
 
-Experimental `consensus_v2` detail:
+Current `consensus_v2` detail on `main`:
 
 - the V2 service committee for a validator now uses that validator's actual assigned witnesses
 - this removes the earlier mismatch where a derived observer set could be asked to score work it never directly observed
@@ -99,7 +99,7 @@ Current runtime detail:
   - diversity `0.25`
   - penalty `1.00`
 
-Experimental `consensus_v2` scoring detail:
+Current `consensus_v2` scoring detail on `main`:
 
 - witness attestations are now scoped to the specific obligations that witness can actually observe for the subject validator
 - service aggregates are intended to summarize witness-attested evidence from earlier epochs, not whatever raw receipt gossip one node happened to cache locally
@@ -158,20 +158,10 @@ So think of it as the current policy engine for the chain, not the finished prod
 
 Important current limit:
 
-- this receipt-driven scoring model is still best treated as the validated 4-validator prototype baseline
-- larger validator-count localnets still need a stronger shared evidence source and stronger ordering/fork-choice story
-- the active redesign plan for that next step lives in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
-
-On the `consensus_v2` branch specifically:
-
-- the service-evidence plane is partially live
-- the ordering plane is still legacy and does not yet use quorum certificates for fork choice
-
-That is why recent `4/6/8` bursty V2 runs show:
-
-- `4 validators`: healthy service evidence and convergence
-- `6 validators`: healthy scores, but remaining fork divergence
-- `8 validators`: improved scores, but still not enough validator-count-aware evidence coverage yet
+- the baseline receipt-driven scoring model is still useful as the benchmark path on `codex/consensus-v1`
+- `main` now carries the active V2 scoring work behind `consensus_v2`
+- service-evidence gating from prior-epoch aggregates is live, but the ordering and certified-sync story is still incomplete at larger validator counts
+- the active redesign and stabilization work live in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## Why this crate matters
 

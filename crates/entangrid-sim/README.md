@@ -55,6 +55,12 @@ The current recommended prototype gating profile emitted by default is:
 
 That default is still the best current 4-validator baseline, but the latest live matrix now keeps a healthy 6-validator gated case in the suite precisely because larger bursty topologies are still the open convergence problem before PQ work.
 
+Current branch focus:
+
+- `main` is now the active V2-focused line
+- `codex/consensus-v1` is kept as the benchmark/control line
+- `consensus_v2` is still opt-in through config so the simulator can compare baseline and V2 behavior on the same codebase
+
 ### `up`
 
 This command reads the manifest and launches one OS process per node.
@@ -174,6 +180,7 @@ Recent improvement:
 - this also makes it possible to tune how strict gating should be without recompiling the node
 - this also makes it easier to trade off score stability, responsiveness, and penalty harshness in local experiments
 - the latest matrix review currently keeps the shared defaults at that same profile, so fresh localnet experiments start from the same policy we are using as the pre-PQ baseline
+- branch-comparison helpers now also exist so the simulator can mark `v1 degraded/4` and `v1 degraded/5` as benchmark cases when comparing V2 against the older line
 
 ## What it is today
 

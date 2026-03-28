@@ -6,9 +6,15 @@ The first real environment for `Entangrid` should be a reproducible multi-node l
 
 The localnet is not just for demos. It is the main laboratory for protocol validation and attack testing.
 
+Current status note:
+
+- the active protocol work now happens on `main`
+- the baseline V1 path is preserved on `codex/consensus-v1` as a benchmark line
+- the current correctness gate is the single-machine healthy and degraded bursty matrix across `4/5/6/7/8` validators with `consensus_v2`
+
 ## Node Layout
 
-Start with 4 to 7 validator processes.
+Start with 4 to 8 validator processes.
 
 Each node should have:
 
@@ -125,3 +131,9 @@ A good first demo is:
 - visible relay score changes when one node is degraded
 
 If localnet cannot make that demo stable, the protocol is not ready for broader experiments.
+
+Current main-branch focus:
+
+- make the `consensus_v2` matrix go green on one machine first
+- use `codex/consensus-v1` as the benchmark comparison
+- do not move to PQ integration until that happens

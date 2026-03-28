@@ -6,6 +6,12 @@
 
 The system is not trying to solve every production blockchain problem in V1. It is trying to surface whether the witness-entangled design can stay auditable, hard to game, and operational under load.
 
+Current main-branch focus:
+
+- test the active `consensus_v2` line on one-machine `4/5/6/7/8` bursty matrices
+- treat `codex/consensus-v1` as the benchmark/control line
+- delay PQ integration until the V2 convergence and gating story is strong enough
+
 ## Protected Properties
 
 - proposer eligibility should not be easy to bias locally
@@ -158,6 +164,7 @@ Mitigations:
 - a very harsh relay threshold could make consensus brittle
 - a very soft relay threshold could make entanglement meaningless
 - multi-hop witness corridors may be much harder to validate efficiently than pairwise receipts
+- larger-validator V2 convergence is still not strong enough yet without better certified sync and stronger QC-dominant branch recovery
 
 ## What Must Be Tested Early
 

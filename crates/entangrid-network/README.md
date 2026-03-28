@@ -11,6 +11,8 @@ It is the transport layer used by the node runtime to send and receive:
 - sync messages
 - heartbeats
 - relay receipts
+- service attestations and service aggregates
+- proposal votes and quorum certificates
 
 It also reports network events back to the node, such as:
 
@@ -101,6 +103,12 @@ It does not yet provide:
 - NAT traversal
 - batching or compression
 - robust large-topology convergence under heavy bursty localnet load
+
+Current main-branch focus:
+
+- keep the transport simple and observable while `consensus_v2` is stabilized on `main`
+- support the active V2 evidence and ordering messages cleanly
+- defer real PQ transport and larger-topology networking work until the single-machine V2 matrix is green
 
 ## Why this crate matters
 
