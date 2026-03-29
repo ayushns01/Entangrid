@@ -201,6 +201,27 @@ impl ConsensusEngine {
             .unwrap_or_default()
     }
 
+    pub fn service_aggregators_for(
+        &self,
+        epoch: Epoch,
+        subject_validator_id: ValidatorId,
+    ) -> Vec<ValidatorId> {
+        let mut committee = self.service_committee_for(epoch, subject_validator_id);
+        committee.sort_unstable();
+        committee.truncate(service_aggregator_count(committee.len()));
+        committee
+    }
+
+    pub fn is_service_aggregator_for(
+        &self,
+        epoch: Epoch,
+        subject_validator_id: ValidatorId,
+        validator_id: ValidatorId,
+    ) -> bool {
+        self.service_aggregators_for(epoch, subject_validator_id)
+            .contains(&validator_id)
+    }
+
     pub fn validate_service_aggregate(&self, aggregate: &ServiceAggregate) -> Result<(), String> {
         if !aggregate.is_well_formed() {
             return Err("aggregate payload is malformed".into());
@@ -506,6 +527,10 @@ fn service_committee_threshold(committee_size: usize) -> usize {
     ((committee_size * 2) / 3) + 1
 }
 
+fn service_aggregator_count(committee_size: usize) -> usize {
+    committee_size.min(3)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -701,6 +726,21 @@ mod tests {
             eight.service_committee_for(2, 1).len(),
             eight.genesis().witness_count.min(7)
         );
+    }
+
+    #[test]
+    fn service_aggregators_are_deterministic_subset_of_committee() {
+        let mut genesis = sample_genesis_with_validators(8);
+        genesis.witness_count = 7;
+        let engine = ConsensusEngine::new(genesis);
+
+        let committee = engine.service_committee_for(2, 1);
+        let aggregators = engine.service_aggregators_for(2, 1);
+
+        assert_eq!(aggregators.len(), 3);
+        assert!(aggregators.iter().all(|validator_id| committee.contains(validator_id)));
+        assert_eq!(aggregators, engine.service_aggregators_for(2, 1));
+        assert!(engine.is_service_aggregator_for(2, 1, aggregators[0]));
     }
 
     #[test]

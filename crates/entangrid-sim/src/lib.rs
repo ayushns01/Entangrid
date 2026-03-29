@@ -274,7 +274,11 @@ pub fn init_localnet(
         slot_duration_millis,
         slots_per_epoch,
         max_txs_per_block: 128,
-        witness_count: 2,
+        witness_count: if consensus_v2 {
+            recommended_v2_witness_count_for_validators(validators)
+        } else {
+            2.min(validators.saturating_sub(1))
+        },
         validators: validator_configs.clone(),
         initial_balances,
     };
@@ -1267,6 +1271,20 @@ fn rigorous_matrix_scenarios(settle_secs: u64) -> Vec<MatrixScenario> {
 
 fn recommended_service_score_window_epochs_for_validators(validators: usize) -> u64 {
     default_service_score_window_epochs().max(validators as u64)
+}
+
+fn recommended_v2_witness_count_for_validators(validators: usize) -> usize {
+    let max_relations = validators.saturating_sub(1);
+    if max_relations <= 3 {
+        return max_relations;
+    }
+    let mut power = 1usize;
+    let mut ceil_log2 = 0usize;
+    while power < validators {
+        power <<= 1;
+        ceil_log2 += 1;
+    }
+    (ceil_log2 + 1).clamp(3, max_relations)
 }
 
 fn write_transaction_for_validator(
@@ -2593,6 +2611,33 @@ mod tests {
             recommended_service_score_window_epochs_for_validators(12),
             12
         );
+    }
+
+    #[test]
+    fn consensus_v2_localnet_scales_observer_surface_with_validator_count() {
+        let unique_dir = std::env::temp_dir()
+            .join(format!("entangrid-sim-v2-witnesses-test-{}", now_unix_millis()));
+        init_localnet(
+            6,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            true,
+            3,
+            0.35,
+            6,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            true,
+        )
+        .unwrap();
+        let genesis: GenesisConfig =
+            toml::from_str(&fs::read_to_string(unique_dir.join("genesis.toml")).unwrap()).unwrap();
+        assert_eq!(genesis.witness_count, 4);
     }
 
     #[test]

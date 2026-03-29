@@ -19,7 +19,8 @@ Current benchmark gate on `main`:
 - Issue 1 certified-sync availability is now expected to stay live in `6/7/8`, and certified repair should apply whenever a run actually needs recovery
 - Issue 2 healthy branch convergence is now expected to finish on one tip in repeated `6/7/8` runs
 - Issue 3 service evidence and degraded punishment are expected to stay healthy enough that honest validators avoid collapse while the degraded target is still penalized
-- the active edge case is now stale-node restart recovery: a restarted node should catch up without falling back to late full snapshots or getting stuck behind sync-control rate limiting
+- stale-node restart recovery is now expected to converge cleanly enough that a restarted node catches up without late full snapshots
+- the next benchmark gate is proving healthy, degraded, and stale-restart cases together on current `main`
 - PQ integration stays out of scope until the V2 matrix is green
 
 ## Core Metrics

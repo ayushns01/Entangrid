@@ -132,9 +132,9 @@ Current V2 shape:
 
 The main remaining V2 blockers are now:
 
-- stale-node restart recovery under heavy sync-control pressure
-- finishing stale catch-up through certified and incremental suffix repair without needing a late full snapshot rescue
-- real PQ integration only after the full matrix and stale-restart stress cases are green
+- proving the final healthy and degraded `4/5/6/7/8` bursty matrix on current `main`
+- tightening the simulator acceptance gates so regressions fail loudly
+- real PQ integration only after the full matrix is green
 
 ## Current Recommended Prototype Policy
 
@@ -168,7 +168,8 @@ The current prototype proved the core Entangrid idea is implementable, and `main
 - healthy `6/7/8` bursty runs now repeatedly shut down on one tip with QC-dominant branch choice active
 - certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
 - V2 service evidence and degraded punishment are materially better after the transport/session hardening on `main`
-- the next blocker is stale-node restart catch-up under sync-control saturation, not baseline healthy ordering anymore
+- stale-restart recovery is now fixed enough that a restarted validator can catch up without falling back to full snapshot sync
+- the next step is to prove the full healthy/degraded matrix on current `main`, not to keep redesigning recovery again
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
 Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.

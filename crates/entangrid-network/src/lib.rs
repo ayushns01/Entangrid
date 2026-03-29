@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use entangrid_crypto::CryptoBackend;
 use entangrid_types::{
-    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope, ValidatorId,
-    canonical_hash,
+    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope,
+    ValidatorId, canonical_hash,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -57,7 +57,7 @@ pub enum NetworkEvent {
 
 #[derive(Clone)]
 pub struct NetworkHandle {
-    outbound_tx: mpsc::UnboundedSender<OutboundRequest>,
+    outbound_by_peer: Arc<BTreeMap<ValidatorId, mpsc::UnboundedSender<OutboundRequest>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +76,7 @@ impl NetworkHandle {
     }
 
     pub fn send_to(&self, peer: PeerConfig, payload: ProtocolMessage) -> Result<()> {
-        self.outbound_tx
+        self.outbound_sender_for(peer.validator_id)?
             .send(OutboundRequest {
                 peer,
                 payload,
@@ -93,13 +93,22 @@ impl NetworkHandle {
     }
 
     pub fn send_control_to(&self, peer: PeerConfig, payload: ProtocolMessage) -> Result<()> {
-        self.outbound_tx
+        self.outbound_sender_for(peer.validator_id)?
             .send(OutboundRequest {
                 peer,
                 payload,
                 service_accountable: false,
             })
             .map_err(|_| anyhow!("network outbound worker is closed"))
+    }
+
+    fn outbound_sender_for(
+        &self,
+        validator_id: ValidatorId,
+    ) -> Result<&mpsc::UnboundedSender<OutboundRequest>> {
+        self.outbound_by_peer
+            .get(&validator_id)
+            .ok_or_else(|| anyhow!("unknown peer {validator_id}"))
     }
 }
 
@@ -122,11 +131,11 @@ pub async fn spawn_network(
             .collect(),
     );
 
-    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<OutboundRequest>();
     let listener_crypto = Arc::clone(&crypto);
     let listener_metrics = Arc::clone(&metrics);
     let listener_events = event_tx.clone();
     let inbound_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_SESSIONS));
+    let mut outbound_by_peer = BTreeMap::new();
 
     tokio::spawn(async move {
         loop {
@@ -191,26 +200,18 @@ pub async fn spawn_network(
         }
     });
 
-    tokio::spawn({
+    for peer in peers_by_id.values() {
+        let peer_id = peer.validator_id;
+        let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<OutboundRequest>();
+        outbound_by_peer.insert(peer_id, peer_tx);
         let crypto = Arc::clone(&crypto);
         let metrics = Arc::clone(&metrics);
         let event_tx = event_tx.clone();
-        let peers_by_id = Arc::clone(&peers_by_id);
-        async move {
-            while let Some(request) = outbound_rx.recv().await {
-                let peer = request.peer.clone();
-                let peer_id = peer.validator_id;
+        let fault_profile = fault_profile.clone();
+        tokio::spawn(async move {
+            let mut stream = None;
+            while let Some(request) = peer_rx.recv().await {
                 let service_accountable = request.service_accountable;
-                if !peers_by_id.contains_key(&peer_id) {
-                    let _ = event_tx.send(NetworkEvent::SessionFailed {
-                        peer_validator_id: Some(peer_id),
-                        detail: "peer not configured".into(),
-                        outbound: true,
-                        service_accountable,
-                        kind: NetworkFailureKind::PeerConfig,
-                    });
-                    continue;
-                }
                 if let Err(error) = send_message(
                     local_validator_id,
                     request,
@@ -218,6 +219,7 @@ pub async fn spawn_network(
                     Arc::clone(&crypto),
                     Arc::clone(&metrics),
                     event_tx.clone(),
+                    &mut stream,
                 )
                 .await
                 {
@@ -230,10 +232,12 @@ pub async fn spawn_network(
                     });
                 }
             }
-        }
-    });
+        });
+    }
 
-    Ok(NetworkHandle { outbound_tx })
+    Ok(NetworkHandle {
+        outbound_by_peer: Arc::new(outbound_by_peer),
+    })
 }
 
 async fn send_message(
@@ -243,6 +247,7 @@ async fn send_message(
     crypto: Arc<dyn CryptoBackend>,
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
+    stream: &mut Option<TcpStream>,
 ) -> Result<()> {
     if fault_profile.disable_outbound {
         let _ = event_tx.send(NetworkEvent::SessionFailed {
@@ -286,10 +291,26 @@ async fn send_message(
     };
 
     let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
-    let mut stream = connect_with_retries(&request.peer.address).await?;
-    stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
+    let mut retried = false;
+    loop {
+        if stream.is_none() {
+            let connected = connect_with_retries(&request.peer.address).await?;
+            connected.set_nodelay(true)?;
+            *stream = Some(connected);
+        }
+
+        match write_frame(stream.as_mut().expect("stream populated"), &bytes).await {
+            Ok(()) => break,
+            Err(error) if !retried && is_retryable_stream_error(&error) => {
+                *stream = None;
+                retried = true;
+            }
+            Err(error) => {
+                *stream = None;
+                return Err(error.into());
+            }
+        }
+    }
 
     let _ = event_tx.send(NetworkEvent::SessionObserved {
         peer_validator_id: request.peer.validator_id,
@@ -312,70 +333,75 @@ async fn handle_inbound(
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
-    let frame_len = stream.read_u32().await? as usize;
-    if frame_len > MAX_FRAME_SIZE_BYTES {
-        update_metrics(&metrics, |metrics| {
-            metrics.handshake_failures += 1;
-            metrics.active_sessions = 0;
-        });
-        return Err(anyhow!(
-            "frame length {frame_len} exceeds max {}",
-            MAX_FRAME_SIZE_BYTES
-        ));
-    }
-    let mut frame = vec![0u8; frame_len];
-    stream.read_exact(&mut frame).await?;
-
-    let (envelope, _): (SignedEnvelope, usize) =
-        bincode::serde::decode_from_slice(&frame, bincode::config::standard())?;
-    update_metrics(&metrics, |metrics| {
-        metrics.bytes_received += frame_len as u64;
-        metrics.handshake_attempts += 1;
-        metrics.active_sessions = 1;
-    });
-
-    let expected_hash = canonical_hash(&envelope.payload);
-    if expected_hash != envelope.message_hash {
-        update_metrics(&metrics, |metrics| {
-            metrics.handshake_failures += 1;
-            metrics.active_sessions = 0;
-        });
-        return Err(anyhow!("payload hash mismatch"));
-    }
-
-    let session = crypto.open_session(
-        local_validator_id,
-        envelope.from_validator_id,
-        &envelope.message_hash,
-    )?;
-    let _ = event_tx.send(NetworkEvent::SessionObserved {
-        peer_validator_id: envelope.from_validator_id,
-        transcript_hash: session.transcript_hash,
-        outbound: false,
-        service_accountable: true,
-    });
-
-    let verified = crypto.verify(
-        envelope.from_validator_id,
-        &envelope.message_hash,
-        &envelope.signature,
-    )?;
-    update_metrics(&metrics, |metrics| {
-        if !verified {
-            metrics.handshake_failures += 1;
+    loop {
+        let frame_len = match stream.read_u32().await {
+            Ok(length) => length as usize,
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if frame_len > MAX_FRAME_SIZE_BYTES {
+            update_metrics(&metrics, |metrics| {
+                metrics.handshake_failures += 1;
+                metrics.active_sessions = 0;
+            });
+            return Err(anyhow!(
+                "frame length {frame_len} exceeds max {}",
+                MAX_FRAME_SIZE_BYTES
+            ));
         }
-        metrics.active_sessions = 0;
-    });
-    if !verified {
-        return Err(anyhow!("invalid envelope signature"));
-    }
+        let mut frame = vec![0u8; frame_len];
+        stream.read_exact(&mut frame).await?;
 
-    let _ = event_tx.send(NetworkEvent::Received {
-        from_validator_id: envelope.from_validator_id,
-        payload: envelope.payload,
-        bytes: frame_len,
-    });
-    Ok(())
+        let (envelope, _): (SignedEnvelope, usize) =
+            bincode::serde::decode_from_slice(&frame, bincode::config::standard())?;
+        update_metrics(&metrics, |metrics| {
+            metrics.bytes_received += frame_len as u64;
+            metrics.handshake_attempts += 1;
+            metrics.active_sessions = 1;
+        });
+
+        let expected_hash = canonical_hash(&envelope.payload);
+        if expected_hash != envelope.message_hash {
+            update_metrics(&metrics, |metrics| {
+                metrics.handshake_failures += 1;
+                metrics.active_sessions = 0;
+            });
+            return Err(anyhow!("payload hash mismatch"));
+        }
+
+        let session = crypto.open_session(
+            local_validator_id,
+            envelope.from_validator_id,
+            &envelope.message_hash,
+        )?;
+        let _ = event_tx.send(NetworkEvent::SessionObserved {
+            peer_validator_id: envelope.from_validator_id,
+            transcript_hash: session.transcript_hash,
+            outbound: false,
+            service_accountable: true,
+        });
+
+        let verified = crypto.verify(
+            envelope.from_validator_id,
+            &envelope.message_hash,
+            &envelope.signature,
+        )?;
+        update_metrics(&metrics, |metrics| {
+            if !verified {
+                metrics.handshake_failures += 1;
+            }
+            metrics.active_sessions = 0;
+        });
+        if !verified {
+            return Err(anyhow!("invalid envelope signature"));
+        }
+
+        let _ = event_tx.send(NetworkEvent::Received {
+            from_validator_id: envelope.from_validator_id,
+            payload: envelope.payload,
+            bytes: frame_len,
+        });
+    }
 }
 
 fn should_drop(
@@ -427,6 +453,25 @@ fn is_retryable_connect_error(error: &std::io::Error) -> bool {
     )
 }
 
+fn is_retryable_stream_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+    )
+}
+
+async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<(), std::io::Error> {
+    stream.write_u32(bytes.len() as u32).await?;
+    stream.write_all(bytes).await?;
+    stream.flush().await
+}
+
 fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut NodeMetrics)) {
     if let Ok(mut metrics) = metrics.lock() {
         update(&mut metrics);
@@ -437,7 +482,55 @@ fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+    use entangrid_types::{GenesisConfig, ValidatorConfig};
     use std::io::Error;
+    use entangrid_types::HeartbeatPulse;
+    use tokio::{
+        net::TcpListener,
+        sync::mpsc,
+        time::{Duration, timeout},
+    };
+
+    fn sample_validators() -> Vec<ValidatorConfig> {
+        vec![
+            ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:4100".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: vec![],
+            },
+            ValidatorConfig {
+                validator_id: 2,
+                stake: 100,
+                address: "127.0.0.1:4101".into(),
+                dev_secret: "secret-2".into(),
+                public_identity: vec![],
+            },
+        ]
+    }
+
+    fn sample_genesis() -> GenesisConfig {
+        GenesisConfig {
+            chain_id: "entangrid-network-test".into(),
+            epoch_seed: [0u8; 32],
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1_000,
+            slots_per_epoch: 6,
+            max_txs_per_block: 16,
+            witness_count: 1,
+            validators: sample_validators(),
+            initial_balances: BTreeMap::new(),
+        }
+    }
+
+    async fn reserve_local_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        address
+    }
 
     #[test]
     fn rejects_oversized_inbound_frame() {
@@ -457,5 +550,223 @@ mod tests {
         assert!(!is_retryable_connect_error(&Error::from(
             ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    fn send_to_rejects_unknown_peer_without_configured_lane() {
+        let handle = NetworkHandle {
+            outbound_by_peer: Arc::new(BTreeMap::new()),
+        };
+        let error = handle
+            .send_to(
+                PeerConfig {
+                    validator_id: 9,
+                    address: "127.0.0.1:9999".into(),
+                },
+                ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+                    epoch: 0,
+                    slot: 0,
+                    source_validator_id: 1,
+                    sequence_number: 0,
+                    emitted_at_unix_millis: 0,
+                }),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown peer"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_to_routes_messages_to_configured_peer_lane() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handle = NetworkHandle {
+            outbound_by_peer: Arc::new(BTreeMap::from([(2, tx)])),
+        };
+        let payload = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 4,
+            source_validator_id: 1,
+            sequence_number: 4,
+            emitted_at_unix_millis: 123,
+        });
+
+        handle
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: "127.0.0.1:4002".into(),
+                },
+                payload.clone(),
+            )
+            .unwrap();
+
+        let queued = rx.recv().await.expect("request queued");
+        assert_eq!(queued.peer.validator_id, 2);
+        assert_eq!(queued.payload, payload);
+        assert!(queued.service_accountable);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbound_lane_reuses_same_connection_for_same_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap().to_string();
+        let local_address = reserve_local_address().await;
+        let validators = sample_validators();
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_validators(&validators));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            1,
+            local_address,
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let payload_one = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let payload_two = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 2,
+            source_validator_id: 1,
+            sequence_number: 2,
+            emitted_at_unix_millis: 2,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_one.clone(),
+            )
+            .unwrap();
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_two.clone(),
+            )
+            .unwrap();
+
+        let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted in time")
+            .unwrap();
+        let first_len = stream.read_u32().await.unwrap() as usize;
+        let mut first_frame = vec![0u8; first_len];
+        stream.read_exact(&mut first_frame).await.unwrap();
+        let (first, _): (SignedEnvelope, usize) =
+            bincode::serde::decode_from_slice(&first_frame, bincode::config::standard()).unwrap();
+        assert_eq!(first.payload, payload_one);
+
+        let second_len = timeout(Duration::from_secs(2), stream.read_u32())
+            .await
+            .expect("second frame on same stream")
+            .unwrap() as usize;
+        let mut second_frame = vec![0u8; second_len];
+        stream.read_exact(&mut second_frame).await.unwrap();
+        let (second, _): (SignedEnvelope, usize) =
+            bincode::serde::decode_from_slice(&second_frame, bincode::config::standard()).unwrap();
+        assert_eq!(second.payload, payload_two);
+        assert!(timeout(Duration::from_millis(200), listener.accept()).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_session_accepts_multiple_frames_from_same_stream() {
+        let listen_address = reserve_local_address().await;
+        let genesis = sample_genesis();
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_genesis(&genesis));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 2,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let _network = spawn_network(
+            2,
+            listen_address.clone(),
+            vec![PeerConfig {
+                validator_id: 1,
+                address: reserve_local_address().await,
+            }],
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let client_crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let mut stream = TcpStream::connect(&listen_address).await.unwrap();
+        for slot in [1u64, 2u64] {
+            let payload = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+                epoch: 0,
+                slot,
+                source_validator_id: 1,
+                sequence_number: slot,
+                emitted_at_unix_millis: slot,
+            });
+            let message_hash = canonical_hash(&payload);
+            let envelope = SignedEnvelope {
+                from_validator_id: 1,
+                message_hash,
+                signature: client_crypto.sign(1, &message_hash).unwrap(),
+                payload,
+            };
+            let bytes =
+                bincode::serde::encode_to_vec(&envelope, bincode::config::standard()).unwrap();
+            stream.write_u32(bytes.len() as u32).await.unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+
+        let mut received = Vec::new();
+        while received.len() < 2 {
+            let event = timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("event in time")
+                .expect("event received");
+            if let NetworkEvent::Received { payload, .. } = event {
+                received.push(payload);
+            }
+        }
+        assert_eq!(
+            received,
+            vec![
+                ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+                    epoch: 0,
+                    slot: 1,
+                    source_validator_id: 1,
+                    sequence_number: 1,
+                    emitted_at_unix_millis: 1,
+                }),
+                ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+                    epoch: 0,
+                    slot: 2,
+                    source_validator_id: 1,
+                    sequence_number: 2,
+                    emitted_at_unix_millis: 2,
+                }),
+            ]
+        );
     }
 }

@@ -133,6 +133,13 @@ Goal:
 - stale recovery finishes through certified plus suffix repair without needing late full snapshot rescue
 - recovery traffic stays below the point where sync-control rate limiting starves the last suffix catch-up
 
+Current status:
+
+- completed enough on `main` to move focus to Issue 5
+- stale restarted nodes now advertise and serve only the certified frontier during recovery
+- live slots now proactively request catch-up while peers remain ahead
+- the latest stale `8` rerun shut down `8/8` on one tip without full snapshot fallback on the restarted node
+
 ### Issue 5: Matrix Tightening
 
 Problem:
@@ -145,7 +152,7 @@ Goal:
 
 ### Current Focus
 
-Work on **Issue 4** next.
+Work on **Issue 5** next.
 
 Issue 1 is now complete enough to close because:
 
@@ -158,7 +165,7 @@ Issue 2 is now complete enough to close because:
 - stale certified-sync responses no longer drag a node back to an older certified tip during those runs
 - full snapshot fallback no longer drives the healthy live-recovery path
 
-The next blocker is no longer sync activation, canonical branch choice, or the broad service-gating pipeline. It is stale-node restart recovery under sync-control saturation.
+The next blocker is no longer sync activation, canonical branch choice, service-gating stabilization, or stale restart recovery. It is proving the full matrix and tightening acceptance gates.
 
 ## File Structure
 

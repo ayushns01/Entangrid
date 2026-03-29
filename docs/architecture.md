@@ -13,7 +13,8 @@ Current status note:
 - committee-attested service evidence, certified sync, and QC-dominant branch choice are now live on `main`
 - healthy `6/7/8` bursty runs now repeatedly shut down structurally on one tip, and certified sync now ignores stale certified suffixes instead of downgrading local state
 - startup replay suppression and a startup sync barrier now prevent restarted nodes from replaying stale proposer slots before they catch up
-- the remaining runtime edge is stale-node restart recovery under sync-control saturation, not baseline healthy branch selection
+- stale-node restart recovery is now fixed enough on `main`: restarted nodes advertise and serve only their certified frontier during recovery, then proactively pull catch-up while peers remain ahead
+- the next runtime step is full-matrix validation and hard acceptance gates, not another recovery redesign
 - the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## High-Level Components
@@ -109,7 +110,8 @@ Current V2 detail on `main`:
 - certified sync is now live behind `consensus_v2`
 - QC-backed canonical branch selection is now active behind `consensus_v2`
 - restart-time proposal suppression and startup sync barriers are now active behind `consensus_v2`
-- the main remaining consensus/runtime gap is stale-node suffix catch-up under sync-control pressure, not fork-choice activation in healthy runs
+- the earlier stale-node suffix catch-up gap is now materially closed on `main`
+- the remaining consensus/runtime work is turning the healthy/degraded/stale matrix into a hard acceptance gate before PQ work
 
 ### 7. Storage Layer
 

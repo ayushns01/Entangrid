@@ -295,6 +295,8 @@ pub struct ChunkedSyncRequest {
 pub enum ChunkedSyncResponse {
     Certified {
         responder_id: ValidatorId,
+        responder_height: u64,
+        responder_tip_hash: HashBytes,
         shared_qc_hash: HashBytes,
         shared_qc_height: u64,
         headers: Vec<CertifiedBlockHeader>,

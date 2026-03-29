@@ -53,7 +53,7 @@ The current recommended prototype gating profile emitted by default is:
 - `service_score_window_epochs = 4`
 - weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the remaining pre-PQ problem has shifted from basic structural reconvergence to restart-time recovery and stale-node catch-up behavior.
+That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the next pre-PQ problem is no longer basic structural reconvergence or restart recovery. It is proving the full matrix and then turning it into a hard acceptance gate.
 
 Current branch focus:
 

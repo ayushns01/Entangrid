@@ -17,7 +17,7 @@ Current status note:
 - the baseline receipt-driven path still exists for comparison when `consensus_v2` is disabled and is preserved on `codex/consensus-v1`
 - committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
-- the remaining work is stale-node restart recovery under sync-control saturation, and only then PQ integration
+- stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
 
 On the active `consensus_v2` path on `main`, the protocol direction is tightening further:
 
@@ -27,7 +27,8 @@ On the active `consensus_v2` path on `main`, the protocol direction is tightenin
 - proposal votes, quorum certificates, certified sync, and QC-dominant canonical branch choice are live
 - certified sync now rejects stale certified responses that would otherwise downgrade a newer local certified tip
 - certified sync responses now also advertise the responder's current tip metadata so the requester can follow a certified catch-up with suffix repair
-- the next blocker is no longer basic branch recovery itself, but making stale restarted nodes finish suffix catch-up reliably under sync-control rate limiting
+- stale restarted nodes now suppress historical replay, hold proposals behind the startup barrier, advertise the certified frontier during recovery, and proactively request catch-up while peers remain ahead
+- the next blocker is no longer restart recovery itself, but proving the full matrix and freezing the acceptance gates before PQ work
 
 ## Protocol Goals
 

@@ -176,7 +176,7 @@ Important current limit:
 - healthy bursty `6/7/8` runs now repeatedly shut down structurally on one tip
 - stale certified-sync responses are now skipped instead of re-adopting an older certified suffix
 - restarted nodes now suppress historical proposer-slot replay and can hold proposals behind a startup sync barrier while peers are still ahead
-- the remaining node-runtime edge is stale-node restart catch-up under sync-control saturation, not healthy branch convergence
+- stale-node restart recovery is now fixed enough on `main`, not the active runtime blocker anymore
 - the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking and stale restart recovery:
@@ -196,12 +196,14 @@ The recent validation-focused improvement in this crate was about correctness un
 - restarted nodes now seed `last_processed_slot` from real time and stored state so they do not replay historical proposer slots on startup
 - restarted nodes can wait behind a startup sync barrier instead of immediately proposing while peers are known ahead
 - certified sync responses now carry responder tip metadata so a catching-up node can follow certified repair with suffix sync instead of stalling at the certified frontier
-- the next node-runtime milestone is finishing stale restart recovery without sync-control chatter or rate-limit pressure starving the final suffix catch-up
+- startup-barrier sync serving is now capped to the certified frontier instead of exporting a stale uncertified suffix
+- live slots now proactively request catch-up while peers are known ahead instead of waiting only for the periodic sync tick
+- the next node-runtime milestone is proving the final healthy/degraded/stale matrix and freezing the acceptance gates
 
 So the next node-runtime milestone is:
 
-- lower sync-control churn during stale recovery
-- cleaner suffix catch-up after certified repair, ideally without needing full snapshot fallback at all
+- full-matrix proof on current `main`
+- simulator acceptance gates that fail loudly on any regression
 
 But it is still intentionally early-stage.
 

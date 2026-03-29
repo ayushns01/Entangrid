@@ -137,6 +137,7 @@ Future direction:
 Current runtime note:
 
 - the persistent-lane transport work materially improved Issue 3 on `main`
-- the next transport/runtime edge is no longer basic bursty delivery, but keeping stale-node recovery from self-throttling under heavy sync-control traffic
+- the transport/runtime edge is no longer basic bursty delivery or stale-node self-throttling
+- the next step is keeping this transport behavior stable while the full V2 matrix is frozen into acceptance gates
 
 In short: today this crate gives us a practical local validator network, but it is meant to become a much stronger transport layer for Entangrid.

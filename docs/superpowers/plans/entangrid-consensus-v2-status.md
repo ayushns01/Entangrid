@@ -114,9 +114,9 @@ That means both Issue 1 and Issue 2 have been cut down substantially:
 - certified sync is active in live recovery when needed, and its availability remains live in repeated healthy runs
 - QC-dominant branch choice plus the pending-certified-child lane now keep healthy `6/7/8` runs on one tip
 
-## What Is Still Broken
+## What Was Closed Next
 
-The biggest remaining blocker is now stale-node restart recovery under heavy sync-control pressure.
+The stale-node restart recovery edge is now substantially closed on `main`.
 
 The runtime moved past the earlier broad Issue 3 story:
 
@@ -124,16 +124,21 @@ The runtime moved past the earlier broad Issue 3 story:
 - healthy larger-validator bursty runs now converge structurally without the old service-score collapse
 - degraded larger-validator runs now punish the target much more reliably while keeping honest validators healthy
 
-But the newest stale-restart reruns exposed a narrower edge:
+The final restart-focused fixes landed around three recovery rules:
 
 - restarted nodes no longer replay historical proposer slots after coming back
 - restarted nodes can hold proposals behind a startup sync barrier while peers are still ahead
-- certified sync now prefers higher certified height over a taller uncertified local tip
-- certified sync responses now tell the requester whether the responder is still ahead so suffix repair can follow immediately
-- the latest stale `8` rerun avoided full-snapshot fallback entirely
-- but the restarted node still finished a few blocks short of the cluster under heavy `sync-control` rate limiting
+- startup-barrier sync serving is capped to the certified frontier instead of exporting a stale uncertified suffix
+- live slots now proactively request catch-up while peers are known ahead instead of only waiting for the 5-second sync maintenance timer
 
-So the remaining problem is no longer "make certified sync exist" or "make healthy `6/7/8` converge." It is "make a restarted stale node finish the last suffix catch-up reliably when recovery traffic itself is noisy."
+In the latest stale `8` rerun:
+
+- all `8/8` validators shut down on the same tip
+- validator `8` recovered with `certified_sync_applied = 1`
+- validator `8` recovered with `full_sync_applied = 0`
+- the old stale-restart gap is no longer the active blocker
+
+So the remaining problem is no longer "make certified sync exist," "make healthy `6/7/8` converge," or "make a restarted stale node finish the last suffix catch-up." The next task is to prove that all of those hold together across the full matrix.
 
 ## What This Means
 
@@ -145,15 +150,16 @@ The honest status is:
 - degraded punishment is now materially better across the live matrix than the older service-collapse phase
 - Issue 1 certified-sync activation is effectively closed
 - Issue 2 QC-backed canonical branch selection is effectively closed for the healthy `6/7/8` structural runs we just repeated
-- Issue 3 service evidence and gating behavior are materially improved, but the new active blocker is stale restart recovery
-- the remaining pre-PQ blocker is reliable stale-node catch-up under sync-control saturation
+- Issue 3 service evidence and gating behavior are materially improved
+- Issue 4 stale-node restart recovery is now fixed enough to move on
+- the remaining pre-PQ blocker is full-matrix proof and acceptance-gate tightening
 
 ## Next Work
 
 The next implementation priorities are:
 
-1. finish stale restart recovery without relying on late full snapshots or getting trapped behind sync-control rate limits
-2. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification plus stale-restart stress against the V1 benchmark line
+1. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification plus stale-restart stress against the V1 benchmark line
+2. turn that matrix into hard acceptance gates in the simulator
 3. only after that move to PQ-safe signature/session integration
 
 ## Recommended Reading Order

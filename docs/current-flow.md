@@ -245,7 +245,7 @@ This is why bursty runs can temporarily split the network into short competing b
 
 The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
 
-Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. The current open problem is narrower: restarted stale nodes can still finish a run a few blocks behind when sync-control chatter and rate limits interfere with the final suffix catch-up.
+Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. Restarted stale nodes now also recover cleanly enough to rejoin the final tip without late full-snapshot rescue; the next job is proving that across the full matrix, not inventing another recovery mechanism.
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 
