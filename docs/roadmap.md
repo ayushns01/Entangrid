@@ -130,7 +130,7 @@ The current focus on `main` is no longer "invent V2 on a side branch." It is:
 - stabilize `consensus_v2` on `main`
 - keep `codex/consensus-v1` as the benchmark/control line
 - make the single-machine `4/5/6/7/8` healthy and degraded bursty matrix go green
-- tighten service-gating enforcement and score stability now that certified sync and QC-dominant convergence are live
+- finish stale-node restart recovery now that certified sync, QC-dominant convergence, and the main service-evidence fixes are live
 - only then move to PQ-safe crypto integration
 
 ## What Not To Build Too Early

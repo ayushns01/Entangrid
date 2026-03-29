@@ -42,14 +42,14 @@ There is currently:
 Current transport is:
 
 - Tokio TCP listener for inbound connections
-- one outbound send request at a time through an internal channel
-- direct TCP connect to the peer address
+- one outbound lane per peer
+- direct TCP streams that are reused per peer when possible
 - length-prefixed `bincode` frame
 - signed envelope around the payload
 
 So the current mental model is:
 
-"open connection, send signed message, receive and verify on the other side."
+"enqueue onto the peer lane, reuse the stream if it is alive, reconnect only when needed, then receive and verify on the other side."
 
 ### Message integrity
 
@@ -72,6 +72,8 @@ Recent hardening:
 - concurrent inbound session handling is now capped, so one noisy peer cannot force unbounded task fan-out on the listener side
 - outbound sends now retry transient connect failures before reporting a hard session failure, which reduces false negatives during localnet churn
 - outbound session observations are emitted only after the connect/write/flush path succeeds, so the node's penalty accounting is tied to real delivery attempts instead of pre-send optimistic bookkeeping
+- outbound transport now keeps a persistent lane per peer instead of creating a new connection for every message
+- inbound sessions can now accept multiple frames on the same stream, which materially reduced handshake churn in larger V2 bursty runs
 
 ### Session observations
 
@@ -95,14 +97,13 @@ Today this is a clean localnet transport layer, not a production peer-to-peer st
 
 It does not yet provide:
 
-- persistent authenticated sessions
 - real PQ transport security
 - backpressure-aware gossip
 - peer reputation
 - discovery
 - NAT traversal
 - batching or compression
-- robust large-topology convergence under heavy bursty localnet load
+- robust large-topology recovery under heavy stale-restart sync-control pressure
 
 Current main-branch focus:
 
@@ -128,10 +129,14 @@ This crate should become a more serious communication layer over time.
 Future direction:
 
 - replace dev session derivation with real PQ-secure session setup
-- add persistent connections instead of opening a new TCP connection per message
 - improve sync and broadcast efficiency
 - add better retry and buffering behavior
 - prepare for more realistic peer topologies and partial connectivity
 - eventually support larger-scale networking beyond localhost experiments
+
+Current runtime note:
+
+- the persistent-lane transport work materially improved Issue 3 on `main`
+- the next transport/runtime edge is no longer basic bursty delivery, but keeping stale-node recovery from self-throttling under heavy sync-control traffic
 
 In short: today this crate gives us a practical local validator network, but it is meant to become a much stronger transport layer for Entangrid.

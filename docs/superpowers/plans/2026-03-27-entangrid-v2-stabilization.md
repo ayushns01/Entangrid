@@ -112,7 +112,28 @@ Goal:
 - insufficient evidence skips
 - healthy validators do not collapse to `0.0`
 
-### Issue 4: Matrix Tightening
+Status update:
+
+- materially improved on `main` after aggregate-merge, deterministic aggregator, and transport/session hardening
+- healthy larger-validator runs no longer show the earlier all-zero honest-score collapse
+- degraded larger-validator runs now punish the target much more reliably than the older Issue 3 failures
+- this is no longer the main active blocker
+
+### Issue 4: Stale-Node Restart Recovery
+
+Problem:
+
+- a restarted stale node can still finish a few blocks behind the cluster even after certified catch-up succeeds
+- the remaining failures now correlate more with sync-control chatter and per-peer rate limiting than with stale slot replay or missing certified sync activation
+
+Goal:
+
+- restarted nodes do not replay historical proposer slots
+- restarted nodes hold proposals behind a startup sync barrier until peers are caught up enough
+- stale recovery finishes through certified plus suffix repair without needing late full snapshot rescue
+- recovery traffic stays below the point where sync-control rate limiting starves the last suffix catch-up
+
+### Issue 5: Matrix Tightening
 
 Problem:
 
@@ -124,7 +145,7 @@ Goal:
 
 ### Current Focus
 
-Work on **Issue 3** next.
+Work on **Issue 4** next.
 
 Issue 1 is now complete enough to close because:
 
@@ -137,7 +158,7 @@ Issue 2 is now complete enough to close because:
 - stale certified-sync responses no longer drag a node back to an older certified tip during those runs
 - full snapshot fallback no longer drives the healthy live-recovery path
 
-The next blocker is no longer sync activation or canonical branch choice. It is service-gating enforcement and score stability after recovery.
+The next blocker is no longer sync activation, canonical branch choice, or the broad service-gating pipeline. It is stale-node restart recovery under sync-control saturation.
 
 ## File Structure
 
@@ -163,6 +184,16 @@ The next blocker is no longer sync activation or canonical branch choice. It is 
   - Finalize `CertifiedSyncRequest` and `CertifiedSyncResponse` payload shape.
 - Modify: `crates/entangrid-network/src/lib.rs`
   - Prioritize QC/certified sync traffic where needed.
+
+**Stale restart recovery**
+- Modify: `crates/entangrid-node/src/lib.rs`
+  - Suppress historical slot replay after restart.
+  - Hold proposals behind a startup sync barrier while peers are known ahead.
+  - Prefer certified recovery by QC height and continue with suffix repair from responder tip metadata.
+- Modify: `crates/entangrid-types/src/lib.rs`
+  - Carry responder tip metadata on certified sync responses.
+- Modify: `crates/entangrid-network/src/lib.rs`
+  - Keep transport/session pressure low enough that recovery control traffic does not self-throttle the final catch-up.
 
 **Docs**
 - Modify: `docs/superpowers/plans/entangrid-consensus-v2-status.md`

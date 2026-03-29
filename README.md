@@ -127,12 +127,14 @@ Current V2 shape:
   - no-evidence skip
 - proposal votes and quorum certificates are live in the node runtime
 - equal-QC uncertified sibling branches no longer replace the current canonical tip just because they gained extra local votes
+- restarted nodes now suppress historical slot replay and can hold back local proposals behind a startup sync barrier while peers are still ahead
+- certified sync responses now carry responder tip metadata so a catching-up node can continue with suffix repair instead of guessing whether the peer is still ahead
 
 The main remaining V2 blockers are now:
 
-- validator-count-aware service coverage and convergence across the full `4/5/6/7/8` bursty matrix
-- service-gating enforcement at scale now that certified sync and QC-dominant branch choice are live
-- real PQ integration only after that matrix is green
+- stale-node restart recovery under heavy sync-control pressure
+- finishing stale catch-up through certified and incremental suffix repair without needing a late full snapshot rescue
+- real PQ integration only after the full matrix and stale-restart stress cases are green
 
 ## Current Recommended Prototype Policy
 
@@ -163,10 +165,10 @@ Important:
 The current prototype proved the core Entangrid idea is implementable, and `main` now carries the first real V2 stabilization slices, but the scaling work is not finished yet:
 
 - the baseline local-receipt path is still too topology-sensitive at larger validator counts
-- V2 service gating must keep improving from confirmed prior-epoch committee evidence
 - healthy `6/7/8` bursty runs now repeatedly shut down on one tip with QC-dominant branch choice active
 - certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
-- the next blocker is no longer branch selection itself, but service-score collapse and gating semantics at `7/8`
+- V2 service evidence and degraded punishment are materially better after the transport/session hardening on `main`
+- the next blocker is stale-node restart catch-up under sync-control saturation, not baseline healthy ordering anymore
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
 Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.
@@ -242,7 +244,7 @@ cargo run -p entangrid-sim -- matrix \
 ```
 
 The matrix runner now waits for convergence during the settle window, captures reports at that converged moment, checks scenario-specific scoring/gating expectations, and then asks nodes to shut down cleanly, so the generated summaries are a much better fit for regression checking. Those expectations now cover both sides of the policy: harsh degraded runs must actually gate the targeted validator, baseline runs must keep honest validators above a minimum score floor, and the policy-sweep cases now track how many non-target validators fell below threshold or suffered gating fallout under different threshold, score-window, and penalty-weight settings.
-The built-in matrix now also includes a healthy `gated-6-bursty` scenario, which is useful because it currently exposes the remaining convergence gap under heavier multi-validator traffic instead of silently hiding it.
+The built-in matrix now also includes larger-validator healthy and degraded bursty scenarios because the current runtime goal is no longer just proving structural convergence on `6/7/8`, but also proving that stale and degraded nodes recover cleanly without regressing the V2 sync path.
 The recommended prototype defaults above are the same values used by the current shared config defaults, so a plain gated `init-localnet` run now starts from the current 4-validator matrix-selected policy instead of an older warmup profile.
 The localnet reports now also surface the penalty inputs behind the latest score, including failed session counts and invalid receipts, so threshold, weight, and window tuning is easier to inspect from one run to the next.
 The built-in matrix also includes abuse-control scenarios now, so we can verify that sync-control floods trip peer rate limits and inbound connection floods trip listener session caps without breaking the Entangrid-specific degraded-validator cases.

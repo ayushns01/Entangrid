@@ -175,10 +175,11 @@ Important current limit:
 - certified sync and QC-dominant branch choice are now live on `main`
 - healthy bursty `6/7/8` runs now repeatedly shut down structurally on one tip
 - stale certified-sync responses are now skipped instead of re-adopting an older certified suffix
-- service scores and gating still need work at `7/8`
+- restarted nodes now suppress historical proposer-slot replay and can hold proposals behind a startup sync barrier while peers are still ahead
+- the remaining node-runtime edge is stale-node restart catch-up under sync-control saturation, not healthy branch convergence
 - the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
-The recent validation-focused improvement in this crate was about correctness under degraded networking:
+The recent validation-focused improvement in this crate was about correctness under degraded networking and stale restart recovery:
 
 - commitment validation now uses explicit proof data from the block
 - stricter receipt assignment checks are enforced
@@ -192,12 +193,15 @@ The recent validation-focused improvement in this crate was about correctness un
 - the active matrix focus on `main` is the V2 `4/5/6/7/8` healthy and degraded bursty sweep, using `codex/consensus-v1` as the benchmark/control line
 - larger-topology peers now reconverge structurally in repeated healthy `6/7/8` runs, which cuts down the old ordering blocker substantially
 - certified sync now refuses stale certified responses that would otherwise pull a node backward after it already advanced
-- the next node-runtime milestone is service-gating enforcement and score stability at `7/8`, not activating certified repair itself
+- restarted nodes now seed `last_processed_slot` from real time and stored state so they do not replay historical proposer slots on startup
+- restarted nodes can wait behind a startup sync barrier instead of immediately proposing while peers are known ahead
+- certified sync responses now carry responder tip metadata so a catching-up node can follow certified repair with suffix sync instead of stalling at the certified frontier
+- the next node-runtime milestone is finishing stale restart recovery without sync-control chatter or rate-limit pressure starving the final suffix catch-up
 
 So the next node-runtime milestone is:
 
-- stronger service-gating enforcement at scale on the V2 path
-- healthier score behavior once certified repair has already converged the branch
+- lower sync-control churn during stale recovery
+- cleaner suffix catch-up after certified repair, ideally without needing full snapshot fallback at all
 
 But it is still intentionally early-stage.
 

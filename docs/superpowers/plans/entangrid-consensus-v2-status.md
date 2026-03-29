@@ -116,22 +116,24 @@ That means both Issue 1 and Issue 2 have been cut down substantially:
 
 ## What Is Still Broken
 
-The biggest remaining blocker is now service-score stability and gating semantics at larger validator counts.
+The biggest remaining blocker is now stale-node restart recovery under heavy sync-control pressure.
 
-The latest healthy bursty runs on `main` make that pretty clear:
+The runtime moved past the earlier broad Issue 3 story:
 
-- structural convergence is now much better than the older `3/6`, `2/7`, `3/8` shapes
-- full-snapshot fallback is no longer driving these healthy `6/7/8` runs
-- but `7` and especially `8` still show service-score collapse and `0` gating rejections
+- persistent per-peer outbound lanes and multi-frame inbound sessions fixed the transport bottleneck that was starving service evidence
+- healthy larger-validator bursty runs now converge structurally without the old service-score collapse
+- degraded larger-validator runs now punish the target much more reliably while keeping honest validators healthy
 
-In the latest cross-branch comparison:
+But the newest stale-restart reruns exposed a narrower edge:
 
-- `v1 degraded` average same-chain ratio was `0.587`
-- `v2 degraded` average same-chain ratio was `0.487`
-- `v1 degraded` average target score was `0.090`
-- `v2 degraded` average target score was `0.217`
+- restarted nodes no longer replay historical proposer slots after coming back
+- restarted nodes can hold proposals behind a startup sync barrier while peers are still ahead
+- certified sync now prefers higher certified height over a taller uncertified local tip
+- certified sync responses now tell the requester whether the responder is still ahead so suffix repair can follow immediately
+- the latest stale `8` rerun avoided full-snapshot fallback entirely
+- but the restarted node still finished a few blocks short of the cluster under heavy `sync-control` rate limiting
 
-So the service side is still the next thing to beat: the full live matrix is not green yet because larger healthy runs can converge structurally while still ending with incorrect score/gating behavior.
+So the remaining problem is no longer "make certified sync exist" or "make healthy `6/7/8` converge." It is "make a restarted stale node finish the last suffix catch-up reliably when recovery traffic itself is noisy."
 
 ## What This Means
 
@@ -140,17 +142,18 @@ The redesign direction still looks correct, but `main` is not ready for PQ integ
 The honest status is:
 
 - V2 service evidence is substantially better than the legacy model
-- degraded punishment is working in smaller benchmark cases but is still not reliable enough across the full matrix
+- degraded punishment is now materially better across the live matrix than the older service-collapse phase
 - Issue 1 certified-sync activation is effectively closed
 - Issue 2 QC-backed canonical branch selection is effectively closed for the healthy `6/7/8` structural runs we just repeated
-- the remaining pre-PQ blocker is service-gating enforcement at scale
+- Issue 3 service evidence and gating behavior are materially improved, but the new active blocker is stale restart recovery
+- the remaining pre-PQ blocker is reliable stale-node catch-up under sync-control saturation
 
 ## Next Work
 
 The next implementation priorities are:
 
-1. tighten service-gating enforcement at scale
-2. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification against the V1 benchmark line
+1. finish stale restart recovery without relying on late full snapshots or getting trapped behind sync-control rate limits
+2. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification plus stale-restart stress against the V1 benchmark line
 3. only after that move to PQ-safe signature/session integration
 
 ## Recommended Reading Order

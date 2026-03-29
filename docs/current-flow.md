@@ -78,23 +78,26 @@ The network is pre-wired for localnet experiments.
 When a node sends a protocol message:
 
 1. it chooses a peer from its config
-2. it opens a TCP connection to that peer
-3. it wraps the payload in a signed `SignedEnvelope`
-4. it serializes the envelope with `bincode`
-5. it sends a length-prefixed frame
+2. it enqueues the payload onto that peer's outbound lane
+3. it reuses the current TCP stream for that peer when possible, or reconnects if the stream is gone
+4. it wraps the payload in a signed `SignedEnvelope`
+5. it serializes the envelope with `bincode`
+6. it sends a length-prefixed frame
 
 When the receiver gets a message:
 
-1. it reads the frame length
-2. it reads the full frame body
-3. it decodes the envelope
-4. it checks the payload hash
-5. it verifies the sender signature
-6. it hands the message to the node runtime
+1. it keeps reading frames from the inbound TCP session
+2. it reads the frame length
+3. it reads the full frame body
+4. it decodes the envelope
+5. it checks the payload hash
+6. it verifies the sender signature
+7. it hands the message to the node runtime
 
 So communication today is:
 
 - direct TCP
+- mostly persistent per-peer streams instead of one fresh connection per message
 - signed messages
 - binary framing
 - static peers
@@ -242,7 +245,7 @@ This is why bursty runs can temporarily split the network into short competing b
 
 The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
 
-Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. The next open problem is service-evidence/gating behavior at larger validator counts.
+Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. The current open problem is narrower: restarted stale nodes can still finish a run a few blocks behind when sync-control chatter and rate limits interfere with the final suffix catch-up.
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 

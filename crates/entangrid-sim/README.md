@@ -53,7 +53,7 @@ The current recommended prototype gating profile emitted by default is:
 - `service_score_window_epochs = 4`
 - weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-That default is still the best current 4-validator baseline, but the live matrix now keeps healthy `6/7/8` cases in the suite because the remaining pre-PQ problem has shifted from structural reconvergence to service-score and gating behavior at larger validator counts.
+That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the remaining pre-PQ problem has shifted from basic structural reconvergence to restart-time recovery and stale-node catch-up behavior.
 
 Current branch focus:
 
@@ -157,7 +157,7 @@ Recent improvement:
 - localnet and matrix summaries now also expose peer-rate-limit drops and inbound-session drops, which makes abuse-control tuning visible without digging into raw metrics files
 - the matrix can now generate protocol-level abuse traffic itself, so we can regression-test the new per-peer rate limits and inbound listener caps without needing manual socket scripts
 - the matrix now also exposes non-target below-threshold counts and non-target gating rejections, so threshold/window sweeps tell us whether a policy is only punishing the degraded validator or harming honest ones too
-- the matrix now also keeps the healthy `gated-6-bursty` case in the suite, which currently helps us catch larger-topology reconvergence regressions instead of only proving the 4-validator path
+- the matrix now also keeps larger-validator healthy and degraded bursty cases in the suite, which helps us catch both reconvergence regressions and the newer stale-restart recovery edge cases instead of only proving the 4-validator path
 
 ### Fault and degradation controls
 

@@ -18,6 +18,8 @@ Current benchmark gate on `main`:
 - `codex/consensus-v1` is the benchmark/control line
 - Issue 1 certified-sync availability is now expected to stay live in `6/7/8`, and certified repair should apply whenever a run actually needs recovery
 - Issue 2 healthy branch convergence is now expected to finish on one tip in repeated `6/7/8` runs
+- Issue 3 service evidence and degraded punishment are expected to stay healthy enough that honest validators avoid collapse while the degraded target is still penalized
+- the active edge case is now stale-node restart recovery: a restarted node should catch up without falling back to late full snapshots or getting stuck behind sync-control rate limiting
 - PQ integration stays out of scope until the V2 matrix is green
 
 ## Core Metrics
@@ -163,6 +165,7 @@ Run these in order:
 4. four-node degraded-link benchmark
 5. seven-node churn and isolation benchmark
 6. `4/5/6/7/8` healthy and degraded bursty V2 matrix against the V1 benchmark line
+7. stale-node restart recovery on larger V2 localnets, with certified plus suffix repair preferred over full snapshot fallback
 
 ## Rule For Interpreting Results
 

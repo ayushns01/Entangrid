@@ -12,7 +12,8 @@ Current status note:
 - the baseline receipt-driven path is still available when `consensus_v2` is disabled and is preserved as the benchmark line on `codex/consensus-v1`
 - committee-attested service evidence, certified sync, and QC-dominant branch choice are now live on `main`
 - healthy `6/7/8` bursty runs now repeatedly shut down structurally on one tip, and certified sync now ignores stale certified suffixes instead of downgrading local state
-- larger-topology service scoring and gating are still unfinished
+- startup replay suppression and a startup sync barrier now prevent restarted nodes from replaying stale proposer slots before they catch up
+- the remaining runtime edge is stale-node restart recovery under sync-control saturation, not baseline healthy branch selection
 - the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## High-Level Components
@@ -107,7 +108,8 @@ Current V2 detail on `main`:
 - service-evidence gating is partially live behind `consensus_v2`
 - certified sync is now live behind `consensus_v2`
 - QC-backed canonical branch selection is now active behind `consensus_v2`
-- the main remaining consensus/runtime gap is service-gating behavior at larger validator counts, not fork choice activation
+- restart-time proposal suppression and startup sync barriers are now active behind `consensus_v2`
+- the main remaining consensus/runtime gap is stale-node suffix catch-up under sync-control pressure, not fork-choice activation in healthy runs
 
 ### 7. Storage Layer
 
