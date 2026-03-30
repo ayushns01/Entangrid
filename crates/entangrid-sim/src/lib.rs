@@ -2615,8 +2615,10 @@ mod tests {
 
     #[test]
     fn consensus_v2_localnet_scales_observer_surface_with_validator_count() {
-        let unique_dir = std::env::temp_dir()
-            .join(format!("entangrid-sim-v2-witnesses-test-{}", now_unix_millis()));
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-v2-witnesses-test-{}",
+            now_unix_millis()
+        ));
         init_localnet(
             6,
             &unique_dir,

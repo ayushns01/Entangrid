@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use entangrid_crypto::CryptoBackend;
 use entangrid_types::{
-    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope,
-    ValidatorId, canonical_hash,
+    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope, ValidatorId,
+    canonical_hash,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -483,9 +483,9 @@ fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut No
 mod tests {
     use super::*;
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+    use entangrid_types::HeartbeatPulse;
     use entangrid_types::{GenesisConfig, ValidatorConfig};
     use std::io::Error;
-    use entangrid_types::HeartbeatPulse;
     use tokio::{
         net::TcpListener,
         sync::mpsc,
@@ -686,7 +686,11 @@ mod tests {
         let (second, _): (SignedEnvelope, usize) =
             bincode::serde::decode_from_slice(&second_frame, bincode::config::standard()).unwrap();
         assert_eq!(second.payload, payload_two);
-        assert!(timeout(Duration::from_millis(200), listener.accept()).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

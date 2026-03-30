@@ -738,7 +738,11 @@ mod tests {
         let aggregators = engine.service_aggregators_for(2, 1);
 
         assert_eq!(aggregators.len(), 3);
-        assert!(aggregators.iter().all(|validator_id| committee.contains(validator_id)));
+        assert!(
+            aggregators
+                .iter()
+                .all(|validator_id| committee.contains(validator_id))
+        );
         assert_eq!(aggregators, engine.service_aggregators_for(2, 1));
         assert!(engine.is_service_aggregator_for(2, 1, aggregators[0]));
     }
