@@ -19,8 +19,8 @@ use entangrid_types::{
     ChunkedSyncResponse, Epoch, EventLogEntry, GenesisConfig, HashBytes, HeartbeatPulse,
     MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProposalVote, ProtocolMessage,
     QuorumCertificate, RelayReceipt, ServiceAggregate, ServiceAttestation, ServiceCounters,
-    SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment, ValidatorId,
-    canonical_hash, empty_hash, now_unix_millis,
+    SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment, TypedSignature,
+    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -1479,7 +1479,7 @@ impl NodeRunner {
             latency_bucket_ms: self.genesis.slot_duration_millis.min(1000),
             byte_count_bucket: u64::from(byte_hash[0]),
             sequence_number,
-            signature: Vec::new(),
+            signature: TypedSignature::default(),
         };
         let receipt_hash = receipt_signing_hash(&receipt);
         receipt.signature = self.crypto.sign(self.config.validator_id, &receipt_hash)?;
@@ -1871,7 +1871,7 @@ impl NodeRunner {
             block_number: block.header.block_number,
             epoch: block.header.epoch,
             slot: block.header.slot,
-            signature: Vec::new(),
+            signature: TypedSignature::default(),
         };
         let hash = proposal_vote_signing_hash(&vote);
         vote.signature = self.crypto.sign(self.config.validator_id, &hash)?;
@@ -4264,7 +4264,7 @@ impl NodeRunner {
             committee_member_id: self.config.validator_id,
             epoch,
             counters,
-            signature: Vec::new(),
+            signature: TypedSignature::default(),
         };
         let hash = service_attestation_signing_hash(&attestation);
         attestation.signature = self.crypto.sign(self.config.validator_id, &hash)?;
@@ -4598,19 +4598,19 @@ impl NodeRunner {
 
 fn receipt_signing_hash(receipt: &RelayReceipt) -> HashBytes {
     let mut unsigned = receipt.clone();
-    unsigned.signature.clear();
+    unsigned.signature.bytes.clear();
     canonical_hash(&unsigned)
 }
 
 fn service_attestation_signing_hash(attestation: &ServiceAttestation) -> HashBytes {
     let mut unsigned = attestation.clone();
-    unsigned.signature.clear();
+    unsigned.signature.bytes.clear();
     canonical_hash(&unsigned)
 }
 
 fn proposal_vote_signing_hash(vote: &ProposalVote) -> HashBytes {
     let mut unsigned = vote.clone();
-    unsigned.signature.clear();
+    unsigned.signature.bytes.clear();
     canonical_hash(&unsigned)
 }
 
@@ -5383,9 +5383,9 @@ mod tests {
     use entangrid_network::{NetworkEvent, spawn_network};
     use entangrid_types::{
         ChunkedSyncResponse, FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PeerConfig,
-        ProposalVote, ProtocolMessage, ServiceAggregate, ServiceAttestation, ServiceCounters,
-        SignedTransaction, SyncQcAnchor, Transaction, ValidatorConfig, empty_hash,
-        validator_account,
+        ProposalVote, ProtocolMessage, PublicIdentity, ServiceAggregate, ServiceAttestation,
+        ServiceCounters, SignatureScheme, SignedTransaction, SyncQcAnchor, Transaction,
+        TypedSignature, ValidatorConfig, empty_hash, validator_account,
     };
     use tokio::{sync::mpsc, time::timeout};
 
@@ -5410,7 +5410,7 @@ mod tests {
                     stake: 100,
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: balances,
@@ -5429,7 +5429,10 @@ mod tests {
             latency_bucket_ms: 100,
             byte_count_bucket: 8,
             sequence_number: 7,
-            signature: vec![1, 2, 3],
+            signature: TypedSignature {
+                scheme: SignatureScheme::DevDeterministic,
+                bytes: vec![1, 2, 3],
+            },
         }
     }
 
@@ -5675,7 +5678,7 @@ mod tests {
             committee_member_id,
             epoch,
             counters,
-            signature: Vec::new(),
+            signature: TypedSignature::default(),
         };
         let hash = service_attestation_signing_hash(&attestation);
         attestation.signature = crypto.sign(committee_member_id, &hash).unwrap();
@@ -5736,11 +5739,29 @@ mod tests {
             block_number: block.header.block_number,
             epoch: block.header.epoch,
             slot: block.header.slot,
-            signature: Vec::new(),
+            signature: TypedSignature::default(),
         };
         let hash = proposal_vote_signing_hash(&vote);
         vote.signature = crypto.sign(validator_id, &hash).unwrap();
         vote
+    }
+
+    #[test]
+    fn first_valid_block_uses_typed_signature() {
+        let genesis = sample_genesis();
+        let block = first_valid_block(&genesis);
+        assert_eq!(block.signature.scheme, entangrid_types::SignatureScheme::DevDeterministic);
+        assert!(!block.signature.bytes.is_empty());
+    }
+
+    #[test]
+    fn signed_proposal_vote_uses_typed_signature() {
+        let genesis = sample_genesis();
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let block = first_valid_block(&genesis);
+        let vote = signed_proposal_vote(&crypto, 2, &block);
+        assert_eq!(vote.signature.scheme, entangrid_types::SignatureScheme::DevDeterministic);
+        assert!(!vote.signature.bytes.is_empty());
     }
 
     async fn recv_protocol_message(
@@ -7040,7 +7061,10 @@ mod tests {
         );
 
         let mut vote = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
-        vote.signature = vec![7, 7, 7];
+        vote.signature = TypedSignature {
+            scheme: SignatureScheme::DevDeterministic,
+            bytes: vec![7, 7, 7],
+        };
 
         let error = runner.import_proposal_vote(vote).unwrap_err();
 
@@ -12140,7 +12164,7 @@ mod tests {
                     stake: 100,
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: balances,
@@ -13302,7 +13326,10 @@ mod tests {
         let mut runner = build_test_runner(1, config, genesis).await;
         let mut attestation =
             signed_service_attestation(runner.crypto.as_ref(), 1, 2, 1, ServiceCounters::default());
-        attestation.signature = vec![9, 9, 9];
+        attestation.signature = TypedSignature {
+            scheme: SignatureScheme::DevDeterministic,
+            bytes: vec![9, 9, 9],
+        };
 
         let error = runner.import_service_attestation(attestation).unwrap_err();
 
@@ -13462,7 +13489,10 @@ mod tests {
     fn receipt_event_hash_ignores_non_identity_fields() {
         let mut first = sample_receipt();
         let mut second = sample_receipt();
-        second.signature = vec![9, 9, 9];
+        second.signature = TypedSignature {
+            scheme: SignatureScheme::DevDeterministic,
+            bytes: vec![9, 9, 9],
+        };
         second.transcript_digest = [9u8; 32];
         second.latency_bucket_ms = 900;
         second.byte_count_bucket = 42;
@@ -13514,7 +13544,10 @@ mod tests {
         receipt.source_validator_id = 1;
         receipt.destination_validator_id = 2;
         receipt.witness_validator_id = 2;
-        receipt.signature = vec![9, 9, 9];
+        receipt.signature = TypedSignature {
+            scheme: SignatureScheme::DevDeterministic,
+            bytes: vec![9, 9, 9],
+        };
         let chain = ChainSnapshot {
             snapshot: LedgerState::from_genesis(&genesis).snapshot().clone(),
             blocks: Vec::new(),

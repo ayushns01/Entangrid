@@ -227,6 +227,12 @@ At minimum, a block should include:
 
 Detailed receipt bodies can live off the critical validation path and be requested on demand if the commitment is disputed.
 
+Current PQ Stage 1 direction:
+
+- signature-bearing protocol objects are moving from anonymous byte signatures to typed signatures with explicit scheme metadata
+- this stage keeps consensus behavior unchanged while making the wire and state model crypto-agile
+- hybrid policy enforcement comes later; the current slice only makes scheme-aware signing/authentication possible
+
 ## Slashing And Rewards
 
 V1 should not implement full economics.

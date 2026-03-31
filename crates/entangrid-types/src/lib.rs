@@ -8,6 +8,46 @@ pub type Epoch = u64;
 pub type HashBytes = [u8; 32];
 pub type AccountId = String;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SignatureScheme {
+    DevDeterministic,
+    Ed25519,
+    MlDsa,
+    Hybrid,
+}
+
+impl Default for SignatureScheme {
+    fn default() -> Self {
+        Self::DevDeterministic
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PublicKeyScheme {
+    DevDeterministic,
+    Ed25519,
+    MlDsa,
+    Hybrid,
+}
+
+impl Default for PublicKeyScheme {
+    fn default() -> Self {
+        Self::DevDeterministic
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypedSignature {
+    pub scheme: SignatureScheme,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicIdentity {
+    pub scheme: PublicKeyScheme,
+    pub bytes: Vec<u8>,
+}
+
 pub const RECOMMENDED_SERVICE_GATING_START_EPOCH: Epoch = 3;
 pub const RECOMMENDED_SERVICE_GATING_THRESHOLD: f64 = 0.40;
 pub const RECOMMENDED_SERVICE_SCORE_WINDOW_EPOCHS: u64 = 4;
@@ -59,7 +99,7 @@ pub struct ValidatorConfig {
     pub stake: u64,
     pub address: String,
     pub dev_secret: String,
-    pub public_identity: Vec<u8>,
+    pub public_identity: PublicIdentity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,7 +142,7 @@ pub struct Transaction {
 pub struct SignedTransaction {
     pub transaction: Transaction,
     pub signer_id: ValidatorId,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
     pub tx_hash: HashBytes,
     pub submitted_at_unix_millis: u64,
 }
@@ -128,7 +168,7 @@ pub struct RelayReceipt {
     pub latency_bucket_ms: u64,
     pub byte_count_bucket: u64,
     pub sequence_number: u64,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -175,7 +215,7 @@ pub struct Block {
     pub commitment: Option<TopologyCommitment>,
     #[serde(default)]
     pub commitment_receipts: Vec<RelayReceipt>,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
     pub block_hash: HashBytes,
 }
 
@@ -213,7 +253,7 @@ pub struct ProposalVote {
     pub block_number: u64,
     pub epoch: Epoch,
     pub slot: Slot,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,7 +285,7 @@ pub struct ServiceAttestation {
     pub committee_member_id: ValidatorId,
     pub epoch: Epoch,
     pub counters: ServiceCounters,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -361,7 +401,7 @@ pub enum ProtocolMessage {
 pub struct SignedEnvelope {
     pub from_validator_id: ValidatorId,
     pub message_hash: HashBytes,
-    pub signature: Vec<u8>,
+    pub signature: TypedSignature,
     pub payload: ProtocolMessage,
 }
 
@@ -603,7 +643,10 @@ mod tests {
             block_number: 7,
             epoch: 3,
             slot: 19,
-            signature: vec![1, 2, 3],
+            signature: TypedSignature {
+                scheme: SignatureScheme::DevDeterministic,
+                bytes: vec![1, 2, 3],
+            },
         };
         let qc = QuorumCertificate {
             block_hash: vote.block_hash,
@@ -629,7 +672,10 @@ mod tests {
                 failed_sessions: 1,
                 invalid_receipts: 0,
             },
-            signature: vec![4, 5, 6],
+            signature: TypedSignature {
+                scheme: SignatureScheme::DevDeterministic,
+                bytes: vec![4, 5, 6],
+            },
         };
         let aggregate = ServiceAggregate {
             subject_validator_id: 3,
@@ -660,5 +706,29 @@ mod tests {
         let (decoded, _): (CertifiedBlockHeader, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded, certified);
+    }
+
+    #[test]
+    fn typed_signature_round_trips_with_scheme_metadata() {
+        let signature = TypedSignature {
+            scheme: SignatureScheme::DevDeterministic,
+            bytes: vec![1, 2, 3, 4],
+        };
+        let bytes = bincode::serde::encode_to_vec(&signature, bincode::config::standard()).unwrap();
+        let (decoded, _): (TypedSignature, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, signature);
+    }
+
+    #[test]
+    fn public_identity_round_trips_with_scheme_metadata() {
+        let identity = PublicIdentity {
+            scheme: PublicKeyScheme::DevDeterministic,
+            bytes: vec![9, 8, 7, 6],
+        };
+        let bytes = bincode::serde::encode_to_vec(&identity, bincode::config::standard()).unwrap();
+        let (decoded, _): (PublicIdentity, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, identity);
     }
 }

@@ -262,7 +262,10 @@ pub fn init_localnet(
             stake: 100,
             address: address.clone(),
             dev_secret: format!("entangrid-dev-secret-{validator_id}"),
-            public_identity: format!("validator-{validator_id}").into_bytes(),
+            public_identity: entangrid_types::PublicIdentity {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{validator_id}").into_bytes(),
+            },
         });
         initial_balances.insert(validator_account(validator_id), 1_000_000);
     }
@@ -2225,7 +2228,10 @@ mod tests {
                 transactions: Vec::new(),
                 commitment: None,
                 commitment_receipts: Vec::new(),
-                signature: vec![validator_id as u8],
+                signature: entangrid_types::TypedSignature {
+                    scheme: entangrid_types::SignatureScheme::DevDeterministic,
+                    bytes: vec![validator_id as u8],
+                },
                 block_hash,
             });
             parent_hash = block_hash;
@@ -2329,7 +2335,7 @@ mod tests {
                     stake: 100,
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
-                    public_identity: vec![],
+                    public_identity: entangrid_types::PublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),

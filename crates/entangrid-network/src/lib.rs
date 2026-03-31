@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use entangrid_crypto::CryptoBackend;
 use entangrid_types::{
-    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope, ValidatorId,
-    canonical_hash,
+    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope,
+    ValidatorId, canonical_hash,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -484,7 +484,7 @@ mod tests {
     use super::*;
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::HeartbeatPulse;
-    use entangrid_types::{GenesisConfig, ValidatorConfig};
+    use entangrid_types::{GenesisConfig, PublicIdentity, ValidatorConfig};
     use std::io::Error;
     use tokio::{
         net::TcpListener,
@@ -499,14 +499,14 @@ mod tests {
                 stake: 100,
                 address: "127.0.0.1:4100".into(),
                 dev_secret: "secret-1".into(),
-                public_identity: vec![],
+                public_identity: PublicIdentity::default(),
             },
             ValidatorConfig {
                 validator_id: 2,
                 stake: 100,
                 address: "127.0.0.1:4101".into(),
                 dev_secret: "secret-2".into(),
-                public_identity: vec![],
+                public_identity: PublicIdentity::default(),
             },
         ]
     }

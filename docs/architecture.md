@@ -45,6 +45,12 @@ Responsibilities:
 
 The crypto layer should expose a narrow interface so the rest of the codebase does not depend on primitive-specific details.
 
+Current PQ Stage 1 detail on `stage-1/pq-integration`:
+
+- signing and verification are being moved to typed signatures with explicit scheme metadata
+- validator config is moving to typed public identities instead of untyped byte blobs
+- the current slice is intentionally limited to signing/authentication, not session KEM changes yet
+
 ### 3. Network Layer
 
 Responsibilities:
@@ -172,6 +178,7 @@ This gives cleaner fault injection and makes CPU and memory usage easier to comp
 ### `crypto`
 
 - key wrappers
+- scheme-aware signature wrappers
 - signature verification
 - key exchange
 - transcript hashing
@@ -182,6 +189,7 @@ This gives cleaner fault injection and makes CPU and memory usage easier to comp
 - transaction
 - block
 - receipt
+- typed signature and identity containers
 - epoch assignment
 - topology commitment
 

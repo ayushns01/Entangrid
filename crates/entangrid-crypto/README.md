@@ -33,7 +33,8 @@ Current behavior:
 
 - each validator has a `dev_secret`
 - signing is simulated by hashing `dev_secret || message`
-- verification recomputes the same value
+- signatures are now returned as typed signatures with explicit scheme metadata
+- verification dispatches by signature scheme instead of assuming one anonymous byte format
 - session material is deterministically derived from:
   - both validators' secrets
   - both validator ids
@@ -45,6 +46,13 @@ This is useful because it gives us:
 - a working chain skeleton
 - a working networking layer
 - a clean place to swap in real algorithms later
+
+The current deterministic backend emits `SignatureScheme::DevDeterministic`. That means the rest of the system can now distinguish:
+
+- what bytes were signed
+- which scheme produced them
+
+without changing consensus rules yet.
 
 ## What it is not
 
@@ -69,6 +77,12 @@ Current main-branch focus:
 - stabilize the V2 protocol path on `main` first
 - keep the crypto boundary clean while consensus, ordering, and sync are still changing
 - only move to real PQ integration after the single-machine V2 matrix is green
+
+Current PQ branch focus:
+
+- on `stage-1/pq-integration`, the first implementation slice is to make signing and identity types scheme-aware
+- that branch is intentionally limited to signing/authentication first
+- KEM/session upgrades come later
 
 ## Why this crate matters
 

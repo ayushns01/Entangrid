@@ -20,6 +20,13 @@ If `entangrid-node`, `entangrid-ledger`, `entangrid-consensus`, and `entangrid-n
 
 Right now this crate is intentionally simple and very central.
 
+It also now contains the first crypto-agility primitives for the PQ work:
+
+- `SignatureScheme`
+- `PublicKeyScheme`
+- `TypedSignature`
+- `PublicIdentity`
+
 - `GenesisConfig` describes the chain start state:
   - validator list
   - slot timing
@@ -40,7 +47,7 @@ Right now this crate is intentionally simple and very central.
   - optional `memo`
 - `SignedTransaction` wraps that transfer with:
   - signer id
-  - signature
+  - typed signature
   - transaction hash
   - submission timestamp
 - `Block` contains:
@@ -48,7 +55,7 @@ Right now this crate is intentionally simple and very central.
   - accepted transactions
   - an optional topology commitment
   - the receipt bundle that proves that commitment in the current prototype
-  - proposer signature
+  - typed proposer signature
   - block hash
 - `ProtocolMessage` is the current network message enum:
   - transaction broadcast
@@ -134,6 +141,12 @@ One recent example of the type layer evolving with the active main-branch V2 wor
 - `ServiceAttestation` and `ServiceAggregate` now carry the witness-aligned evidence needed for the V2 path
 - `NodeMetrics` now distinguishes actual gating rejections from enforcement skips when evidence is missing or insufficient
 
+One recent example of the type layer evolving with the active PQ branch is signing and identity metadata:
+
+- signature-bearing protocol objects now carry `TypedSignature` instead of anonymous bytes
+- validator config now carries `PublicIdentity` instead of an untyped byte blob
+- verification code can now dispatch by explicit signature scheme
+
 ## Where we want to take it
 
 This crate should grow into the stable protocol schema of Entangrid.
@@ -144,6 +157,6 @@ Future direction:
 - add richer transaction types beyond simple transfers
 - support stronger proof and commitment structures
 - introduce versioning and upgrade-friendly wire/state formats
-- prepare the type layer for real post-quantum identities and network evidence
+- extend the typed identity and signature model into full PQ and hybrid production formats
 
 In short: this crate should become the clean, stable data model that the rest of the blockchain can rely on for a long time.

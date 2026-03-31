@@ -168,8 +168,8 @@ mod tests {
 
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::{
-        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash, empty_hash,
-        now_unix_millis, validator_account,
+        GenesisConfig, PublicIdentity, SignedTransaction, Transaction, ValidatorConfig,
+        canonical_hash, empty_hash, now_unix_millis, validator_account,
     };
 
     use super::*;
@@ -194,14 +194,14 @@ mod tests {
                     stake: 100,
                     address: "127.0.0.1:3001".into(),
                     dev_secret: "secret-1".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 },
                 ValidatorConfig {
                     validator_id: 2,
                     stake: 100,
                     address: "127.0.0.1:3002".into(),
                     dev_secret: "secret-2".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 },
             ],
             initial_balances: balances,
@@ -228,5 +228,58 @@ mod tests {
         state.apply_transaction(&signed).unwrap();
         assert_eq!(state.balance_of(&validator_account(1)), 90);
         assert_eq!(state.balance_of(&validator_account(2)), 10);
+    }
+
+    #[test]
+    fn typed_signature_transaction_validates_with_deterministic_backend() {
+        let mut balances = BTreeMap::new();
+        balances.insert(validator_account(1), 100);
+        balances.insert(validator_account(2), 0);
+
+        let genesis = GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+            ],
+            initial_balances: balances,
+        };
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: None,
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        let state = LedgerState::from_genesis(&genesis);
+        state.validate_tx(&signed, &crypto).unwrap();
     }
 }
