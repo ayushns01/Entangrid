@@ -10,6 +10,17 @@
 
 ---
 
+## Stage 1B Status Note
+
+Stage 1B now builds on this plan with:
+
+- `SigningBackendKind` in `NodeConfig`
+- a crypto backend factory instead of hard-coded deterministic startup wiring
+- an experimental `MlDsa65Experimental` backend behind `pq-ml-dsa`
+- ML-DSA validation tests for transactions, blocks, and proposal votes
+
+Session/KEM work and hybrid enforcement are still intentionally out of scope.
+
 ## File Structure
 
 ### Crypto and type foundation

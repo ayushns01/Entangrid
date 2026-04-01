@@ -49,6 +49,8 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 
 - signing and verification are being moved to typed signatures with explicit scheme metadata
 - validator config is moving to typed public identities instead of untyped byte blobs
+- node config now carries node-local signing backend selection instead of treating signer choice as a consensus feature flag
+- the first real experimental PQ backend is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - the current slice is intentionally limited to signing/authentication, not session KEM changes yet
 
 ### 3. Network Layer

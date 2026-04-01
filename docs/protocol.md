@@ -231,6 +231,8 @@ Current PQ Stage 1 direction:
 
 - signature-bearing protocol objects are moving from anonymous byte signatures to typed signatures with explicit scheme metadata
 - this stage keeps consensus behavior unchanged while making the wire and state model crypto-agile
+- validator public identity stays in genesis while node-local signer choice and key loading now live in node config
+- the first experimental PQ signing path is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - hybrid policy enforcement comes later; the current slice only makes scheme-aware signing/authentication possible
 
 ## Slashing And Rewards

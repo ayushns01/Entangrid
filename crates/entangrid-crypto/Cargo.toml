@@ -4,8 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+pq-ml-dsa = ["dep:ml-dsa"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
 entangrid-types = { path = "../entangrid-types" }
+ml-dsa = { version = "0.0.4", optional = true }
+serde.workspace = true
+serde_json.workspace = true
 
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }

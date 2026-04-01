@@ -26,6 +26,7 @@ It also now contains the first crypto-agility primitives for the PQ work:
 - `PublicKeyScheme`
 - `TypedSignature`
 - `PublicIdentity`
+- `SigningBackendKind`
 
 - `GenesisConfig` describes the chain start state:
   - validator list
@@ -39,6 +40,8 @@ It also now contains the first crypto-agility primitives for the PQ work:
   - static peers
   - feature flags
   - fault profile
+  - `signing_backend`
+  - optional `signing_key_path`
 - `Transaction` is a native balance transfer:
   - `from`
   - `to`
@@ -145,6 +148,7 @@ One recent example of the type layer evolving with the active PQ branch is signi
 
 - signature-bearing protocol objects now carry `TypedSignature` instead of anonymous bytes
 - validator config now carries `PublicIdentity` instead of an untyped byte blob
+- node config now carries `SigningBackendKind` so signer selection is local configuration, not a consensus feature flag
 - verification code can now dispatch by explicit signature scheme
 
 ## Where we want to take it

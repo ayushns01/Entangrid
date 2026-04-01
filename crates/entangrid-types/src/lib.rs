@@ -36,6 +36,19 @@ impl Default for PublicKeyScheme {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningBackendKind {
+    DevDeterministic,
+    MlDsa65Experimental,
+}
+
+impl Default for SigningBackendKind {
+    fn default() -> Self {
+        Self::DevDeterministic
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TypedSignature {
     pub scheme: SignatureScheme,
@@ -127,6 +140,10 @@ pub struct NodeConfig {
     pub feature_flags: FeatureFlags,
     pub fault_profile: FaultProfile,
     pub sync_on_startup: bool,
+    #[serde(default)]
+    pub signing_backend: SigningBackendKind,
+    #[serde(default)]
+    pub signing_key_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -730,5 +747,67 @@ mod tests {
         let (decoded, _): (PublicIdentity, usize) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn signing_backend_defaults_to_deterministic_when_omitted_from_node_config() {
+        let config = r#"
+validator_id = 1
+data_dir = "/tmp/node-1"
+genesis_path = "/tmp/genesis.toml"
+listen_address = "127.0.0.1:3001"
+peers = []
+log_path = "/tmp/events.log"
+metrics_path = "/tmp/metrics.json"
+sync_on_startup = true
+
+[feature_flags]
+enable_receipts = true
+enable_service_gating = false
+consensus_v2 = false
+service_gating_start_epoch = 3
+service_gating_threshold = 0.40
+service_score_window_epochs = 4
+
+[feature_flags.service_score_weights]
+uptime_weight = 0.25
+delivery_weight = 0.50
+diversity_weight = 0.25
+penalty_weight = 1.0
+
+[fault_profile]
+artificial_delay_ms = 0
+outbound_drop_probability = 0.0
+pause_slot_production = false
+disable_outbound = false
+"#;
+        let parsed: NodeConfig = toml::from_str(config).unwrap();
+        assert_eq!(parsed.signing_backend, SigningBackendKind::DevDeterministic);
+        assert_eq!(parsed.signing_key_path, None);
+    }
+
+    #[test]
+    fn signing_backend_round_trips_through_toml() {
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::MlDsa65Experimental,
+            signing_key_path: Some("/tmp/ml-dsa.sk".into()),
+        };
+        let serialized = toml::to_string(&config).unwrap();
+        let decoded: NodeConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            decoded.signing_backend,
+            SigningBackendKind::MlDsa65Experimental
+        );
+        assert_eq!(decoded.signing_key_path.as_deref(), Some("/tmp/ml-dsa.sk"));
     }
 }

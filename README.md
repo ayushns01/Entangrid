@@ -107,7 +107,11 @@ Important:
 
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
 - real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
-- `stage-1/pq-integration` is now the active branch for Stage 1 PQ foundations: typed signatures, typed identities, and crypto-agile signing/authentication without consensus-rule changes
+- `stage-1/pq-integration` is now the active branch for Stage 1 PQ work:
+  - typed signatures and typed public identities are in
+  - node-local signing backend selection is in
+  - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
+  - session/KEM upgrades and hybrid enforcement still come later
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back

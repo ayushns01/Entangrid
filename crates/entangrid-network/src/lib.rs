@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use entangrid_crypto::CryptoBackend;
 use entangrid_types::{
-    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope,
-    ValidatorId, canonical_hash,
+    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope, ValidatorId,
+    canonical_hash,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

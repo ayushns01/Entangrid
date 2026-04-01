@@ -12,11 +12,12 @@ use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
     PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
-    Transaction, ValidatorConfig, canonical_hash, default_service_delivery_weight,
-    default_service_diversity_weight, default_service_gating_start_epoch,
-    default_service_gating_threshold, default_service_penalty_weight,
-    default_service_score_weights, default_service_score_window_epochs,
-    default_service_uptime_weight, empty_hash, now_unix_millis, validator_account,
+    SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
+    default_service_delivery_weight, default_service_diversity_weight,
+    default_service_gating_start_epoch, default_service_gating_threshold,
+    default_service_penalty_weight, default_service_score_weights,
+    default_service_score_window_epochs, default_service_uptime_weight, empty_hash,
+    now_unix_millis, validator_account,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -326,6 +327,8 @@ pub fn init_localnet(
             },
             fault_profile,
             sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
         };
         let config_path = node_dir.join("node.toml");
         fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -2414,6 +2417,40 @@ mod tests {
         let contents = fs::read_to_string(node_one_path).unwrap();
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.consensus_v2);
+    }
+
+    #[test]
+    fn init_localnet_defaults_nodes_to_deterministic_signing_backend() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-signing-backend-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+        )
+        .unwrap();
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(
+            node_config.signing_backend,
+            entangrid_types::SigningBackendKind::DevDeterministic
+        );
+        assert_eq!(node_config.signing_key_path, None);
     }
 
     #[test]

@@ -22,12 +22,14 @@ Right now the crate contains:
 - `HandshakeProvider`
 - `TranscriptHasher`
 - `CryptoBackend`
+- `build_crypto_backend(...)`
 
-and one concrete implementation:
+and two concrete backend paths:
 
 - `DeterministicCryptoBackend`
+- `MlDsa65Experimental` behind the `pq-ml-dsa` cargo feature
 
-That backend is a development-only placeholder.
+The deterministic backend is still the default development path. The ML-DSA path is experimental and only covers signing/authentication so far.
 
 Current behavior:
 
@@ -53,6 +55,13 @@ The current deterministic backend emits `SignatureScheme::DevDeterministic`. Tha
 - which scheme produced them
 
 without changing consensus rules yet.
+
+The current PQ branch now also supports:
+
+- node-local backend selection through `NodeConfig.signing_backend`
+- optional ML-DSA signing key loading through `NodeConfig.signing_key_path`
+- validator identity checks at startup so a node cannot silently sign as a mismatched public identity
+- scheme-aware verification for both deterministic and ML-DSA signatures
 
 ## What it is not
 
@@ -80,7 +89,10 @@ Current main-branch focus:
 
 Current PQ branch focus:
 
-- on `stage-1/pq-integration`, the first implementation slice is to make signing and identity types scheme-aware
+- on `stage-1/pq-integration`, the first implementation slices are:
+  - make signing and identity types scheme-aware
+  - add node-local backend selection
+  - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
 - that branch is intentionally limited to signing/authentication first
 - KEM/session upgrades come later
 
