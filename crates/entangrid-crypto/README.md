@@ -63,6 +63,39 @@ The current PQ branch now also supports:
 - validator identity checks at startup so a node cannot silently sign as a mismatched public identity
 - scheme-aware verification for both deterministic and ML-DSA signatures
 
+## How to measure ML-DSA signing right now
+
+Stage 1C on `stage-1/pq-integration` adds a report-first measurement flow.
+
+Backend-local measurement:
+
+```bash
+cargo test -p entangrid-crypto --features pq-ml-dsa measurement
+```
+
+Small sim-side block/proposal-vote proxy report:
+
+```bash
+cargo run -p entangrid-sim --features pq-ml-dsa -- pq-measure \
+  --validators 4 \
+  --iterations 32 \
+  --output-path test-results/pq-ml-dsa-measurements.md
+```
+
+What this currently measures:
+
+- deterministic vs ML-DSA public identity size
+- deterministic vs ML-DSA signature size
+- deterministic vs ML-DSA sign latency
+- deterministic vs ML-DSA verify latency
+- deterministic vs ML-DSA serialized block/proposal-vote proxy size
+
+What it does not measure yet:
+
+- KEM/session overhead
+- hybrid dual-signature policy
+- full localnet benchmark gates
+
 ## What it is not
 
 This crate is **not post-quantum secure yet**.

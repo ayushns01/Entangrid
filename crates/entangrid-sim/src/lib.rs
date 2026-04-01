@@ -9,6 +9,10 @@ use std::{
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+#[cfg(feature = "pq-ml-dsa")]
+use entangrid_crypto::{
+    build_crypto_backend, deterministic_public_identity, measure_signing_backend,
+};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
     PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
@@ -19,6 +23,15 @@ use entangrid_types::{
     default_service_score_window_epochs, default_service_uptime_weight, empty_hash,
     now_unix_millis, validator_account,
 };
+#[cfg(feature = "pq-ml-dsa")]
+use entangrid_types::{
+    Block, BlockHeader, ProposalVote, PublicIdentity, PublicKeyScheme, TopologyCommitment,
+    TypedSignature, ValidatorId,
+};
+#[cfg(feature = "pq-ml-dsa")]
+use ml_dsa::{KeyGen, MlDsa65};
+#[cfg(feature = "pq-ml-dsa")]
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncWriteExt,
@@ -98,6 +111,14 @@ enum Commands {
         output_dir: PathBuf,
         #[arg(long, default_value_t = 18)]
         settle_secs: u64,
+    },
+    PqMeasure {
+        #[arg(long, default_value_t = 4)]
+        validators: usize,
+        #[arg(long, default_value_t = 32)]
+        iterations: usize,
+        #[arg(long, default_value = "test-results/pq-ml-dsa-measurements.md")]
+        output_path: PathBuf,
     },
 }
 
@@ -219,7 +240,17 @@ pub async fn cli_main() -> Result<()> {
             output_dir,
             settle_secs,
         } => run_rigorous_matrix(&base_dir, &output_dir, settle_secs).await,
+        Commands::PqMeasure {
+            validators,
+            iterations,
+            output_path,
+        } => run_pq_measurement(&output_path, validators, iterations),
     }
+}
+
+#[cfg(test)]
+fn default_pq_measurement_output_path() -> String {
+    "test-results/pq-ml-dsa-measurements.md".into()
 }
 
 pub fn init_localnet(
@@ -1521,6 +1552,30 @@ struct MatrixReport {
     scenarios: Vec<MatrixScenarioResult>,
 }
 
+#[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct PqMeasurementScenario {
+    label: String,
+    deterministic_signature_size_bytes: usize,
+    ml_dsa_signature_size_bytes: usize,
+    deterministic_message_size_bytes: usize,
+    ml_dsa_message_size_bytes: usize,
+    deterministic_median_sign_latency_nanos: u128,
+    ml_dsa_median_sign_latency_nanos: u128,
+    deterministic_median_verify_latency_nanos: u128,
+    ml_dsa_median_verify_latency_nanos: u128,
+}
+
+#[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct PqMeasurementReport {
+    generated_at_unix_millis: u64,
+    validator_count: usize,
+    iterations: usize,
+    output_path: String,
+    scenarios: Vec<PqMeasurementScenario>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct BenchmarkTarget {
     name: String,
@@ -1904,6 +1959,353 @@ impl MatrixReport {
 
         lines.join("\n")
     }
+}
+
+impl PqMeasurementReport {
+    #[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+    fn render_markdown(&self) -> String {
+        let mut lines = vec![
+            "# Entangrid PQ Signing Measurements".to_string(),
+            String::new(),
+            format!(
+                "Generated at unix millis `{}` with validator count `{}` and iterations `{}`.",
+                self.generated_at_unix_millis, self.validator_count, self.iterations
+            ),
+            String::new(),
+            "| Scenario | Deterministic signature size | ML-DSA signature size | Deterministic message size | ML-DSA message size | Deterministic Median sign latency | ML-DSA Median sign latency | Deterministic Median verify latency | ML-DSA Median verify latency |".to_string(),
+            "|---|---|---|---|---|---|---|---|---|".to_string(),
+        ];
+        for scenario in &self.scenarios {
+            lines.push(format!(
+                "| {} | {} bytes | {} bytes | {} bytes | {} bytes | {} ns | {} ns | {} ns | {} ns |",
+                scenario.label,
+                scenario.deterministic_signature_size_bytes,
+                scenario.ml_dsa_signature_size_bytes,
+                scenario.deterministic_message_size_bytes,
+                scenario.ml_dsa_message_size_bytes,
+                scenario.deterministic_median_sign_latency_nanos,
+                scenario.ml_dsa_median_sign_latency_nanos,
+                scenario.deterministic_median_verify_latency_nanos,
+                scenario.ml_dsa_median_verify_latency_nanos
+            ));
+        }
+        lines.push(String::new());
+        lines.push("## Measurement Notes".to_string());
+        lines.push(String::new());
+        lines.push("- Public identity and signature sizes come from the real configured signing backends.".to_string());
+        lines.push("- Block and proposal-vote message sizes are proxy serialized sizes, not a full live-network benchmark.".to_string());
+        lines.push("- Median timings are local-machine measurements and should be treated as indicative.".to_string());
+        lines.join("\n")
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MlDsa65SimKeyFile {
+    signing_key: Vec<u8>,
+    verifying_key: Vec<u8>,
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_measurement_validators(
+    validator_count: usize,
+    validator_one_identity: PublicIdentity,
+) -> Vec<ValidatorConfig> {
+    (1..=validator_count as u64)
+        .map(|validator_id| ValidatorConfig {
+            validator_id,
+            stake: 100,
+            address: format!("127.0.0.1:{}", 3000 + validator_id),
+            dev_secret: format!("secret-{validator_id}"),
+            public_identity: if validator_id == 1 {
+                validator_one_identity.clone()
+            } else {
+                deterministic_public_identity(validator_id)
+            },
+        })
+        .collect()
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_measurement_genesis(
+    validator_count: usize,
+    validator_one_identity: PublicIdentity,
+) -> GenesisConfig {
+    GenesisConfig {
+        chain_id: "entangrid-pq-measurement".into(),
+        epoch_seed: empty_hash(),
+        genesis_time_unix_millis: 0,
+        slot_duration_millis: 1_000,
+        slots_per_epoch: 6,
+        max_txs_per_block: 16,
+        witness_count: validator_count.saturating_sub(2).max(2),
+        validators: build_measurement_validators(validator_count, validator_one_identity),
+        initial_balances: (1..=validator_count as u64)
+            .map(|validator_id| (validator_account(validator_id), 1_000))
+            .collect(),
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn deterministic_measurement_config() -> NodeConfig {
+    NodeConfig {
+        validator_id: 1,
+        data_dir: "/tmp/pq-measure-deterministic".into(),
+        genesis_path: "/tmp/pq-measure-genesis.toml".into(),
+        listen_address: "127.0.0.1:3001".into(),
+        peers: Vec::new(),
+        log_path: "/tmp/pq-measure-events.log".into(),
+        metrics_path: "/tmp/pq-measure-metrics.json".into(),
+        feature_flags: FeatureFlags::default(),
+        fault_profile: FaultProfile::default(),
+        sync_on_startup: true,
+        signing_backend: SigningBackendKind::DevDeterministic,
+        signing_key_path: None,
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn ml_dsa_measurement_setup(validator_count: usize) -> Result<(GenesisConfig, NodeConfig)> {
+    let mut rng = OsRng;
+    let keypair = MlDsa65::key_gen(&mut rng);
+    let signing_key = keypair.signing_key().clone();
+    let verifying_key = keypair.verifying_key().clone();
+    let key_path = std::env::temp_dir().join(format!(
+        "entangrid-pq-measure-{}-{}.key",
+        validator_count,
+        std::process::id()
+    ));
+    let key_file = MlDsa65SimKeyFile {
+        signing_key: signing_key.encode().as_slice().to_vec(),
+        verifying_key: verifying_key.encode().as_slice().to_vec(),
+    };
+    fs::write(&key_path, serde_json::to_vec(&key_file)?)?;
+    let genesis = build_measurement_genesis(
+        validator_count,
+        PublicIdentity {
+            scheme: PublicKeyScheme::MlDsa,
+            bytes: verifying_key.encode().as_slice().to_vec(),
+        },
+    );
+    let config = NodeConfig {
+        signing_backend: SigningBackendKind::MlDsa65Experimental,
+        signing_key_path: Some(key_path.display().to_string()),
+        ..deterministic_measurement_config()
+    };
+    Ok((genesis, config))
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn sample_block(block_hash_parent: [u8; 32], signature: TypedSignature) -> Block {
+    let transactions = Vec::new();
+    let commitment: Option<TopologyCommitment> = None;
+    let header = BlockHeader {
+        block_number: 2,
+        parent_hash: block_hash_parent,
+        slot: 2,
+        epoch: 0,
+        proposer_id: 1,
+        timestamp_unix_millis: 1_000,
+        state_root: canonical_hash(&"state-root"),
+        transactions_root: canonical_hash(&transactions),
+        topology_root: commitment
+            .as_ref()
+            .map(canonical_hash)
+            .unwrap_or_else(empty_hash),
+    };
+    let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+    Block {
+        header,
+        transactions,
+        commitment,
+        commitment_receipts: Vec::new(),
+        signature,
+        block_hash,
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn unsigned_proposal_vote() -> ProposalVote {
+    ProposalVote {
+        validator_id: 1,
+        block_hash: canonical_hash(&"proposal-vote-block"),
+        block_number: 2,
+        epoch: 0,
+        slot: 2,
+        signature: TypedSignature::default(),
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn proposal_vote_signing_hash(vote: &ProposalVote) -> [u8; 32] {
+    let mut unsigned = vote.clone();
+    unsigned.signature = TypedSignature::default();
+    canonical_hash(&unsigned)
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn sample_block_signing_hash() -> [u8; 32] {
+    let transactions = Vec::<SignedTransaction>::new();
+    let commitment: Option<TopologyCommitment> = None;
+    let header = BlockHeader {
+        block_number: 2,
+        parent_hash: empty_hash(),
+        slot: 2,
+        epoch: 0,
+        proposer_id: 1,
+        timestamp_unix_millis: 1_000,
+        state_root: canonical_hash(&"state-root"),
+        transactions_root: canonical_hash(&transactions),
+        topology_root: commitment
+            .as_ref()
+            .map(canonical_hash)
+            .unwrap_or_else(empty_hash),
+    };
+    canonical_hash(&(header, &transactions, &commitment))
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn signed_block_size(
+    genesis: &GenesisConfig,
+    config: &NodeConfig,
+    validator_id: ValidatorId,
+) -> Result<usize> {
+    let crypto = build_crypto_backend(genesis, config)?;
+    let block_hash = sample_block_signing_hash();
+    let signature = crypto.sign(validator_id, &block_hash)?;
+    Ok(
+        bincode::serde::encode_to_vec(
+            sample_block(empty_hash(), signature),
+            bincode::config::standard(),
+        )?
+        .len(),
+    )
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn signed_vote_size(
+    genesis: &GenesisConfig,
+    config: &NodeConfig,
+    validator_id: ValidatorId,
+) -> Result<usize> {
+    let crypto = build_crypto_backend(genesis, config)?;
+    let mut vote = unsigned_proposal_vote();
+    let vote_hash = proposal_vote_signing_hash(&vote);
+    vote.signature = crypto.sign(validator_id, &vote_hash)?;
+    Ok(bincode::serde::encode_to_vec(vote, bincode::config::standard())?.len())
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_pq_measurement_report(
+    validator_count: usize,
+    iterations: usize,
+    output_path: &Path,
+) -> Result<PqMeasurementReport> {
+    let deterministic_genesis =
+        build_measurement_genesis(validator_count, deterministic_public_identity(1));
+    let deterministic_config = deterministic_measurement_config();
+    let (ml_dsa_genesis, ml_dsa_config) = ml_dsa_measurement_setup(validator_count)?;
+
+    let block_hash = sample_block_signing_hash();
+    let vote_hash = proposal_vote_signing_hash(&unsigned_proposal_vote());
+
+    let deterministic_block = measure_signing_backend(
+        "deterministic",
+        &deterministic_genesis,
+        &deterministic_config,
+        1,
+        &block_hash,
+        iterations,
+    )?;
+    let ml_dsa_block = measure_signing_backend(
+        "ml-dsa",
+        &ml_dsa_genesis,
+        &ml_dsa_config,
+        1,
+        &block_hash,
+        iterations,
+    )?;
+    let deterministic_vote = measure_signing_backend(
+        "deterministic",
+        &deterministic_genesis,
+        &deterministic_config,
+        1,
+        &vote_hash,
+        iterations,
+    )?;
+    let ml_dsa_vote = measure_signing_backend(
+        "ml-dsa",
+        &ml_dsa_genesis,
+        &ml_dsa_config,
+        1,
+        &vote_hash,
+        iterations,
+    )?;
+
+    Ok(PqMeasurementReport {
+        generated_at_unix_millis: now_unix_millis(),
+        validator_count,
+        iterations,
+        output_path: output_path.to_string_lossy().to_string(),
+        scenarios: vec![
+            PqMeasurementScenario {
+                label: "block".into(),
+                deterministic_signature_size_bytes: deterministic_block.signature_size_bytes,
+                ml_dsa_signature_size_bytes: ml_dsa_block.signature_size_bytes,
+                deterministic_message_size_bytes: signed_block_size(
+                    &deterministic_genesis,
+                    &deterministic_config,
+                    1,
+                )?,
+                ml_dsa_message_size_bytes: signed_block_size(&ml_dsa_genesis, &ml_dsa_config, 1)?,
+                deterministic_median_sign_latency_nanos: deterministic_block
+                    .median_sign_latency_nanos,
+                ml_dsa_median_sign_latency_nanos: ml_dsa_block.median_sign_latency_nanos,
+                deterministic_median_verify_latency_nanos: deterministic_block
+                    .median_verify_latency_nanos,
+                ml_dsa_median_verify_latency_nanos: ml_dsa_block.median_verify_latency_nanos,
+            },
+            PqMeasurementScenario {
+                label: "proposal_vote".into(),
+                deterministic_signature_size_bytes: deterministic_vote.signature_size_bytes,
+                ml_dsa_signature_size_bytes: ml_dsa_vote.signature_size_bytes,
+                deterministic_message_size_bytes: signed_vote_size(
+                    &deterministic_genesis,
+                    &deterministic_config,
+                    1,
+                )?,
+                ml_dsa_message_size_bytes: signed_vote_size(&ml_dsa_genesis, &ml_dsa_config, 1)?,
+                deterministic_median_sign_latency_nanos: deterministic_vote
+                    .median_sign_latency_nanos,
+                ml_dsa_median_sign_latency_nanos: ml_dsa_vote.median_sign_latency_nanos,
+                deterministic_median_verify_latency_nanos: deterministic_vote
+                    .median_verify_latency_nanos,
+                ml_dsa_median_verify_latency_nanos: ml_dsa_vote.median_verify_latency_nanos,
+            },
+        ],
+    })
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn run_pq_measurement(output_path: &Path, validator_count: usize, iterations: usize) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let report = build_pq_measurement_report(validator_count, iterations, output_path)?;
+    fs::write(output_path, report.render_markdown())?;
+    println!("{}", output_path.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "pq-ml-dsa"))]
+fn run_pq_measurement(
+    _output_path: &Path,
+    _validator_count: usize,
+    _iterations: usize,
+) -> Result<()> {
+    Err(anyhow!(
+        "pq-measure requires entangrid-sim to be built with pq-ml-dsa"
+    ))
 }
 
 fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result<LocalnetReport> {
@@ -2776,6 +3178,73 @@ mod tests {
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
         assert!(markdown.contains("| Scenario | Status | Signal | Validators |"));
+    }
+
+    #[test]
+    fn pq_measurement_report_renders_backend_and_overhead_fields() {
+        let report = PqMeasurementReport {
+            generated_at_unix_millis: 1,
+            validator_count: 4,
+            iterations: 32,
+            output_path: "test-results/pq-ml-dsa-measurements.md".into(),
+            scenarios: vec![
+                PqMeasurementScenario {
+                    label: "block".into(),
+                    deterministic_signature_size_bytes: 32,
+                    ml_dsa_signature_size_bytes: 3309,
+                    deterministic_message_size_bytes: 480,
+                    ml_dsa_message_size_bytes: 3757,
+                    deterministic_median_sign_latency_nanos: 500,
+                    ml_dsa_median_sign_latency_nanos: 45_000,
+                    deterministic_median_verify_latency_nanos: 400,
+                    ml_dsa_median_verify_latency_nanos: 62_000,
+                },
+                PqMeasurementScenario {
+                    label: "proposal_vote".into(),
+                    deterministic_signature_size_bytes: 32,
+                    ml_dsa_signature_size_bytes: 3309,
+                    deterministic_message_size_bytes: 140,
+                    ml_dsa_message_size_bytes: 3417,
+                    deterministic_median_sign_latency_nanos: 450,
+                    ml_dsa_median_sign_latency_nanos: 42_000,
+                    deterministic_median_verify_latency_nanos: 390,
+                    ml_dsa_median_verify_latency_nanos: 59_000,
+                },
+            ],
+        };
+        let markdown = report.render_markdown();
+        assert!(markdown.contains("# Entangrid PQ Signing Measurements"));
+        assert!(markdown.contains("validator count"));
+        assert!(markdown.contains("block"));
+        assert!(markdown.contains("proposal_vote"));
+        assert!(markdown.contains("ML-DSA message size"));
+        assert!(markdown.contains("Median verify latency"));
+    }
+
+    #[test]
+    fn default_pq_measurement_output_path_uses_test_results_directory() {
+        let path = default_pq_measurement_output_path();
+        assert!(
+            path.starts_with("test-results"),
+            "unexpected output path: {path}"
+        );
+        assert!(
+            path.ends_with(".md"),
+            "unexpected output path extension: {path}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn pq_measurement_report_builds_real_block_and_vote_scenarios() {
+        let output_path = std::env::temp_dir().join("entangrid-pq-measure-test.md");
+        let report = build_pq_measurement_report(4, 4, &output_path).unwrap();
+        assert_eq!(report.validator_count, 4);
+        assert_eq!(report.scenarios.len(), 2);
+        assert_eq!(report.scenarios[0].label, "block");
+        assert_eq!(report.scenarios[1].label, "proposal_vote");
+        assert!(report.scenarios[0].ml_dsa_signature_size_bytes > 0);
+        assert!(report.scenarios[1].ml_dsa_message_size_bytes > 0);
     }
 
     #[test]

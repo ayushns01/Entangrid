@@ -23,6 +23,17 @@ Current benchmark gate on `main`:
 - the next benchmark gate is proving healthy, degraded, and stale-restart cases together on current `main`
 - PQ integration stays out of scope until the V2 matrix is green
 
+Current PQ measurement work on `stage-1/pq-integration`:
+
+- Stage 1C is report-first, not gate-first
+- deterministic vs ML-DSA signing measurements should be recorded before introducing PQ benchmark thresholds
+- the first PQ report should include:
+  - public identity size
+  - signature size
+  - sign latency
+  - verify latency
+  - one small block/proposal-vote proxy comparison
+
 ## Core Metrics
 
 ### Cryptography
@@ -79,6 +90,13 @@ Conditions:
 Purpose:
 
 - isolate post-quantum overhead
+
+For the current PQ branch, the first concrete outputs from this suite are:
+
+- backend-local deterministic vs ML-DSA signing measurements
+- a small deterministic vs ML-DSA block/proposal-vote proxy report
+
+Those outputs should be written as human-readable markdown under `test-results/` before we decide on any pass/fail thresholds.
 
 ### 3. Propagation Suite
 

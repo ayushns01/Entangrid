@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow};
 use entangrid_types::{
@@ -54,6 +54,93 @@ pub trait CryptoBackend:
 impl<T> CryptoBackend for T where
     T: Signer + Verifier + HandshakeProvider + TranscriptHasher + Send + Sync
 {
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SigningMeasurementReport {
+    pub backend: String,
+    pub signature_scheme: SignatureScheme,
+    pub public_identity_size_bytes: usize,
+    pub signature_size_bytes: usize,
+    pub median_sign_latency_nanos: u128,
+    pub median_verify_latency_nanos: u128,
+    pub iterations: usize,
+}
+
+fn median_nanos(samples: &mut [u128]) -> u128 {
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    samples[samples.len() / 2]
+}
+
+fn backend_display_name(backend: &str, scheme: &SignatureScheme) -> String {
+    match scheme {
+        SignatureScheme::DevDeterministic => "Deterministic".into(),
+        SignatureScheme::MlDsa => "ML-DSA".into(),
+        _ => backend.to_string(),
+    }
+}
+
+pub fn measure_signing_backend(
+    backend: &str,
+    genesis: &GenesisConfig,
+    config: &NodeConfig,
+    validator_id: ValidatorId,
+    message: &[u8],
+    iterations: usize,
+) -> Result<SigningMeasurementReport> {
+    let backend_impl = build_crypto_backend(genesis, config)?;
+    let validator = validator_config(genesis, validator_id)?;
+    let iterations = iterations.max(1);
+    let mut sign_latencies = Vec::with_capacity(iterations);
+    let mut verify_latencies = Vec::with_capacity(iterations);
+    let mut signature = None;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let signed = backend_impl.sign(validator_id, message)?;
+        sign_latencies.push(started.elapsed().as_nanos());
+
+        let started = Instant::now();
+        let verified = backend_impl.verify(validator_id, message, &signed)?;
+        verify_latencies.push(started.elapsed().as_nanos());
+        if !verified {
+            return Err(anyhow!(
+                "signature verification failed while measuring backend {backend}"
+            ));
+        }
+        signature = Some(signed);
+    }
+    let signature = signature.ok_or_else(|| anyhow!("missing measured signature"))?;
+    Ok(SigningMeasurementReport {
+        backend: backend.to_string(),
+        signature_scheme: signature.scheme,
+        public_identity_size_bytes: validator.public_identity.bytes.len(),
+        signature_size_bytes: signature.bytes.len(),
+        median_sign_latency_nanos: median_nanos(&mut sign_latencies),
+        median_verify_latency_nanos: median_nanos(&mut verify_latencies),
+        iterations,
+    })
+}
+
+pub fn render_signing_measurement_report(reports: &[SigningMeasurementReport]) -> String {
+    let mut markdown = String::from("# PQ Signing Measurements\n\n");
+    for report in reports {
+        let display_name = backend_display_name(&report.backend, &report.signature_scheme);
+        markdown.push_str(&format!("## {display_name}\n\n"));
+        markdown.push_str(&format!(
+            "- Backend id: `{}`\n- Signature scheme: `{:?}`\n- Public identity size: `{}` bytes\n- Signature size: `{}` bytes\n- Median sign latency: `{}` ns\n- Median verify latency: `{}` ns\n- Iterations: `{}`\n\n",
+            report.backend,
+            report.signature_scheme,
+            report.public_identity_size_bytes,
+            report.signature_size_bytes,
+            report.median_sign_latency_nanos,
+            report.median_verify_latency_nanos,
+            report.iterations,
+        ));
+    }
+    markdown
 }
 
 pub fn deterministic_public_identity(validator_id: ValidatorId) -> PublicIdentity {
@@ -556,6 +643,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn measurement_report_includes_deterministic_sizes_and_latency_sections() {
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:3001".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: deterministic_public_identity(1),
+            }],
+            initial_balances: Default::default(),
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+        };
+        let report = measure_signing_backend(
+            "deterministic",
+            &genesis,
+            &config,
+            1,
+            b"stage1c-measurement",
+            8,
+        )
+        .unwrap();
+        let markdown = render_signing_measurement_report(&[report.clone()]);
+        assert_eq!(report.backend, "deterministic");
+        assert_eq!(report.signature_scheme, SignatureScheme::DevDeterministic);
+        assert!(report.public_identity_size_bytes > 0);
+        assert!(report.signature_size_bytes > 0);
+        assert!(markdown.contains("Deterministic"));
+        assert!(markdown.contains("Public identity size"));
+        assert!(markdown.contains("Median sign latency"));
+        assert!(markdown.contains("Median verify latency"));
+    }
+
     #[cfg(not(feature = "pq-ml-dsa"))]
     #[test]
     fn backend_factory_rejects_ml_dsa_selection_without_feature() {
@@ -660,5 +800,71 @@ mod tests {
         let signature = backend.sign(1, b"ml-dsa-backend").unwrap();
         assert_eq!(signature.scheme, SignatureScheme::MlDsa);
         assert!(backend.verify(1, b"ml-dsa-backend", &signature).unwrap());
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn measurement_report_includes_ml_dsa_scheme_and_sizes() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-ml-dsa-measurement-{}.key",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFile {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        std::fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:3001".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: PublicIdentity {
+                    scheme: PublicKeyScheme::MlDsa,
+                    bytes: verifying_key.encode().as_slice().to_vec(),
+                },
+            }],
+            initial_balances: Default::default(),
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::MlDsa65Experimental,
+            signing_key_path: Some(key_path.display().to_string()),
+        };
+        let report =
+            measure_signing_backend("ml-dsa", &genesis, &config, 1, b"stage1c-measurement", 4)
+                .unwrap();
+        let markdown = render_signing_measurement_report(&[report.clone()]);
+        assert_eq!(report.signature_scheme, SignatureScheme::MlDsa);
+        assert!(report.public_identity_size_bytes > 0);
+        assert!(report.signature_size_bytes > 0);
+        assert!(markdown.contains("ML-DSA"));
+        assert!(markdown.contains("Signature size"));
     }
 }
