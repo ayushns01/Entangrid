@@ -1497,9 +1497,7 @@ pause_slot_production = false
 disable_outbound = false
 "#;
         let parsed: NodeConfig = toml::from_str(config).unwrap();
-        assert!(!parsed
-            .feature_flags
-            .require_hybrid_validator_signatures);
+        assert!(!parsed.feature_flags.require_hybrid_validator_signatures);
     }
 
     #[test]

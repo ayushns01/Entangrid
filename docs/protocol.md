@@ -18,6 +18,7 @@ Current status note:
 - committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
 - stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
+- on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, blocks, and proposal votes
 
 On the active `consensus_v2` path on `main`, the protocol direction is tightening further:
 
@@ -194,6 +195,14 @@ Current V2 note:
 - the service side of this rule is live on `main` behind `consensus_v2`
 - the ordering side now includes proposal votes, quorum certificates, certified sync, and QC-dominant branch selection
 - the remaining pre-PQ gap is reliable service scoring and gating behavior at larger validator counts
+
+Current PQ Stage 1E note on `stage-1/pq-integration`:
+
+- hybrid enforcement is opt-in, not default
+- when enabled, every validator in genesis must advertise a hybrid public identity
+- validator-originated block signatures must be hybrid
+- validator-originated proposal-vote signatures, including votes imported through quorum certificates, must be hybrid
+- transactions, receipts, service evidence, and session/KEM behavior remain outside this enforcement slice
 
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 

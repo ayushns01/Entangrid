@@ -64,6 +64,13 @@ The current PQ branch now also supports:
 - scheme-aware verification for both deterministic and ML-DSA signatures
 - hybrid deterministic + ML-DSA signing through `HybridDeterministicMlDsaExperimental`
 - permissive verification against hybrid identities so single-scheme and hybrid signatures can coexist during rollout
+- an opt-in `require_hybrid_validator_signatures` mode in node policy that now enforces hybrid validator identities plus hybrid block/proposal-vote signatures
+
+Current enforcement boundary:
+
+- blocks: enforced when the flag is on
+- proposal votes, including votes imported via quorum certificates: enforced when the flag is on
+- transactions, receipts, service evidence, and session/KEM behavior: not enforced yet
 
 ## How to measure ML-DSA signing right now
 

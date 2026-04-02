@@ -169,10 +169,7 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
     runner.run().await
 }
 
-fn validate_hybrid_enforcement_genesis(
-    config: &NodeConfig,
-    genesis: &GenesisConfig,
-) -> Result<()> {
+fn validate_hybrid_enforcement_genesis(config: &NodeConfig, genesis: &GenesisConfig) -> Result<()> {
     if !config.feature_flags.require_hybrid_validator_signatures {
         return Ok(());
     }
@@ -1767,7 +1764,11 @@ impl NodeRunner {
     }
 
     fn validate_hybrid_block_policy(&self, block: &Block) -> Result<()> {
-        if !self.config.feature_flags.require_hybrid_validator_signatures {
+        if !self
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures
+        {
             return Ok(());
         }
         if block.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
@@ -1953,7 +1954,11 @@ impl NodeRunner {
     }
 
     fn validate_hybrid_proposal_vote_policy(&self, vote: &ProposalVote) -> Result<()> {
-        if !self.config.feature_flags.require_hybrid_validator_signatures {
+        if !self
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures
+        {
             return Ok(());
         }
         if vote.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
@@ -5475,6 +5480,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "pq-ml-dsa"))]
     fn hybrid_test_identity(validator_id: ValidatorId) -> PublicIdentity {
         PublicIdentity::try_hybrid(vec![
             entangrid_types::PublicIdentityComponent {
@@ -5484,6 +5490,26 @@ mod tests {
             entangrid_types::PublicIdentityComponent {
                 scheme: entangrid_types::PublicKeyScheme::MlDsa,
                 bytes: format!("validator-{validator_id}-ml-dsa").into_bytes(),
+            },
+        ])
+        .unwrap()
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    fn hybrid_test_identity(validator_id: ValidatorId) -> PublicIdentity {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{validator_id}").into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: keypair.verifying_key().encode().as_slice().to_vec(),
             },
         ])
         .unwrap()
@@ -5990,8 +6016,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_enforcement_rejects_non_hybrid_competing_block_signature() {
         let genesis = hybridized_sample_genesis();
-        let mut config =
-            sample_node_config(1, reserve_local_address(), Vec::new(), "block-competing-reject");
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "block-competing-reject",
+        );
         config.feature_flags.require_hybrid_validator_signatures = false;
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let tip_block = first_valid_block(&genesis);
@@ -5999,7 +6029,10 @@ mod tests {
             runner.accept_block(tip_block.clone(), true).await.unwrap(),
             BlockAcceptance::Accepted
         );
-        runner.config.feature_flags.require_hybrid_validator_signatures = true;
+        runner
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures = true;
 
         let competing_block =
             valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, tip_block.header.slot + 1);
@@ -6012,7 +6045,9 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            !runner.proposal_votes.contains_key(&competing_block.block_hash),
+            !runner
+                .proposal_votes
+                .contains_key(&competing_block.block_hash),
             "rejecting a non-hybrid competing block should not record a local vote"
         );
         assert!(
@@ -6073,7 +6108,7 @@ mod tests {
                 .buffered_proposal_votes
                 .get(&vote.block_hash)
                 .and_then(|by_validator| by_validator.get(&2))
-            .is_some()
+                .is_some()
         );
     }
 

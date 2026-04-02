@@ -351,6 +351,7 @@ pub fn init_localnet(
                 enable_receipts: true,
                 enable_service_gating,
                 consensus_v2,
+                require_hybrid_validator_signatures: false,
                 service_gating_start_epoch,
                 service_gating_threshold,
                 service_score_window_epochs,

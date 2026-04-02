@@ -112,7 +112,9 @@ Important:
   - node-local signing backend selection is in
   - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
   - first-class hybrid signature and identity containers are now in for transactions, blocks, and proposal votes
-  - permissive hybrid verification is in, while mandatory hybrid enforcement still comes later
+  - permissive hybrid verification is in
+  - an opt-in `require_hybrid_validator_signatures` mode now enforces hybrid validator identities at startup plus hybrid signatures for blocks and proposal votes
+  - transactions, receipts, service evidence, and session/KEM enforcement still come later
   - session/KEM upgrades still come later
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
