@@ -79,6 +79,11 @@ Why:
 
 This stage is not about flexibility. It is about proving that strict hybrid enforcement can really boot.
 
+Because this mode generates real ML-DSA key material, the simulator command itself must be feature-aware:
+
+- `init-localnet --hybrid-enforcement` must run from a binary built with `pq-ml-dsa`
+- or fail immediately with a clear message explaining that hybrid bootstrap requires a `pq-ml-dsa` build
+
 ### 2. Simulator Generates Key Material Automatically
 
 The simulator should generate ML-DSA key material during `init-localnet` instead of requiring pre-generated files.
@@ -211,6 +216,7 @@ Deliverables:
 - ML-DSA key generation per validator
 - hybrid validator identities in generated genesis
 - compatible node config generation
+- clear early failure if hybrid bootstrap is requested from a simulator binary built without `pq-ml-dsa`
 - feature-aware launch requirements for hybrid localnets
 
 ### Phase 2: Smoke Validation
@@ -286,6 +292,7 @@ Expected verification commands:
 
 ```bash
 cargo test -p entangrid-sim
+cargo test -p entangrid-sim --features pq-ml-dsa
 cargo test -p entangrid-crypto -p entangrid-ledger -p entangrid-node --features pq-ml-dsa
 cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke
 ```
