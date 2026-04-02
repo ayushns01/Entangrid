@@ -2041,6 +2041,7 @@ impl NodeRunner {
 
     fn validate_proposal_vote_for_block(&self, vote: &ProposalVote, block: &Block) -> Result<()> {
         self.validate_proposal_vote_signature_and_signer(vote)?;
+        self.validate_hybrid_proposal_vote_policy(vote)?;
         if vote.block_number != block.header.block_number
             || vote.epoch != block.header.epoch
             || vote.slot != block.header.slot
@@ -6072,8 +6073,41 @@ mod tests {
                 .buffered_proposal_votes
                 .get(&vote.block_hash)
                 .and_then(|by_validator| by_validator.get(&2))
-                .is_some()
+            .is_some()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_votes_in_quorum_certificate_import() {
+        let genesis = hybridized_sample_genesis();
+        let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "qc-reject");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        config.feature_flags.consensus_v2 = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+        runner.blocks.push(block.clone());
+
+        let vote_crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let votes = vec![
+            signed_proposal_vote(&vote_crypto, 2, &block),
+            signed_proposal_vote(&vote_crypto, 3, &block),
+            signed_proposal_vote(&vote_crypto, 4, &block),
+        ];
+        let qc = QuorumCertificate {
+            block_hash: block.block_hash,
+            block_number: block.header.block_number,
+            epoch: block.header.epoch,
+            slot: block.header.slot,
+            vote_root: entangrid_types::quorum_certificate_vote_root(&votes),
+            votes,
+        };
+
+        let error = runner.import_quorum_certificate(qc).unwrap_err();
+        assert!(
+            error.to_string().contains("validator 2"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.quorum_certificates.is_empty());
     }
 
     #[cfg(feature = "pq-ml-dsa")]
