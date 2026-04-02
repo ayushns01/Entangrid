@@ -578,6 +578,8 @@ pub struct FeatureFlags {
     pub enable_service_gating: bool,
     #[serde(default = "default_consensus_v2")]
     pub consensus_v2: bool,
+    #[serde(default)]
+    pub require_hybrid_validator_signatures: bool,
     #[serde(default = "default_service_gating_start_epoch")]
     pub service_gating_start_epoch: Epoch,
     #[serde(default = "default_service_gating_threshold")]
@@ -1146,6 +1148,52 @@ mod tests {
     #[test]
     fn feature_flags_default_consensus_v2_is_disabled() {
         assert!(!FeatureFlags::default().consensus_v2);
+    }
+
+    #[test]
+    fn hybrid_enforcement_defaults_to_disabled() {
+        assert!(!FeatureFlags::default().require_hybrid_validator_signatures);
+    }
+
+    #[test]
+    fn hybrid_enforcement_round_trips_through_toml() {
+        let config = r#"
+validator_id = 1
+data_dir = "/tmp/node-1"
+genesis_path = "/tmp/genesis.toml"
+listen_address = "127.0.0.1:3001"
+peers = []
+log_path = "/tmp/events.log"
+metrics_path = "/tmp/metrics.json"
+sync_on_startup = true
+
+[feature_flags]
+enable_receipts = true
+enable_service_gating = false
+consensus_v2 = false
+require_hybrid_validator_signatures = true
+service_gating_start_epoch = 3
+service_gating_threshold = 0.40
+service_score_window_epochs = 4
+
+[feature_flags.service_score_weights]
+uptime_weight = 0.25
+delivery_weight = 0.50
+diversity_weight = 0.25
+penalty_weight = 1.0
+
+[fault_profile]
+artificial_delay_ms = 0
+outbound_drop_probability = 0.0
+pause_slot_production = false
+disable_outbound = false
+"#;
+        let parsed: NodeConfig = toml::from_str(config).unwrap();
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: NodeConfig = toml::from_str(&serialized).unwrap();
+        assert!(serialized.contains("require_hybrid_validator_signatures = true"));
+        assert!(reparsed.feature_flags.require_hybrid_validator_signatures);
+        assert!(parsed.feature_flags.require_hybrid_validator_signatures);
     }
 
     #[test]
