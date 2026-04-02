@@ -180,7 +180,8 @@ fn validate_hybrid_enforcement_genesis(
     for validator in &genesis.validators {
         if validator.public_identity.scheme() != PublicKeyScheme::Hybrid {
             return Err(anyhow!(
-                "hybrid enforcement requires every validator to advertise a hybrid public identity"
+                "hybrid enforcement requires validator {} to advertise a hybrid public identity",
+                validator.validator_id
             ));
         }
     }
@@ -5744,9 +5745,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn hybrid_enforcement_rejects_mixed_validator_identities_at_startup() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_mixed_validator_identities_at_startup() {
         let mut genesis = sample_genesis();
+        genesis.validators = genesis
+            .validators
+            .into_iter()
+            .map(|validator| ValidatorConfig {
+                public_identity: PublicIdentity::try_hybrid(vec![
+                    entangrid_types::PublicIdentityComponent {
+                        scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                        bytes: format!("validator-{}", validator.validator_id).into_bytes(),
+                    },
+                    entangrid_types::PublicIdentityComponent {
+                        scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                        bytes: format!("validator-{}-ml-dsa", validator.validator_id).into_bytes(),
+                    },
+                ])
+                .unwrap(),
+                ..validator
+            })
+            .collect();
         genesis.validators[0].public_identity = PublicIdentity::single(
             entangrid_types::PublicKeyScheme::DevDeterministic,
             b"validator-1".to_vec(),
@@ -5759,9 +5778,9 @@ mod tests {
         );
         config.feature_flags.require_hybrid_validator_signatures = true;
 
-        let error = validate_hybrid_enforcement_genesis(&config, &genesis).unwrap_err();
+        let error = run_node(config, genesis).await.unwrap_err();
         assert!(
-            error.to_string().contains("hybrid public identity"),
+            error.to_string().contains("validator 1"),
             "unexpected error: {error}"
         );
     }
