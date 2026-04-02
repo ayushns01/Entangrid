@@ -44,6 +44,8 @@ Right now, strict hybrid enforcement is still mostly a code-and-test feature. St
 - write hybrid validator identities into genesis automatically
 - write node configs that select `HybridDeterministicMlDsaExperimental`
 - write node configs that enable `require_hybrid_validator_signatures = true`
+- define the simulator startup behavior for this mode so node launch uses a `pq-ml-dsa`-capable build or fails early with a clear message
+- tie the strict hybrid smoke path to `consensus_v2 = true` so proposal-vote enforcement is part of the runnable mode
 - add one smoke test proving that a small generated all-hybrid localnet can boot successfully
 - document the new localnet bootstrap mode
 
@@ -117,6 +119,7 @@ Each generated node config should include:
 - `signing_backend = HybridDeterministicMlDsaExperimental`
 - `signing_key_path = ".../ml-dsa-key.json"`
 - `feature_flags.require_hybrid_validator_signatures = true`
+- `feature_flags.consensus_v2 = true`
 
 Other defaults should remain unchanged unless they are already required by existing localnet behavior.
 
@@ -125,6 +128,14 @@ This keeps the bootstrap mode aligned with current runtime expectations:
 - startup passes identity enforcement
 - locally produced blocks use hybrid signatures
 - locally produced proposal votes use hybrid signatures
+
+The `consensus_v2` requirement is intentional for this mode.
+
+Reason:
+
+- Stage 1E block enforcement applies in both the general block path and the V2-enabled runtime
+- Stage 1E proposal-vote enforcement only matters when proposal votes are live
+- a strict hybrid localnet that claims to exercise validator-originated enforcement should therefore turn on `consensus_v2`
 
 ### 5. Keep The CLI Surface Small
 
@@ -141,6 +152,21 @@ Why this name is preferable:
 - it does not overfit the stage to ML-DSA internals even though ML-DSA is the current PQ component
 
 The simulator behavior behind this flag can still use the current `pq-ml-dsa` implementation under the hood.
+
+### 6. Launch Path Must Be Feature-Aware
+
+Strict hybrid bootstrap is only meaningful if the generated localnet can actually start nodes that understand:
+
+- `HybridDeterministicMlDsaExperimental`
+- generated ML-DSA key files
+- hybrid validator identities
+
+That means simulator startup must do one of two things:
+
+- build/spawn `entangrid-node` with `pq-ml-dsa` enabled
+- or fail immediately with a clear operator-facing error explaining that hybrid-enforcement localnets require a `pq-ml-dsa` build
+
+Stage 1F should not silently generate a hybrid localnet that the existing launch path cannot boot.
 
 ## File And Output Shape
 
@@ -167,6 +193,7 @@ Generated node config should set:
 - `signing_backend = HybridDeterministicMlDsaExperimental`
 - `signing_key_path = "..."`
 - `feature_flags.require_hybrid_validator_signatures = true`
+- `feature_flags.consensus_v2 = true`
 
 All of this should be generated automatically by simulator init.
 
@@ -184,6 +211,7 @@ Deliverables:
 - ML-DSA key generation per validator
 - hybrid validator identities in generated genesis
 - compatible node config generation
+- feature-aware launch requirements for hybrid localnets
 
 ### Phase 2: Smoke Validation
 
@@ -220,9 +248,15 @@ Deliverables:
 Add tests that prove:
 
 - `init-localnet --hybrid-enforcement` writes `require_hybrid_validator_signatures = true`
+- `init-localnet --hybrid-enforcement` writes `consensus_v2 = true`
 - generated node configs select `HybridDeterministicMlDsaExperimental`
 - generated node configs contain an ML-DSA key path
 - generated genesis contains hybrid identities for all validators
+- without `--hybrid-enforcement`, `init-localnet` still preserves the current deterministic defaults:
+  - deterministic signing backend
+  - no generated ML-DSA key files
+  - `require_hybrid_validator_signatures = false`
+  - current default consensus behavior remains unchanged
 
 ### Smoke Test
 
@@ -231,6 +265,12 @@ Add one smoke path that proves:
 - a small generated localnet, preferably `4` validators
 - can boot successfully
 - under strict hybrid enforcement
+
+Concrete pass condition:
+
+- node processes stay alive past genesis time for a few slots
+- at least one block is proposed or accepted
+- because this mode enables `consensus_v2`, at least one proposal-vote or quorum-certificate path is observed in logs or metrics
 
 The smoke test should stay intentionally narrow:
 
@@ -250,7 +290,7 @@ cargo test -p entangrid-crypto -p entangrid-ledger -p entangrid-node --features 
 cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke
 ```
 
-If the smoke test boots nodes as part of verification, unrestricted localhost socket access may be needed outside the sandbox.
+If the smoke test boots nodes as part of verification, unrestricted localhost socket access may be needed outside the sandbox. The startup path should use a `pq-ml-dsa`-capable node build; otherwise the simulator should fail early with a clear message instead of attempting a broken launch.
 
 ## Risks And Trade-Offs
 
@@ -287,13 +327,30 @@ Stage 1F should first prove:
 
 Only after that should we widen hybrid runs into larger matrices.
 
+### Why Preserve Deterministic Defaults Explicitly?
+
+Because Stage 1F is adding a new bootstrap mode, not replacing the current simulator baseline.
+
+The branch already uses deterministic localnets for:
+
+- existing PQ measurement flows
+- existing non-hybrid tests
+- general localnet development
+
+So the strict hybrid path must be additive. The simulator should remain deterministic by default unless `--hybrid-enforcement` is explicitly requested.
+
 ## Success Criteria
 
 Stage 1F is successful when:
 
 - the simulator can generate a strict all-hybrid localnet automatically
 - every generated validator identity is hybrid
-- every generated node config selects the hybrid backend and enables hybrid enforcement
+- every generated node config selects the hybrid backend, enables hybrid enforcement, and enables `consensus_v2`
 - every generated node has an ML-DSA key file
-- one small localnet can boot successfully under that generated configuration
+- the hybrid localnet startup path is explicitly feature-aware and does not silently attempt an incompatible launch
+- one small localnet can boot successfully under that generated configuration, with:
+  - nodes alive past genesis time
+  - block production or acceptance observed
+  - proposal-vote or QC activity observed
+- deterministic localnet generation remains unchanged when `--hybrid-enforcement` is not used
 - docs clearly describe the new bootstrap mode and its boundaries
