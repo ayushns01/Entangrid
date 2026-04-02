@@ -483,7 +483,8 @@ pub async fn up_localnet(base_dir: &Path) -> Result<()> {
 
 async fn spawn_localnet_children(base_dir: &Path) -> Result<Vec<Child>> {
     let manifest = read_manifest(base_dir)?;
-    ensure_node_binary_built().await?;
+    let require_pq_ml_dsa = localnet_requires_hybrid_enforcement(&manifest)?;
+    ensure_node_binary_built(require_pq_ml_dsa).await?;
     refresh_genesis_time_for_fresh_localnet(&manifest)?;
     let node_binary = node_binary_path()?;
     let mut children: Vec<Child> = Vec::new();
@@ -845,6 +846,18 @@ fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {
             Ok(toml::from_str(&contents)?)
         })
         .collect()
+}
+
+fn localnet_requires_hybrid_enforcement(manifest: &LocalnetManifest) -> Result<bool> {
+    for config in read_node_configs(manifest)? {
+        if config.feature_flags.require_hybrid_validator_signatures
+            || config.signing_backend
+                == SigningBackendKind::HybridDeterministicMlDsaExperimental
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn wait_for_scenario_expectations(
@@ -2634,32 +2647,58 @@ where
     Ok(values)
 }
 
-fn node_binary_path() -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()?;
-    let parent = current_exe
+fn node_binary_candidate_paths(sim_exe: &Path) -> Result<Vec<PathBuf>> {
+    let parent = sim_exe
         .parent()
         .ok_or_else(|| anyhow!("sim executable has no parent directory"))?;
-    let mut candidate = parent.join("entangrid-node");
+    let mut candidates = vec![parent.join("entangrid-node")];
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        if let Some(debug_dir) = parent.parent() {
+            candidates.push(debug_dir.join("entangrid-node"));
+        }
+    }
     if cfg!(windows) {
-        candidate.set_extension("exe");
+        for candidate in &mut candidates {
+            candidate.set_extension("exe");
+        }
     }
-    if !candidate.exists() {
-        return Err(anyhow!(
-            "expected node binary at {}, build the workspace first",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    Ok(candidates)
 }
 
-async fn ensure_node_binary_built() -> Result<()> {
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("--bin")
-        .arg("entangrid-node")
-        .current_dir(workspace_root()?)
-        .status()
-        .await?;
+fn node_binary_path() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe()?;
+    let candidates = node_binary_candidate_paths(&current_exe)?;
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let preferred = candidates
+        .last()
+        .or_else(|| candidates.first())
+        .ok_or_else(|| anyhow!("could not compute node binary path candidates"))?;
+    Err(anyhow!(
+        "expected node binary at {}, build the workspace first",
+        preferred.display()
+    ))
+}
+
+async fn ensure_node_binary_built(require_pq_ml_dsa: bool) -> Result<()> {
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    if require_pq_ml_dsa {
+        return Err(anyhow!(
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa"
+        ));
+    }
+
+    let mut command = Command::new("cargo");
+    command.arg("build").arg("--bin").arg("entangrid-node");
+    if require_pq_ml_dsa {
+        command.arg("--features").arg("pq-ml-dsa");
+    }
+
+    let status = command.current_dir(workspace_root()?).status().await?;
     if !status.success() {
         return Err(anyhow!("failed to build entangrid-node"));
     }
@@ -2710,6 +2749,59 @@ fn localnet_is_fresh(manifest: &LocalnetManifest) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_localnet_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("entangrid-sim-{label}-{}", now_unix_millis()))
+    }
+
+    fn rewrite_first_node_config(
+        base_dir: &Path,
+        update: impl FnOnce(&mut NodeConfig),
+    ) -> LocalnetManifest {
+        let manifest = read_manifest(base_dir).unwrap();
+        let first_config_path = PathBuf::from(&manifest.node_configs[0]);
+        let contents = fs::read_to_string(&first_config_path).unwrap();
+        let mut config: NodeConfig = toml::from_str(&contents).unwrap();
+        update(&mut config);
+        fs::write(first_config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        manifest
+    }
+
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    fn write_hybrid_requirement_to_first_node(base_dir: &Path) {
+        rewrite_first_node_config(base_dir, |config| {
+            config.feature_flags.require_hybrid_validator_signatures = true;
+            config.signing_backend = SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        });
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    fn hybrid_boot_smoke_ready(manifest: &LocalnetManifest) -> Result<bool> {
+        let mut saw_block_progress = false;
+        let mut saw_positive_qc_activity = false;
+
+        for config in read_node_configs(manifest)? {
+            let node_dir = PathBuf::from(&config.data_dir);
+            let blocks: Vec<entangrid_types::Block> = read_json_lines(&node_dir.join("blocks.jsonl"))?;
+            if !blocks.is_empty() {
+                saw_block_progress = true;
+            }
+
+            let events: Vec<entangrid_types::EventLogEntry> =
+                read_json_lines(&node_dir.join("events.log"))?;
+            if events.iter().any(|entry| entry.event == "block-accepted") {
+                saw_block_progress = true;
+            }
+            if events
+                .iter()
+                .any(|entry| entry.event == "qc-built" || entry.event == "qc-imported")
+            {
+                saw_positive_qc_activity = true;
+            }
+        }
+
+        Ok(saw_block_progress && saw_positive_qc_activity)
+    }
 
     fn block_chain(
         validator_id: u64,
@@ -2989,6 +3081,221 @@ mod tests {
             } => assert!(!hybrid_enforcement),
             _ => panic!("expected init-localnet command"),
         }
+    }
+
+    #[test]
+    fn node_binary_candidates_fall_back_from_deps_to_debug_dir() {
+        let sim_exe = PathBuf::from("/tmp/entangrid/target/debug/deps/entangrid_sim-test");
+        let candidates = node_binary_candidate_paths(&sim_exe).unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/entangrid/target/debug/deps/entangrid-node"),
+                PathBuf::from("/tmp/entangrid/target/debug/entangrid-node"),
+            ]
+        );
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_false_for_default_localnet() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-default");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        assert!(!localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_true_when_enforcement_flag_is_set_only() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-enforcement-only");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = rewrite_first_node_config(&unique_dir, |config| {
+            config.feature_flags.require_hybrid_validator_signatures = true;
+        });
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_true_when_backend_is_hybrid_only() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-backend-only");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = rewrite_first_node_config(&unique_dir, |config| {
+            config.signing_backend = SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        });
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn hybrid_localnet_detection_returns_true_for_hybrid_localnet() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-enabled");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_localnet_launch_requires_sim_pq_support() {
+        let unique_dir = temp_localnet_dir("hybrid-launch-feature-gate");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        write_hybrid_requirement_to_first_node(&unique_dir);
+
+        let error = spawn_localnet_children(&unique_dir).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a strict hybrid localnet with real localhost sockets"]
+    async fn hybrid_enforcement_localnet_boot_smoke_test() {
+        let unique_dir = temp_localnet_dir("hybrid-boot-smoke");
+        init_localnet(
+            4,
+            &unique_dir,
+            500,
+            5,
+            250,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        let mut children = spawn_localnet_children(&unique_dir).await.unwrap();
+        let smoke_result = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                for child in children.iter_mut() {
+                    if let Some(status) = child.try_wait()? {
+                        return Err(anyhow!(
+                            "hybrid localnet smoke saw node exit early with status {status}"
+                        ));
+                    }
+                }
+
+                if hybrid_boot_smoke_ready(&manifest)? {
+                    return Ok(());
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "hybrid localnet smoke did not produce blocks plus proposal-vote/qc activity within timeout"
+                    ));
+                }
+
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        .await;
+
+        shutdown_children(&mut children).await;
+        smoke_result.unwrap();
     }
 
     #[cfg(feature = "pq-ml-dsa")]
