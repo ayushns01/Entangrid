@@ -5437,10 +5437,7 @@ mod tests {
             latency_bucket_ms: 100,
             byte_count_bucket: 8,
             sequence_number: 7,
-            signature: TypedSignature {
-                scheme: SignatureScheme::DevDeterministic,
-                bytes: vec![1, 2, 3],
-            },
+            signature: TypedSignature::single(SignatureScheme::DevDeterministic, vec![1, 2, 3]),
         }
     }
 
@@ -5812,10 +5809,10 @@ mod tests {
         let genesis = sample_genesis();
         let block = first_valid_block(&genesis);
         assert_eq!(
-            block.signature.scheme,
+            block.signature.scheme(),
             entangrid_types::SignatureScheme::DevDeterministic
         );
-        assert!(!block.signature.bytes.is_empty());
+        assert!(block.signature.as_single_bytes().is_some());
     }
 
     #[test]
@@ -5825,10 +5822,10 @@ mod tests {
         let block = first_valid_block(&genesis);
         let vote = signed_proposal_vote(&crypto, 2, &block);
         assert_eq!(
-            vote.signature.scheme,
+            vote.signature.scheme(),
             entangrid_types::SignatureScheme::DevDeterministic
         );
-        assert!(!vote.signature.bytes.is_empty());
+        assert!(vote.signature.as_single_bytes().is_some());
     }
 
     #[cfg(feature = "pq-ml-dsa")]
@@ -5857,10 +5854,10 @@ mod tests {
         fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
 
         let mut genesis = sample_genesis();
-        genesis.validators[0].public_identity = PublicIdentity {
-            scheme: entangrid_types::PublicKeyScheme::MlDsa,
-            bytes: verifying_key.encode().as_slice().to_vec(),
-        };
+        genesis.validators[0].public_identity = PublicIdentity::single(
+            entangrid_types::PublicKeyScheme::MlDsa,
+            verifying_key.encode().as_slice().to_vec(),
+        );
 
         let mut config =
             sample_node_config(1, reserve_local_address(), Vec::new(), "ml-dsa-runner");
@@ -5870,7 +5867,7 @@ mod tests {
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let block = first_valid_block_with_crypto(&genesis, runner.crypto.as_ref());
         assert_eq!(
-            block.signature.scheme,
+            block.signature.scheme(),
             entangrid_types::SignatureScheme::MlDsa
         );
         assert_eq!(
@@ -5880,7 +5877,7 @@ mod tests {
 
         let vote = signed_proposal_vote(runner.crypto.as_ref(), 1, &block);
         assert_eq!(
-            vote.signature.scheme,
+            vote.signature.scheme(),
             entangrid_types::SignatureScheme::MlDsa
         );
         assert!(!runner.import_proposal_vote(vote).unwrap());
@@ -5890,8 +5887,102 @@ mod tests {
             .and_then(|by_validator| by_validator.get(&1))
             .expect("runner should retain the ML-DSA local vote");
         assert_eq!(
-            stored_vote.signature.scheme,
+            stored_vote.signature.scheme(),
             entangrid_types::SignatureScheme::MlDsa
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_block_and_proposal_vote_validate_with_test_runner() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path =
+            std::env::temp_dir().join(format!("entangrid-node-hybrid-{}.json", std::process::id()));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut genesis = sample_genesis();
+        genesis.validators[0].public_identity = PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{}", 1).into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: verifying_key.encode().as_slice().to_vec(),
+            },
+        ])
+        .unwrap();
+
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "hybrid-runner");
+        config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        config.signing_key_path = Some(key_path.display().to_string());
+
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block_with_crypto(&genesis, runner.crypto.as_ref());
+        assert_eq!(
+            block.signature.scheme(),
+            entangrid_types::SignatureScheme::Hybrid
+        );
+        assert!(
+            block
+                .signature
+                .component_bytes(entangrid_types::SignatureScheme::DevDeterministic)
+                .is_some()
+        );
+        assert!(
+            block
+                .signature
+                .component_bytes(entangrid_types::SignatureScheme::MlDsa)
+                .is_some()
+        );
+        assert_eq!(
+            runner.accept_block(block.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+
+        let vote = signed_proposal_vote(runner.crypto.as_ref(), 1, &block);
+        assert_eq!(
+            vote.signature.scheme(),
+            entangrid_types::SignatureScheme::Hybrid
+        );
+        assert!(
+            vote.signature
+                .component_bytes(entangrid_types::SignatureScheme::DevDeterministic)
+                .is_some()
+        );
+        assert!(
+            vote.signature
+                .component_bytes(entangrid_types::SignatureScheme::MlDsa)
+                .is_some()
+        );
+        assert!(!runner.import_proposal_vote(vote).unwrap());
+        let stored_vote = runner
+            .proposal_votes
+            .get(&block.block_hash)
+            .and_then(|by_validator| by_validator.get(&1))
+            .expect("runner should retain the hybrid local vote");
+        assert_eq!(
+            stored_vote.signature.scheme(),
+            entangrid_types::SignatureScheme::Hybrid
         );
     }
 
@@ -7192,10 +7283,7 @@ mod tests {
         );
 
         let mut vote = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
-        vote.signature = TypedSignature {
-            scheme: SignatureScheme::DevDeterministic,
-            bytes: vec![7, 7, 7],
-        };
+        vote.signature = TypedSignature::single(SignatureScheme::DevDeterministic, vec![7, 7, 7]);
 
         let error = runner.import_proposal_vote(vote).unwrap_err();
 
@@ -13458,10 +13546,8 @@ mod tests {
         let mut runner = build_test_runner(1, config, genesis).await;
         let mut attestation =
             signed_service_attestation(runner.crypto.as_ref(), 1, 2, 1, ServiceCounters::default());
-        attestation.signature = TypedSignature {
-            scheme: SignatureScheme::DevDeterministic,
-            bytes: vec![9, 9, 9],
-        };
+        attestation.signature =
+            TypedSignature::single(SignatureScheme::DevDeterministic, vec![9, 9, 9]);
 
         let error = runner.import_service_attestation(attestation).unwrap_err();
 
@@ -13621,10 +13707,7 @@ mod tests {
     fn receipt_event_hash_ignores_non_identity_fields() {
         let mut first = sample_receipt();
         let mut second = sample_receipt();
-        second.signature = TypedSignature {
-            scheme: SignatureScheme::DevDeterministic,
-            bytes: vec![9, 9, 9],
-        };
+        second.signature = TypedSignature::single(SignatureScheme::DevDeterministic, vec![9, 9, 9]);
         second.transcript_digest = [9u8; 32];
         second.latency_bucket_ms = 900;
         second.byte_count_bucket = 42;
@@ -13676,10 +13759,8 @@ mod tests {
         receipt.source_validator_id = 1;
         receipt.destination_validator_id = 2;
         receipt.witness_validator_id = 2;
-        receipt.signature = TypedSignature {
-            scheme: SignatureScheme::DevDeterministic,
-            bytes: vec![9, 9, 9],
-        };
+        receipt.signature =
+            TypedSignature::single(SignatureScheme::DevDeterministic, vec![9, 9, 9]);
         let chain = ChainSnapshot {
             snapshot: LedgerState::from_genesis(&genesis).snapshot().clone(),
             blocks: Vec::new(),

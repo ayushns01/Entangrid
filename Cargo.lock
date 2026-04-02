@@ -271,6 +271,7 @@ name = "entangrid-crypto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "blake3",
  "entangrid-types",
  "ml-dsa",

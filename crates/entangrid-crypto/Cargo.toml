@@ -10,6 +10,7 @@ pq-ml-dsa = ["dep:ml-dsa"]
 
 [dependencies]
 anyhow.workspace = true
+bincode.workspace = true
 blake3.workspace = true
 entangrid-types = { path = "../entangrid-types" }
 ml-dsa = { version = "0.0.4", optional = true }

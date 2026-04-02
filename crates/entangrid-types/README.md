@@ -150,6 +150,7 @@ One recent example of the type layer evolving with the active PQ branch is signi
 - validator config now carries `PublicIdentity` instead of an untyped byte blob
 - node config now carries `SigningBackendKind` so signer selection is local configuration, not a consensus feature flag
 - verification code can now dispatch by explicit signature scheme
+- typed signatures and identities now support first-class hybrid bundles while preserving the legacy single-form encoding
 
 ## Where we want to take it
 
@@ -162,5 +163,6 @@ Future direction:
 - support stronger proof and commitment structures
 - introduce versioning and upgrade-friendly wire/state formats
 - extend the typed identity and signature model into full PQ and hybrid production formats
+- decide when hybrid signatures become mandatory instead of permissive
 
 In short: this crate should become the clean, stable data model that the rest of the blockchain can rely on for a long time.

@@ -111,7 +111,9 @@ Important:
   - typed signatures and typed public identities are in
   - node-local signing backend selection is in
   - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
-  - session/KEM upgrades and hybrid enforcement still come later
+  - first-class hybrid signature and identity containers are now in for transactions, blocks, and proposal votes
+  - permissive hybrid verification is in, while mandatory hybrid enforcement still comes later
+  - session/KEM upgrades still come later
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back

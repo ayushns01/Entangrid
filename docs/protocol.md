@@ -233,7 +233,9 @@ Current PQ Stage 1 direction:
 - this stage keeps consensus behavior unchanged while making the wire and state model crypto-agile
 - validator public identity stays in genesis while node-local signer choice and key loading now live in node config
 - the first experimental PQ signing path is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
-- hybrid policy enforcement comes later; the current slice only makes scheme-aware signing/authentication possible
+- hybrid signature and identity bundles now exist for the core signed objects
+- verification is permissive during rollout, so matching deterministic-only, ML-DSA-only, and hybrid signatures can all validate
+- hybrid policy enforcement still comes later; the current slice only makes hybrid-capable signing/authentication possible
 
 ## Slashing And Rewards
 

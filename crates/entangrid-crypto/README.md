@@ -62,6 +62,8 @@ The current PQ branch now also supports:
 - optional ML-DSA signing key loading through `NodeConfig.signing_key_path`
 - validator identity checks at startup so a node cannot silently sign as a mismatched public identity
 - scheme-aware verification for both deterministic and ML-DSA signatures
+- hybrid deterministic + ML-DSA signing through `HybridDeterministicMlDsaExperimental`
+- permissive verification against hybrid identities so single-scheme and hybrid signatures can coexist during rollout
 
 ## How to measure ML-DSA signing right now
 

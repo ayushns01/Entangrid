@@ -13,6 +13,11 @@ use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_crypto::{
     build_crypto_backend, deterministic_public_identity, measure_signing_backend,
 };
+#[cfg(feature = "pq-ml-dsa")]
+use entangrid_types::{
+    Block, BlockHeader, ProposalVote, PublicIdentity, PublicKeyScheme, TopologyCommitment,
+    TypedSignature, ValidatorId,
+};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
     PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
@@ -22,11 +27,6 @@ use entangrid_types::{
     default_service_penalty_weight, default_service_score_weights,
     default_service_score_window_epochs, default_service_uptime_weight, empty_hash,
     now_unix_millis, validator_account,
-};
-#[cfg(feature = "pq-ml-dsa")]
-use entangrid_types::{
-    Block, BlockHeader, ProposalVote, PublicIdentity, PublicKeyScheme, TopologyCommitment,
-    TypedSignature, ValidatorId,
 };
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{KeyGen, MlDsa65};
@@ -294,10 +294,10 @@ pub fn init_localnet(
             stake: 100,
             address: address.clone(),
             dev_secret: format!("entangrid-dev-secret-{validator_id}"),
-            public_identity: entangrid_types::PublicIdentity {
-                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
-                bytes: format!("validator-{validator_id}").into_bytes(),
-            },
+            public_identity: entangrid_types::PublicIdentity::single(
+                entangrid_types::PublicKeyScheme::DevDeterministic,
+                format!("validator-{validator_id}").into_bytes(),
+            ),
         });
         initial_balances.insert(validator_account(validator_id), 1_000_000);
     }
@@ -1992,9 +1992,15 @@ impl PqMeasurementReport {
         lines.push(String::new());
         lines.push("## Measurement Notes".to_string());
         lines.push(String::new());
-        lines.push("- Public identity and signature sizes come from the real configured signing backends.".to_string());
+        lines.push(
+            "- Public identity and signature sizes come from the real configured signing backends."
+                .to_string(),
+        );
         lines.push("- Block and proposal-vote message sizes are proxy serialized sizes, not a full live-network benchmark.".to_string());
-        lines.push("- Median timings are local-machine measurements and should be treated as indicative.".to_string());
+        lines.push(
+            "- Median timings are local-machine measurements and should be treated as indicative."
+                .to_string(),
+        );
         lines.join("\n")
     }
 }
@@ -2173,13 +2179,11 @@ fn signed_block_size(
     let crypto = build_crypto_backend(genesis, config)?;
     let block_hash = sample_block_signing_hash();
     let signature = crypto.sign(validator_id, &block_hash)?;
-    Ok(
-        bincode::serde::encode_to_vec(
-            sample_block(empty_hash(), signature),
-            bincode::config::standard(),
-        )?
-        .len(),
-    )
+    Ok(bincode::serde::encode_to_vec(
+        sample_block(empty_hash(), signature),
+        bincode::config::standard(),
+    )?
+    .len())
 }
 
 #[cfg(feature = "pq-ml-dsa")]
@@ -2633,10 +2637,10 @@ mod tests {
                 transactions: Vec::new(),
                 commitment: None,
                 commitment_receipts: Vec::new(),
-                signature: entangrid_types::TypedSignature {
-                    scheme: entangrid_types::SignatureScheme::DevDeterministic,
-                    bytes: vec![validator_id as u8],
-                },
+                signature: entangrid_types::TypedSignature::single(
+                    entangrid_types::SignatureScheme::DevDeterministic,
+                    vec![validator_id as u8],
+                ),
                 block_hash,
             });
             parent_hash = block_hash;
