@@ -153,6 +153,7 @@ One recent example of the type layer evolving with the active PQ branch is signi
 - verification code can now dispatch by explicit signature scheme
 - typed signatures and identities now support first-class hybrid bundles while preserving the legacy single-form encoding
 - `FeatureFlags.require_hybrid_validator_signatures` now lets a network opt into hybrid validator identity enforcement at startup plus hybrid block/proposal-vote enforcement at runtime
+- Stage 1F uses these same fields to bootstrap a strict hybrid localnet: the simulator writes hybrid validator identities into genesis, sets `signing_backend = HybridDeterministicMlDsaExperimental` per node, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 
 ## Where we want to take it
 

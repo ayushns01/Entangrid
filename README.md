@@ -113,7 +113,9 @@ Important:
   - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
   - first-class hybrid signature and identity containers are now in for transactions, blocks, and proposal votes
   - permissive hybrid verification is in
-  - an opt-in `require_hybrid_validator_signatures` mode now enforces hybrid validator identities at startup plus hybrid signatures for blocks and proposal votes
+  - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
+  - that mode writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+  - `--hybrid-enforcement` is an operational/bootstrap slice, not a full hybrid performance matrix
   - transactions, receipts, service evidence, and session/KEM enforcement still come later
   - session/KEM upgrades still come later
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
@@ -199,6 +201,23 @@ cargo run -p entangrid-sim -- init-localnet --validators 4 --base-dir var/localn
 
 That default localnet still starts in the baseline path.
 To run the active V2 line on `main`, pass `--consensus-v2` when you initialize the network.
+
+To boot the strict hybrid Stage 1F slice, use:
+
+```bash
+cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet \
+  --validators 4 \
+  --hybrid-enforcement \
+  --base-dir var/pq-hybrid-smoke
+```
+
+This mode requires a `pq-ml-dsa` build, writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`. It is meant as a bootstrap/operational smoke path, not as the full hybrid performance matrix.
+
+To start that hybrid localnet, use the same feature-enabled simulator and the matching base directory:
+
+```bash
+cargo run -p entangrid-sim --features pq-ml-dsa -- up --base-dir var/pq-hybrid-smoke
+```
 
 Start the localnet:
 
