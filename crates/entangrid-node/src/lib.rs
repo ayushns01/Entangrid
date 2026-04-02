@@ -1917,6 +1917,7 @@ impl NodeRunner {
             return Err(anyhow!("proposal votes require consensus_v2"));
         }
         self.validate_proposal_vote_signature_and_signer(&vote)?;
+        self.validate_hybrid_proposal_vote_policy(&vote)?;
         let Some(block) = self.known_block(vote.block_hash).cloned() else {
             return self.store_buffered_proposal_vote(vote);
         };
@@ -1949,6 +1950,19 @@ impl NodeRunner {
             }
         }
         Ok(inserted)
+    }
+
+    fn validate_hybrid_proposal_vote_policy(&self, vote: &ProposalVote) -> Result<()> {
+        if !self.config.feature_flags.require_hybrid_validator_signatures {
+            return Ok(());
+        }
+        if vote.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires proposal vote from validator {} to use a hybrid signature",
+                vote.validator_id
+            ));
+        }
+        Ok(())
     }
 
     fn import_quorum_certificate(&mut self, qc: QuorumCertificate) -> Result<bool> {
@@ -6024,6 +6038,44 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_proposal_vote_signature() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "vote-reject");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+        let vote = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
+
+        let error = runner.import_proposal_vote(vote).unwrap_err();
+        assert!(
+            error.to_string().contains("validator 2"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.proposal_votes.is_empty());
+        assert!(runner.buffered_proposal_votes.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_non_hybrid_proposal_vote_signature_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "vote-permissive");
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+        let vote = signed_proposal_vote(runner.crypto.as_ref(), 2, &block);
+
+        assert!(runner.import_proposal_vote(vote.clone()).unwrap());
+        assert!(
+            runner
+                .buffered_proposal_votes
+                .get(&vote.block_hash)
+                .and_then(|by_validator| by_validator.get(&2))
+                .is_some()
+        );
+    }
+
     #[cfg(feature = "pq-ml-dsa")]
     #[tokio::test(flavor = "current_thread")]
     async fn ml_dsa_block_and_proposal_vote_validate_with_test_runner() {
@@ -6090,7 +6142,7 @@ mod tests {
 
     #[cfg(feature = "pq-ml-dsa")]
     #[tokio::test(flavor = "current_thread")]
-    async fn hybrid_enforcement_accepts_hybrid_block_signature() {
+    async fn hybrid_enforcement_accepts_hybrid_proposal_vote_signature() {
         use ml_dsa::{KeyGen, MlDsa65};
         use rand_core::OsRng;
         use serde::Serialize;
@@ -6136,24 +6188,34 @@ mod tests {
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let block = first_valid_block_with_crypto(&genesis, runner.crypto.as_ref());
         assert_eq!(
-            block.signature.scheme(),
+            runner.accept_block(block.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+
+        let vote = runner.build_local_proposal_vote(&block).unwrap();
+        assert_eq!(
+            vote.signature.scheme(),
             entangrid_types::SignatureScheme::Hybrid
         );
         assert!(
-            block
-                .signature
+            vote.signature
                 .component_bytes(entangrid_types::SignatureScheme::DevDeterministic)
                 .is_some()
         );
         assert!(
-            block
-                .signature
+            vote.signature
                 .component_bytes(entangrid_types::SignatureScheme::MlDsa)
                 .is_some()
         );
+        assert!(!runner.import_proposal_vote(vote).unwrap());
+        let stored_vote = runner
+            .proposal_votes
+            .get(&block.block_hash)
+            .and_then(|by_validator| by_validator.get(&1))
+            .expect("runner should retain the hybrid local vote");
         assert_eq!(
-            runner.accept_block(block.clone(), true).await.unwrap(),
-            BlockAcceptance::Accepted
+            stored_vote.signature.scheme(),
+            entangrid_types::SignatureScheme::Hybrid
         );
     }
 
