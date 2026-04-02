@@ -1687,6 +1687,7 @@ impl NodeRunner {
                 self.service_gating_threshold(),
             )
             .map_err(|error| anyhow!(error))?;
+        self.validate_hybrid_block_policy(&block)?;
 
         let mut next_ledger = self.ledger.clone();
         next_ledger.apply_block(&block, self.crypto.as_ref())?;
@@ -1763,6 +1764,19 @@ impl NodeRunner {
         }
         self.persist_metrics()?;
         Ok(BlockAcceptance::Accepted)
+    }
+
+    fn validate_hybrid_block_policy(&self, block: &Block) -> Result<()> {
+        if !self.config.feature_flags.require_hybrid_validator_signatures {
+            return Ok(());
+        }
+        if block.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires block proposer {} to sign with a hybrid signature",
+                block.header.proposer_id
+            ));
+        }
+        Ok(())
     }
 
     fn maybe_broadcast_vote_for_competing_block(&mut self, block: &Block) -> Result<()> {
@@ -5921,6 +5935,36 @@ mod tests {
         assert!(vote.signature.as_single_bytes().is_some());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_block_signature() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "block-reject");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+
+        let error = runner.accept_block(block, true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("block proposer 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_non_hybrid_block_signature_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "block-permissive");
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let block = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner.accept_block(block, true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+    }
+
     #[cfg(feature = "pq-ml-dsa")]
     #[tokio::test(flavor = "current_thread")]
     async fn ml_dsa_block_and_proposal_vote_validate_with_test_runner() {
@@ -5987,7 +6031,7 @@ mod tests {
 
     #[cfg(feature = "pq-ml-dsa")]
     #[tokio::test(flavor = "current_thread")]
-    async fn hybrid_block_and_proposal_vote_validate_with_test_runner() {
+    async fn hybrid_enforcement_accepts_hybrid_block_signature() {
         use ml_dsa::{KeyGen, MlDsa65};
         use rand_core::OsRng;
         use serde::Serialize;
@@ -6028,6 +6072,7 @@ mod tests {
         config.signing_backend =
             entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
         config.signing_key_path = Some(key_path.display().to_string());
+        config.feature_flags.require_hybrid_validator_signatures = true;
 
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let block = first_valid_block_with_crypto(&genesis, runner.crypto.as_ref());
