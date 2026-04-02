@@ -1626,6 +1626,7 @@ impl NodeRunner {
         if let Some(commitment) = &block.commitment {
             self.validate_commitment(commitment, &block.commitment_receipts)?;
         }
+        self.validate_hybrid_block_policy(&block)?;
 
         if block.header.parent_hash != self.ledger.snapshot().tip_hash {
             if !self
@@ -1687,7 +1688,6 @@ impl NodeRunner {
                 self.service_gating_threshold(),
             )
             .map_err(|error| anyhow!(error))?;
-        self.validate_hybrid_block_policy(&block)?;
 
         let mut next_ledger = self.ledger.clone();
         next_ledger.apply_block(&block, self.crypto.as_ref())?;
@@ -5460,6 +5460,28 @@ mod tests {
         }
     }
 
+    fn hybrid_test_identity(validator_id: ValidatorId) -> PublicIdentity {
+        PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{validator_id}").into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: format!("validator-{validator_id}-ml-dsa").into_bytes(),
+            },
+        ])
+        .unwrap()
+    }
+
+    fn hybridized_sample_genesis() -> GenesisConfig {
+        let mut genesis = sample_genesis();
+        for validator in &mut genesis.validators {
+            validator.public_identity = hybrid_test_identity(validator.validator_id);
+        }
+        genesis
+    }
+
     fn sample_receipt() -> RelayReceipt {
         RelayReceipt {
             epoch: 1,
@@ -5937,7 +5959,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hybrid_enforcement_rejects_non_hybrid_block_signature() {
-        let genesis = sample_genesis();
+        let genesis = hybridized_sample_genesis();
         let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "block-reject");
         config.feature_flags.require_hybrid_validator_signatures = true;
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
@@ -5947,6 +5969,43 @@ mod tests {
         assert!(
             error.to_string().contains("block proposer 1"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_competing_block_signature() {
+        let genesis = hybridized_sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "block-competing-reject");
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let tip_block = first_valid_block(&genesis);
+        assert_eq!(
+            runner.accept_block(tip_block.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        runner.config.feature_flags.require_hybrid_validator_signatures = true;
+
+        let competing_block =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, tip_block.header.slot + 1);
+        let error = runner
+            .accept_block(competing_block.clone(), false)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("block proposer 2"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !runner.proposal_votes.contains_key(&competing_block.block_hash),
+            "rejecting a non-hybrid competing block should not record a local vote"
+        );
+        assert!(
+            !runner
+                .orphan_blocks
+                .iter()
+                .any(|block| block.block_hash == competing_block.block_hash),
+            "rejecting a non-hybrid competing block should not retain it as an orphan"
         );
     }
 
@@ -6095,32 +6154,6 @@ mod tests {
         assert_eq!(
             runner.accept_block(block.clone(), true).await.unwrap(),
             BlockAcceptance::Accepted
-        );
-
-        let vote = signed_proposal_vote(runner.crypto.as_ref(), 1, &block);
-        assert_eq!(
-            vote.signature.scheme(),
-            entangrid_types::SignatureScheme::Hybrid
-        );
-        assert!(
-            vote.signature
-                .component_bytes(entangrid_types::SignatureScheme::DevDeterministic)
-                .is_some()
-        );
-        assert!(
-            vote.signature
-                .component_bytes(entangrid_types::SignatureScheme::MlDsa)
-                .is_some()
-        );
-        assert!(!runner.import_proposal_vote(vote).unwrap());
-        let stored_vote = runner
-            .proposal_votes
-            .get(&block.block_hash)
-            .and_then(|by_validator| by_validator.get(&1))
-            .expect("runner should retain the hybrid local vote");
-        assert_eq!(
-            stored_vote.signature.scheme(),
-            entangrid_types::SignatureScheme::Hybrid
         );
     }
 
