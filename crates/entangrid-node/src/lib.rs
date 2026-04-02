@@ -18,9 +18,9 @@ use entangrid_types::{
     Block, BlockHeader, CertifiedBlockHeader, ChainSegment, ChainSnapshot, ChunkedSyncRequest,
     ChunkedSyncResponse, Epoch, EventLogEntry, GenesisConfig, HashBytes, HeartbeatPulse,
     MessageClass, NodeConfig, NodeMetrics, PeerConfig, ProposalVote, ProtocolMessage,
-    QuorumCertificate, RelayReceipt, ServiceAggregate, ServiceAttestation, ServiceCounters,
-    SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment, TypedSignature,
-    ValidatorId, canonical_hash, empty_hash, now_unix_millis,
+    PublicKeyScheme, QuorumCertificate, RelayReceipt, ServiceAggregate, ServiceAttestation,
+    ServiceCounters, SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment,
+    TypedSignature, ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
@@ -78,6 +78,7 @@ pub async fn run_node_from_path(config_path: &Path) -> Result<()> {
 }
 
 pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> {
+    validate_hybrid_enforcement_genesis(&config, &genesis)?;
     let crypto = build_crypto_backend(&genesis, &config)?;
     let consensus = ConsensusEngine::new(genesis.clone());
     let storage = Storage::new(&config)?;
@@ -166,6 +167,25 @@ pub async fn run_node(config: NodeConfig, genesis: GenesisConfig) -> Result<()> 
     runner.restore_service_evidence(loaded_service_attestations, loaded_service_aggregates)?;
     runner.rebuild_seen_sets();
     runner.run().await
+}
+
+fn validate_hybrid_enforcement_genesis(
+    config: &NodeConfig,
+    genesis: &GenesisConfig,
+) -> Result<()> {
+    if !config.feature_flags.require_hybrid_validator_signatures {
+        return Ok(());
+    }
+
+    for validator in &genesis.validators {
+        if validator.public_identity.scheme() != PublicKeyScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires every validator to advertise a hybrid public identity"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 struct NodeRunner {
@@ -5722,6 +5742,60 @@ mod tests {
             peer_sync_repair_failures: BTreeMap::new(),
             peer_message_windows: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn hybrid_enforcement_rejects_mixed_validator_identities_at_startup() {
+        let mut genesis = sample_genesis();
+        genesis.validators[0].public_identity = PublicIdentity::single(
+            entangrid_types::PublicKeyScheme::DevDeterministic,
+            b"validator-1".to_vec(),
+        );
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "hybrid-startup-mixed",
+        );
+        config.feature_flags.require_hybrid_validator_signatures = true;
+
+        let error = validate_hybrid_enforcement_genesis(&config, &genesis).unwrap_err();
+        assert!(
+            error.to_string().contains("hybrid public identity"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn hybrid_enforcement_accepts_all_hybrid_validator_identities_at_startup() {
+        let mut genesis = sample_genesis();
+        genesis.validators = genesis
+            .validators
+            .into_iter()
+            .map(|validator| ValidatorConfig {
+                public_identity: PublicIdentity::try_hybrid(vec![
+                    entangrid_types::PublicIdentityComponent {
+                        scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                        bytes: format!("validator-{}", validator.validator_id).into_bytes(),
+                    },
+                    entangrid_types::PublicIdentityComponent {
+                        scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                        bytes: format!("validator-{}-ml-dsa", validator.validator_id).into_bytes(),
+                    },
+                ])
+                .unwrap(),
+                ..validator
+            })
+            .collect();
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "hybrid-startup-all-hybrid",
+        );
+        config.feature_flags.require_hybrid_validator_signatures = true;
+
+        validate_hybrid_enforcement_genesis(&config, &genesis).unwrap();
     }
 
     fn signed_service_attestation(
