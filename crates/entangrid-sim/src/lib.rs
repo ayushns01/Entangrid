@@ -22,8 +22,7 @@ use entangrid_types::{
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
     PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
-    SessionBackendKind, SessionPublicIdentity, SigningBackendKind, Transaction, ValidatorConfig,
-    canonical_hash,
+    SessionBackendKind, SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
     default_service_delivery_weight, default_service_diversity_weight,
     default_service_gating_start_epoch, default_service_gating_threshold,
     default_service_penalty_weight, default_service_score_weights,
@@ -327,7 +326,7 @@ pub fn init_localnet(
                     address: address.clone(),
                     dev_secret: format!("entangrid-dev-secret-{validator_id}"),
                     public_identity: deterministic_public_identity(validator_id),
-                    session_public_identity: SessionPublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 signing_backend: SigningBackendKind::DevDeterministic,
                 signing_key_path: None,
@@ -343,7 +342,7 @@ pub fn init_localnet(
                     address: address.clone(),
                     dev_secret: format!("entangrid-dev-secret-{validator_id}"),
                     public_identity: deterministic_public_identity(validator_id),
-                    session_public_identity: SessionPublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 signing_backend: SigningBackendKind::DevDeterministic,
                 signing_key_path: None,
@@ -472,7 +471,7 @@ fn generate_hybrid_validator_material(
             address: format!("127.0.0.1:{}", 4100 + (validator_id - 1)),
             dev_secret: format!("entangrid-dev-secret-{validator_id}"),
             public_identity,
-            session_public_identity: SessionPublicIdentity::default(),
+            session_public_identity: None,
         },
         SigningBackendKind::HybridDeterministicMlDsaExperimental,
         key_path.display().to_string(),
@@ -2146,7 +2145,7 @@ fn build_measurement_validators(
             } else {
                 deterministic_public_identity(validator_id)
             },
-            session_public_identity: SessionPublicIdentity::default(),
+            session_public_identity: None,
         })
         .collect()
 }
@@ -2948,7 +2947,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
                     public_identity: entangrid_types::PublicIdentity::default(),
-                    session_public_identity: SessionPublicIdentity::default(),
+                    session_public_identity: None,
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),

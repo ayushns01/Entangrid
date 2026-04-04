@@ -342,6 +342,28 @@ pub struct SessionPublicIdentityComponent {
     pub bytes: Vec<u8>,
 }
 
+fn build_session_public_identity(
+    scheme: SessionKeyScheme,
+    bytes: Vec<u8>,
+    components: Vec<SessionPublicIdentityComponent>,
+) -> Result<SessionPublicIdentity, String> {
+    match scheme {
+        SessionKeyScheme::Hybrid => SessionPublicIdentity::try_hybrid(components),
+        _ => {
+            if !components.is_empty() {
+                return Err(
+                    "non-hybrid session public identity cannot contain hybrid components".into(),
+                );
+            }
+            Ok(SessionPublicIdentity {
+                scheme,
+                bytes,
+                components: Vec::new(),
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicIdentity {
     pub scheme: PublicKeyScheme,
@@ -695,11 +717,7 @@ impl<'de> Deserialize<'de> for SessionPublicIdentity {
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
                 let components = seq.next_element()?.unwrap_or_default();
-                Ok(SessionPublicIdentity {
-                    scheme,
-                    bytes,
-                    components,
-                })
+                build_session_public_identity(scheme, bytes, components).map_err(de::Error::custom)
             }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
@@ -731,11 +749,12 @@ impl<'de> Deserialize<'de> for SessionPublicIdentity {
                         }
                     }
                 }
-                Ok(SessionPublicIdentity {
-                    scheme: scheme.ok_or_else(|| de::Error::missing_field("scheme"))?,
-                    bytes: bytes.ok_or_else(|| de::Error::missing_field("bytes"))?,
-                    components: components.unwrap_or_default(),
-                })
+                build_session_public_identity(
+                    scheme.ok_or_else(|| de::Error::missing_field("scheme"))?,
+                    bytes.ok_or_else(|| de::Error::missing_field("bytes"))?,
+                    components.unwrap_or_default(),
+                )
+                .map_err(de::Error::custom)
             }
         }
 
@@ -762,17 +781,11 @@ impl<'de> Deserialize<'de> for SessionPublicIdentity {
                         "hybrid session public identity payload contained trailing bytes",
                     ));
                 }
-                Ok(SessionPublicIdentity {
-                    scheme: SessionKeyScheme::Hybrid,
-                    bytes: Vec::new(),
-                    components,
-                })
+                build_session_public_identity(SessionKeyScheme::Hybrid, Vec::new(), components)
+                    .map_err(de::Error::custom)
             } else {
-                Ok(SessionPublicIdentity {
-                    scheme: raw.scheme,
-                    bytes: raw.bytes,
-                    components: Vec::new(),
-                })
+                build_session_public_identity(raw.scheme, raw.bytes, Vec::new())
+                    .map_err(de::Error::custom)
             }
         }
     }
@@ -780,6 +793,11 @@ impl<'de> Deserialize<'de> for SessionPublicIdentity {
 
 impl SessionPublicIdentity {
     pub fn single(scheme: SessionKeyScheme, bytes: Vec<u8>) -> Self {
+        assert_ne!(
+            scheme,
+            SessionKeyScheme::Hybrid,
+            "hybrid session public identity must use try_hybrid"
+        );
         Self {
             scheme,
             bytes,
@@ -897,7 +915,7 @@ pub struct ValidatorConfig {
     pub dev_secret: String,
     pub public_identity: PublicIdentity,
     #[serde(default)]
-    pub session_public_identity: SessionPublicIdentity,
+    pub session_public_identity: Option<SessionPublicIdentity>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1615,7 +1633,8 @@ disable_outbound = false
 
     #[test]
     fn session_public_identity_round_trips_with_single_and_hybrid_components() {
-        let single = SessionPublicIdentity::single(SessionKeyScheme::DevDeterministic, vec![1, 2, 3]);
+        let single =
+            SessionPublicIdentity::single(SessionKeyScheme::DevDeterministic, vec![1, 2, 3]);
         let single_toml = toml::to_string(&single).unwrap();
         let parsed_single: SessionPublicIdentity = toml::from_str(&single_toml).unwrap();
         assert_eq!(parsed_single, single);
@@ -1640,17 +1659,41 @@ disable_outbound = false
     }
 
     #[test]
+    fn invalid_session_public_identity_shapes_are_rejected() {
+        let empty_hybrid = r#"
+scheme = "Hybrid"
+bytes = []
+"#;
+        let error = toml::from_str::<SessionPublicIdentity>(empty_hybrid).unwrap_err();
+        assert!(error.to_string().contains("requires at least one component"));
+
+        let stray_components = r#"
+scheme = "MlKem"
+bytes = [1, 2, 3]
+
+[[components]]
+scheme = "DevDeterministic"
+bytes = [4, 5, 6]
+"#;
+        let error = toml::from_str::<SessionPublicIdentity>(stray_components).unwrap_err();
+        assert!(error.to_string().contains("non-hybrid"));
+    }
+
+    #[test]
     fn validator_config_carries_separate_session_public_identity() {
         let validator = ValidatorConfig {
             validator_id: 42,
             stake: 7,
             address: "127.0.0.1:4042".into(),
             dev_secret: "secret-42".into(),
-            public_identity: PublicIdentity::single(PublicKeyScheme::DevDeterministic, vec![1, 1, 1]),
-            session_public_identity: SessionPublicIdentity::single(
+            public_identity: PublicIdentity::single(
+                PublicKeyScheme::DevDeterministic,
+                vec![1, 1, 1],
+            ),
+            session_public_identity: Some(SessionPublicIdentity::single(
                 SessionKeyScheme::MlKem,
                 vec![2, 2, 2],
-            ),
+            )),
         };
         let serialized = toml::to_string(&validator).unwrap();
         let parsed: ValidatorConfig = toml::from_str(&serialized).unwrap();
@@ -1659,7 +1702,31 @@ disable_outbound = false
             parsed.session_public_identity,
             validator.session_public_identity
         );
-        assert_ne!(parsed.public_identity.bytes, parsed.session_public_identity.bytes);
+        assert_ne!(
+            parsed.public_identity.bytes,
+            parsed
+                .session_public_identity
+                .as_ref()
+                .unwrap()
+                .as_single_bytes()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn validator_config_defaults_to_no_session_public_identity_when_omitted() {
+        let validator = r#"
+validator_id = 42
+stake = 7
+address = "127.0.0.1:4042"
+dev_secret = "secret-42"
+
+[public_identity]
+scheme = "DevDeterministic"
+bytes = [1, 1, 1]
+"#;
+        let parsed: ValidatorConfig = toml::from_str(validator).unwrap();
+        assert_eq!(parsed.session_public_identity, None);
     }
 
     #[test]

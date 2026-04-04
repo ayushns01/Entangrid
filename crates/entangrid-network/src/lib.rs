@@ -500,7 +500,7 @@ mod tests {
                 address: "127.0.0.1:4100".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             },
             ValidatorConfig {
                 validator_id: 2,
@@ -508,7 +508,7 @@ mod tests {
                 address: "127.0.0.1:4101".into(),
                 dev_secret: "secret-2".into(),
                 public_identity: PublicIdentity::default(),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             },
         ]
     }

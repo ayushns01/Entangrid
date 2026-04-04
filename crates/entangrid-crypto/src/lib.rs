@@ -9,7 +9,7 @@ use entangrid_types::{
     SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
 };
 #[cfg(test)]
-use entangrid_types::{SessionBackendKind, SessionPublicIdentity};
+use entangrid_types::SessionBackendKind;
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{
     EncodedSigningKey, EncodedVerifyingKey, MlDsa65, Signature as MlDsaSignature,
@@ -744,7 +744,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -770,7 +770,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -800,7 +800,7 @@ mod tests {
                     PublicKeyScheme::DevDeterministic,
                     b"validator-1".to_vec(),
                 ),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -844,7 +844,7 @@ mod tests {
                     PublicKeyScheme::DevDeterministic,
                     b"wrong-validator".to_vec(),
                 ),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -892,7 +892,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: deterministic_public_identity(1),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -949,7 +949,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::single(PublicKeyScheme::MlDsa, vec![7, 7, 7]),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -1015,7 +1015,7 @@ mod tests {
                     PublicKeyScheme::MlDsa,
                     verifying_key.encode().as_slice().to_vec(),
                 ),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -1079,7 +1079,7 @@ mod tests {
                     PublicKeyScheme::MlDsa,
                     verifying_key.encode().as_slice().to_vec(),
                 ),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -1137,7 +1137,7 @@ mod tests {
                     },
                 ])
                 .unwrap(),
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
@@ -1214,7 +1214,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity,
-                session_public_identity: SessionPublicIdentity::default(),
+                session_public_identity: None,
             }],
             initial_balances: Default::default(),
         };
