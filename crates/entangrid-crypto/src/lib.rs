@@ -2,21 +2,21 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow};
 use bincode::config::standard;
+#[cfg(feature = "pq-ml-kem")]
+use entangrid_types::SessionKeyScheme;
 #[cfg(feature = "pq-ml-dsa")]
 use entangrid_types::SignatureComponent;
 use entangrid_types::{
-    GenesisConfig, HashBytes, NodeConfig, PublicIdentity, PublicKeyScheme, SignatureScheme,
-    SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
+    GenesisConfig, HashBytes, NodeConfig, PublicIdentity, PublicKeyScheme, SessionBackendKind,
+    SignatureScheme, SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
 };
-#[cfg(test)]
-use entangrid_types::SessionBackendKind;
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{
     EncodedSigningKey, EncodedVerifyingKey, MlDsa65, Signature as MlDsaSignature,
     SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
     signature::{Signer as _, Verifier as _},
 };
-#[cfg(feature = "pq-ml-dsa")]
+#[cfg(any(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,6 +220,13 @@ struct MlDsa65KeyFile {
     verifying_key: Vec<u8>,
 }
 
+#[cfg(feature = "pq-ml-kem")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MlKemSessionKeyFile {
+    decapsulation_key: Vec<u8>,
+    encapsulation_key: Vec<u8>,
+}
+
 #[derive(Clone)]
 enum LocalSigningBackend {
     Deterministic,
@@ -334,6 +341,83 @@ fn build_ml_dsa_verifying_key_map(
     Ok(Arc::new(verifying_keys))
 }
 
+#[cfg(feature = "pq-ml-kem")]
+fn validate_ml_kem_session_material(
+    validator: &ValidatorConfig,
+    config: &NodeConfig,
+) -> Result<()> {
+    let key_path = config
+        .session_key_path
+        .as_ref()
+        .ok_or_else(|| anyhow!("hybrid session backend requires session_key_path"))?;
+    let session_identity = validator.session_public_identity.as_ref().ok_or_else(|| {
+        anyhow!(
+            "validator {} missing session public identity",
+            validator.validator_id
+        )
+    })?;
+    let key_bytes = std::fs::read(key_path).map_err(|error| {
+        anyhow!("failed to read ML-KEM session key file at {key_path}: {error}")
+    })?;
+    let key_file: MlKemSessionKeyFile = serde_json::from_slice(&key_bytes).map_err(|error| {
+        anyhow!("failed to parse ML-KEM session key file at {key_path}: {error}")
+    })?;
+    if key_file.decapsulation_key.is_empty() || key_file.encapsulation_key.is_empty() {
+        return Err(anyhow!(
+            "ML-KEM session key file at {key_path} is missing key material"
+        ));
+    }
+    let expected_public_key = match session_identity.scheme() {
+        SessionKeyScheme::MlKem => session_identity.as_single_bytes().ok_or_else(|| {
+            anyhow!(
+                "validator {} session public identity missing ML-KEM bytes",
+                validator.validator_id
+            )
+        })?,
+        SessionKeyScheme::Hybrid => session_identity
+            .component_bytes(SessionKeyScheme::MlKem)
+            .ok_or_else(|| {
+                anyhow!(
+                    "validator {} session public identity missing ML-KEM component",
+                    validator.validator_id
+                )
+            })?,
+        SessionKeyScheme::DevDeterministic => {
+            return Err(anyhow!(
+                "validator {} session public identity does not carry ML-KEM material",
+                validator.validator_id
+            ));
+        }
+    };
+    if expected_public_key != key_file.encapsulation_key.as_slice() {
+        return Err(anyhow!(
+            "validator {} session public identity does not match configured ML-KEM session key",
+            validator.validator_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_session_backend_config(validator: &ValidatorConfig, config: &NodeConfig) -> Result<()> {
+    #[cfg(not(feature = "pq-ml-kem"))]
+    let _ = validator;
+    match config.session_backend {
+        SessionBackendKind::DevDeterministic => Ok(()),
+        SessionBackendKind::HybridDeterministicMlKemExperimental => {
+            #[cfg(feature = "pq-ml-kem")]
+            {
+                validate_ml_kem_session_material(validator, config)
+            }
+            #[cfg(not(feature = "pq-ml-kem"))]
+            {
+                Err(anyhow!(
+                    "hybrid ML-KEM session backend requested but entangrid-crypto was built without pq-ml-kem"
+                ))
+            }
+        }
+    }
+}
+
 pub fn build_crypto_backend(
     genesis: &GenesisConfig,
     config: &NodeConfig,
@@ -341,6 +425,7 @@ pub fn build_crypto_backend(
     let validator = validator_config(genesis, config.validator_id)?;
     let deterministic = DeterministicCryptoBackend::from_genesis(genesis);
     let identities = build_identity_map(genesis);
+    validate_session_backend_config(validator, config)?;
     match config.signing_backend {
         SigningBackendKind::DevDeterministic => {
             validate_deterministic_identity(validator)?;
@@ -722,8 +807,9 @@ mod tests {
     use entangrid_types::SignatureComponent;
     use entangrid_types::{
         FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PublicIdentity,
-        PublicIdentityComponent, PublicKeyScheme, SignatureScheme, SigningBackendKind,
-        TypedSignature, ValidatorConfig, empty_hash,
+        PublicIdentityComponent, PublicKeyScheme, SessionKeyScheme, SessionPublicIdentity,
+        SessionPublicIdentityComponent, SignatureScheme, SigningBackendKind, TypedSignature,
+        ValidatorConfig, empty_hash,
     };
 
     use super::*;
@@ -823,6 +909,49 @@ mod tests {
         let backend = build_crypto_backend(&genesis, &config).unwrap();
         let signature = backend.sign(1, b"factory").unwrap();
         assert_eq!(signature.scheme(), SignatureScheme::DevDeterministic);
+    }
+
+    #[test]
+    fn deterministic_session_backend_accepts_default_config() {
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:3001".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: PublicIdentity::single(
+                    PublicKeyScheme::DevDeterministic,
+                    b"validator-1".to_vec(),
+                ),
+                session_public_identity: None,
+            }],
+            initial_balances: Default::default(),
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
+        };
+
+        build_crypto_backend(&genesis, &config).unwrap();
     }
 
     #[test]
@@ -930,6 +1059,67 @@ mod tests {
         assert!(markdown.contains("Public identity size"));
         assert!(markdown.contains("Median sign latency"));
         assert!(markdown.contains("Median verify latency"));
+    }
+
+    fn hybrid_session_public_identity(encapsulation_key: Vec<u8>) -> SessionPublicIdentity {
+        SessionPublicIdentity::try_hybrid(vec![
+            SessionPublicIdentityComponent {
+                scheme: SessionKeyScheme::DevDeterministic,
+                bytes: b"session-validator-1".to_vec(),
+            },
+            SessionPublicIdentityComponent {
+                scheme: SessionKeyScheme::MlKem,
+                bytes: encapsulation_key,
+            },
+        ])
+        .unwrap()
+    }
+
+    #[cfg(not(feature = "pq-ml-kem"))]
+    #[test]
+    fn hybrid_session_backend_requires_pq_kem_feature() {
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:3001".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: deterministic_public_identity(1),
+                session_public_identity: Some(hybrid_session_public_identity(vec![7, 7, 7])),
+            }],
+            initial_balances: Default::default(),
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+            session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
+            session_key_path: Some("/tmp/ml-kem.session".into()),
+        };
+        let error = match build_crypto_backend(&genesis, &config) {
+            Ok(_) => panic!("expected ML-KEM feature gate failure"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("built without pq-ml-kem"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[cfg(not(feature = "pq-ml-dsa"))]
@@ -1192,6 +1382,127 @@ mod tests {
         };
         std::fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
         (key_path, verifying_key)
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    fn write_ml_kem_session_key_file(label: &str) -> (std::path::PathBuf, Vec<u8>) {
+        use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+        use rand_core::OsRng;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mut rng = OsRng;
+        let (decapsulation_key, encapsulation_key) = MlKem768::generate(&mut rng);
+        let decapsulation_key_bytes = decapsulation_key.as_bytes().as_slice().to_vec();
+        let encapsulation_key_bytes = encapsulation_key.as_bytes().as_slice().to_vec();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-{label}-session-{}-{}.key",
+            std::process::id(),
+            nonce
+        ));
+        let key_file = MlKemSessionKeyFile {
+            decapsulation_key: decapsulation_key_bytes,
+            encapsulation_key: encapsulation_key_bytes.clone(),
+        };
+        std::fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+        (key_path, encapsulation_key_bytes)
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    fn session_backend_test_genesis_and_config(
+        session_public_identity: Option<SessionPublicIdentity>,
+        session_backend: SessionBackendKind,
+        session_key_path: Option<String>,
+    ) -> (GenesisConfig, NodeConfig) {
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![ValidatorConfig {
+                validator_id: 1,
+                stake: 100,
+                address: "127.0.0.1:3001".into(),
+                dev_secret: "secret-1".into(),
+                public_identity: deterministic_public_identity(1),
+                session_public_identity,
+            }],
+            initial_balances: Default::default(),
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+            session_backend,
+            session_key_path,
+        };
+        (genesis, config)
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn hybrid_session_backend_requires_session_key_path() {
+        let (genesis, config) = session_backend_test_genesis_and_config(
+            Some(hybrid_session_public_identity(vec![9, 9, 9])),
+            SessionBackendKind::HybridDeterministicMlKemExperimental,
+            None,
+        );
+        let error = match build_crypto_backend(&genesis, &config) {
+            Ok(_) => panic!("expected missing session key path failure"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("session_key_path"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn session_backend_rejects_mismatched_session_public_identity() {
+        let (key_path, matching_encapsulation_key) = write_ml_kem_session_key_file("session-match");
+        let mismatched_identity =
+            hybrid_session_public_identity([matching_encapsulation_key, vec![42]].concat());
+        let (genesis, config) = session_backend_test_genesis_and_config(
+            Some(mismatched_identity),
+            SessionBackendKind::HybridDeterministicMlKemExperimental,
+            Some(key_path.display().to_string()),
+        );
+        let error = match build_crypto_backend(&genesis, &config) {
+            Ok(_) => panic!("expected mismatched session identity failure"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("session public identity"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn hybrid_session_backend_accepts_matching_session_public_identity() {
+        let (key_path, encapsulation_key) = write_ml_kem_session_key_file("session-good");
+        let (genesis, config) = session_backend_test_genesis_and_config(
+            Some(hybrid_session_public_identity(encapsulation_key)),
+            SessionBackendKind::HybridDeterministicMlKemExperimental,
+            Some(key_path.display().to_string()),
+        );
+        build_crypto_backend(&genesis, &config).unwrap();
     }
 
     #[cfg(feature = "pq-ml-dsa")]

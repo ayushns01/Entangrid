@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+pq-ml-kem = ["entangrid-crypto/pq-ml-kem"]
+
 [dependencies]
 anyhow.workspace = true
 bincode.workspace = true
 entangrid-crypto = { path = "../entangrid-crypto" }
 entangrid-types = { path = "../entangrid-types" }
 tokio.workspace = true
-

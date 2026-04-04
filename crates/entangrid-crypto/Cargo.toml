@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 pq-ml-dsa = ["dep:ml-dsa"]
+pq-ml-kem = ["dep:ml-kem"]
 
 [dependencies]
 anyhow.workspace = true
@@ -14,6 +15,7 @@ bincode.workspace = true
 blake3.workspace = true
 entangrid-types = { path = "../entangrid-types" }
 ml-dsa = { version = "0.0.4", optional = true }
+ml-kem = { version = "0.2.1", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 
