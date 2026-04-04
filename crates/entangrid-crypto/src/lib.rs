@@ -2,13 +2,12 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow};
 use bincode::config::standard;
-#[cfg(feature = "pq-ml-kem")]
-use entangrid_types::SessionKeyScheme;
 #[cfg(feature = "pq-ml-dsa")]
 use entangrid_types::SignatureComponent;
 use entangrid_types::{
     GenesisConfig, HashBytes, NodeConfig, PublicIdentity, PublicKeyScheme, SessionBackendKind,
-    SignatureScheme, SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
+    SessionClientHello, SessionKeyScheme, SessionPublicIdentity, SessionServerHello, SignatureScheme,
+    SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
 };
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{
@@ -16,6 +15,13 @@ use ml_dsa::{
     SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
     signature::{Signer as _, Verifier as _},
 };
+#[cfg(feature = "pq-ml-kem")]
+use ml_kem::{
+    Encoded, EncodedSizeUser, KemCore, MlKem768,
+    kem::{Decapsulate, Encapsulate},
+};
+#[cfg(feature = "pq-ml-kem")]
+use rand_core::OsRng;
 #[cfg(any(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +45,26 @@ pub trait Verifier: Send + Sync {
 }
 
 pub trait HandshakeProvider: Send + Sync {
+    fn build_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        peer_validator_id: ValidatorId,
+        nonce: HashBytes,
+    ) -> Result<SessionClientHello>;
+
+    fn accept_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+    ) -> Result<(SessionServerHello, SessionMaterial)>;
+
+    fn finalize_client_session(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+        server_hello: &SessionServerHello,
+    ) -> Result<SessionMaterial>;
+
     fn open_session(
         &self,
         local_validator_id: ValidatorId,
@@ -227,6 +253,13 @@ struct MlKemSessionKeyFile {
     encapsulation_key: Vec<u8>,
 }
 
+#[cfg(feature = "pq-ml-kem")]
+type MlKem768DecapsulationKey = <MlKem768 as KemCore>::DecapsulationKey;
+#[cfg(feature = "pq-ml-kem")]
+type MlKem768EncapsulationKey = <MlKem768 as KemCore>::EncapsulationKey;
+#[cfg(feature = "pq-ml-kem")]
+type MlKem768Ciphertext = ml_kem::Ciphertext<MlKem768>;
+
 #[derive(Clone)]
 enum LocalSigningBackend {
     Deterministic,
@@ -237,12 +270,29 @@ enum LocalSigningBackend {
 }
 
 #[derive(Clone)]
+enum LocalSessionBackend {
+    Deterministic,
+    #[cfg(feature = "pq-ml-kem")]
+    HybridDeterministicMlKem768(LoadedMlKemSessionMaterial),
+}
+
+#[cfg(feature = "pq-ml-kem")]
+#[derive(Clone)]
+struct LoadedMlKemSessionMaterial {
+    key_file: MlKemSessionKeyFile,
+    session_public_identity: SessionPublicIdentity,
+}
+
+#[derive(Clone)]
 struct ConfiguredCryptoBackend {
     #[cfg(feature = "pq-ml-dsa")]
     local_validator_id: ValidatorId,
     local_signing_backend: LocalSigningBackend,
+    local_session_backend: LocalSessionBackend,
     deterministic: DeterministicCryptoBackend,
     identities: Arc<BTreeMap<ValidatorId, PublicIdentity>>,
+    #[cfg(feature = "pq-ml-kem")]
+    session_identities: Arc<BTreeMap<ValidatorId, Option<SessionPublicIdentity>>>,
     #[cfg(feature = "pq-ml-dsa")]
     ml_dsa_verifying_keys: Arc<BTreeMap<ValidatorId, MlDsaVerifyingKey<MlDsa65>>>,
 }
@@ -319,6 +369,24 @@ fn build_identity_map(genesis: &GenesisConfig) -> Arc<BTreeMap<ValidatorId, Publ
     )
 }
 
+#[cfg(feature = "pq-ml-kem")]
+fn build_session_identity_map(
+    genesis: &GenesisConfig,
+) -> Arc<BTreeMap<ValidatorId, Option<SessionPublicIdentity>>> {
+    Arc::new(
+        genesis
+            .validators
+            .iter()
+            .map(|validator| {
+                (
+                    validator.validator_id,
+                    validator.session_public_identity.clone(),
+                )
+            })
+            .collect(),
+    )
+}
+
 #[cfg(feature = "pq-ml-dsa")]
 fn build_ml_dsa_verifying_key_map(
     genesis: &GenesisConfig,
@@ -342,10 +410,10 @@ fn build_ml_dsa_verifying_key_map(
 }
 
 #[cfg(feature = "pq-ml-kem")]
-fn validate_ml_kem_session_material(
+fn load_ml_kem_session_material(
     validator: &ValidatorConfig,
     config: &NodeConfig,
-) -> Result<()> {
+) -> Result<LoadedMlKemSessionMaterial> {
     let key_path = config
         .session_key_path
         .as_ref()
@@ -395,18 +463,25 @@ fn validate_ml_kem_session_material(
             validator.validator_id
         ));
     }
-    Ok(())
+    Ok(LoadedMlKemSessionMaterial {
+        key_file,
+        session_public_identity: session_identity.clone(),
+    })
 }
 
-fn validate_session_backend_config(validator: &ValidatorConfig, config: &NodeConfig) -> Result<()> {
+fn build_local_session_backend(
+    validator: &ValidatorConfig,
+    config: &NodeConfig,
+) -> Result<LocalSessionBackend> {
     #[cfg(not(feature = "pq-ml-kem"))]
     let _ = validator;
     match config.session_backend {
-        SessionBackendKind::DevDeterministic => Ok(()),
+        SessionBackendKind::DevDeterministic => Ok(LocalSessionBackend::Deterministic),
         SessionBackendKind::HybridDeterministicMlKemExperimental => {
             #[cfg(feature = "pq-ml-kem")]
             {
-                validate_ml_kem_session_material(validator, config)
+                load_ml_kem_session_material(validator, config)
+                    .map(LocalSessionBackend::HybridDeterministicMlKem768)
             }
             #[cfg(not(feature = "pq-ml-kem"))]
             {
@@ -425,7 +500,9 @@ pub fn build_crypto_backend(
     let validator = validator_config(genesis, config.validator_id)?;
     let deterministic = DeterministicCryptoBackend::from_genesis(genesis);
     let identities = build_identity_map(genesis);
-    validate_session_backend_config(validator, config)?;
+    #[cfg(feature = "pq-ml-kem")]
+    let session_identities = build_session_identity_map(genesis);
+    let local_session_backend = build_local_session_backend(validator, config)?;
     match config.signing_backend {
         SigningBackendKind::DevDeterministic => {
             validate_deterministic_identity(validator)?;
@@ -433,8 +510,11 @@ pub fn build_crypto_backend(
                 #[cfg(feature = "pq-ml-dsa")]
                 local_validator_id: config.validator_id,
                 local_signing_backend: LocalSigningBackend::Deterministic,
+                local_session_backend,
                 deterministic,
                 identities,
+                #[cfg(feature = "pq-ml-kem")]
+                session_identities,
                 #[cfg(feature = "pq-ml-dsa")]
                 ml_dsa_verifying_keys: build_ml_dsa_verifying_key_map(genesis)?,
             }))
@@ -447,8 +527,11 @@ pub fn build_crypto_backend(
                     #[cfg(feature = "pq-ml-dsa")]
                     local_validator_id: config.validator_id,
                     local_signing_backend: LocalSigningBackend::MlDsa65(signing_key),
+                    local_session_backend,
                     deterministic,
                     identities,
+                    #[cfg(feature = "pq-ml-kem")]
+                    session_identities,
                     ml_dsa_verifying_keys: build_ml_dsa_verifying_key_map(genesis)?,
                 }));
             }
@@ -469,8 +552,11 @@ pub fn build_crypto_backend(
                     local_signing_backend: LocalSigningBackend::HybridDeterministicMlDsa65(
                         signing_key,
                     ),
+                    local_session_backend,
                     deterministic,
                     identities,
+                    #[cfg(feature = "pq-ml-kem")]
+                    session_identities,
                     ml_dsa_verifying_keys: build_ml_dsa_verifying_key_map(genesis)?,
                 }));
             }
@@ -482,6 +568,116 @@ pub fn build_crypto_backend(
             }
         }
     }
+}
+
+fn deterministic_session_public_identity(validator_id: ValidatorId) -> SessionPublicIdentity {
+    SessionPublicIdentity::single(
+        SessionKeyScheme::DevDeterministic,
+        format!("session-validator-{validator_id}").into_bytes(),
+    )
+}
+
+fn client_hello_signing_message(client_hello: &SessionClientHello) -> Result<Vec<u8>> {
+    bincode::serde::encode_to_vec(
+        &(
+            "entangrid-session-client-hello",
+            client_hello.initiator_validator_id,
+            client_hello.responder_validator_id,
+            client_hello.nonce,
+            &client_hello.session_public_identity,
+            &client_hello.kem_public_material,
+        ),
+        standard(),
+    )
+    .map_err(|error| anyhow!("failed to encode client hello signing message: {error}"))
+}
+
+fn server_hello_signing_message(
+    client_hello: &SessionClientHello,
+    server_hello: &SessionServerHello,
+) -> Result<Vec<u8>> {
+    bincode::serde::encode_to_vec(
+        &(
+            "entangrid-session-server-hello",
+            &client_hello_signing_message(client_hello)?,
+            server_hello.responder_validator_id,
+            server_hello.initiator_validator_id,
+            server_hello.nonce,
+            &server_hello.session_public_identity,
+            &server_hello.kem_ciphertext,
+        ),
+        standard(),
+    )
+    .map_err(|error| anyhow!("failed to encode server hello signing message: {error}"))
+}
+
+fn session_transcript_hash<H: TranscriptHasher>(
+    hasher: &H,
+    client_hello: &SessionClientHello,
+    server_hello: &SessionServerHello,
+) -> Result<HashBytes> {
+    let client_bytes = bincode::serde::encode_to_vec(client_hello, standard())
+        .map_err(|error| anyhow!("failed to encode client hello transcript: {error}"))?;
+    let server_bytes = bincode::serde::encode_to_vec(server_hello, standard())
+        .map_err(|error| anyhow!("failed to encode server hello transcript: {error}"))?;
+    Ok(hasher.transcript_hash(&[
+        b"entangrid-session-transcript",
+        client_bytes.as_slice(),
+        server_bytes.as_slice(),
+    ]))
+}
+
+fn deterministic_session_component(
+    deterministic: &DeterministicCryptoBackend,
+    local_validator_id: ValidatorId,
+    peer_validator_id: ValidatorId,
+    nonce: &HashBytes,
+) -> Result<HashBytes> {
+    Ok(
+        deterministic
+            .open_session(local_validator_id, peer_validator_id, nonce)?
+            .session_key,
+    )
+}
+
+fn derive_session_material<H: TranscriptHasher>(
+    hasher: &H,
+    deterministic_component: &HashBytes,
+    kem_component: &[u8],
+    client_hello: &SessionClientHello,
+    server_hello: &SessionServerHello,
+) -> Result<SessionMaterial> {
+    let transcript_hash = session_transcript_hash(hasher, client_hello, server_hello)?;
+    let session_key = hash_many(&[
+        b"entangrid-session-key-v2",
+        deterministic_component,
+        kem_component,
+        &transcript_hash,
+    ]);
+    Ok(SessionMaterial {
+        session_key,
+        transcript_hash,
+    })
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn decode_ml_kem_decapsulation_key(bytes: &[u8]) -> Result<MlKem768DecapsulationKey> {
+    let encoded = Encoded::<MlKem768DecapsulationKey>::try_from(bytes)
+        .map_err(|_| anyhow!("invalid ML-KEM decapsulation key encoding"))?;
+    Ok(MlKem768DecapsulationKey::from_bytes(&encoded))
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn decode_ml_kem_encapsulation_key(bytes: &[u8]) -> Result<MlKem768EncapsulationKey> {
+    let encoded = Encoded::<MlKem768EncapsulationKey>::try_from(bytes)
+        .map_err(|_| anyhow!("invalid ML-KEM encapsulation key encoding"))?;
+    Ok(MlKem768EncapsulationKey::from_bytes(&encoded))
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn decode_ml_kem_ciphertext(bytes: &[u8]) -> Result<MlKem768Ciphertext> {
+    ml_kem::Ciphertext::<MlKem768>::try_from(bytes)
+        .map_err(|_| anyhow!("invalid ML-KEM ciphertext encoding"))
 }
 
 #[derive(Clone, Debug)]
@@ -540,6 +736,118 @@ impl Verifier for DeterministicCryptoBackend {
 }
 
 impl HandshakeProvider for DeterministicCryptoBackend {
+    fn build_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        peer_validator_id: ValidatorId,
+        nonce: HashBytes,
+    ) -> Result<SessionClientHello> {
+        let mut client_hello = SessionClientHello {
+            initiator_validator_id: local_validator_id,
+            responder_validator_id: peer_validator_id,
+            nonce,
+            session_public_identity: deterministic_session_public_identity(local_validator_id),
+            kem_public_material: Vec::new(),
+            signature: TypedSignature::default(),
+        };
+        let signing_message = client_hello_signing_message(&client_hello)?;
+        client_hello.signature = self.sign(local_validator_id, &signing_message)?;
+        Ok(client_hello)
+    }
+
+    fn accept_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+    ) -> Result<(SessionServerHello, SessionMaterial)> {
+        if client_hello.responder_validator_id != local_validator_id {
+            return Err(anyhow!(
+                "client hello responder {} does not match local validator {}",
+                client_hello.responder_validator_id,
+                local_validator_id
+            ));
+        }
+        if client_hello.session_public_identity
+            != deterministic_session_public_identity(client_hello.initiator_validator_id)
+        {
+            return Err(anyhow!(
+                "validator {} advertised an unexpected deterministic session public identity",
+                client_hello.initiator_validator_id
+            ));
+        }
+        let signing_message = client_hello_signing_message(client_hello)?;
+        if !self.verify(
+            client_hello.initiator_validator_id,
+            &signing_message,
+            &client_hello.signature,
+        )? {
+            return Err(anyhow!("client hello signature verification failed"));
+        }
+        let mut server_hello = SessionServerHello {
+            responder_validator_id: local_validator_id,
+            initiator_validator_id: client_hello.initiator_validator_id,
+            nonce: client_hello.nonce,
+            session_public_identity: deterministic_session_public_identity(local_validator_id),
+            kem_ciphertext: Vec::new(),
+            signature: TypedSignature::default(),
+        };
+        let signing_message = server_hello_signing_message(client_hello, &server_hello)?;
+        server_hello.signature = self.sign(local_validator_id, &signing_message)?;
+        let deterministic_component = deterministic_session_component(
+            self,
+            local_validator_id,
+            client_hello.initiator_validator_id,
+            &client_hello.nonce,
+        )?;
+        let session =
+            derive_session_material(self, &deterministic_component, &[], client_hello, &server_hello)?;
+        Ok((server_hello, session))
+    }
+
+    fn finalize_client_session(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+        server_hello: &SessionServerHello,
+    ) -> Result<SessionMaterial> {
+        if client_hello.initiator_validator_id != local_validator_id {
+            return Err(anyhow!(
+                "client hello initiator {} does not match local validator {}",
+                client_hello.initiator_validator_id,
+                local_validator_id
+            ));
+        }
+        if server_hello.initiator_validator_id != local_validator_id
+            || server_hello.responder_validator_id != client_hello.responder_validator_id
+            || server_hello.nonce != client_hello.nonce
+        {
+            return Err(anyhow!("server hello does not match the client hello transcript"));
+        }
+        if server_hello.session_public_identity
+            != deterministic_session_public_identity(server_hello.responder_validator_id)
+        {
+            return Err(anyhow!(
+                "validator {} advertised an unexpected deterministic session public identity",
+                server_hello.responder_validator_id
+            ));
+        }
+        let signing_message = server_hello_signing_message(client_hello, server_hello)?;
+        if !self.verify(
+            server_hello.responder_validator_id,
+            &signing_message,
+            &server_hello.signature,
+        )? {
+            return Err(anyhow!("server hello signature verification failed"));
+        }
+        let deterministic_component = deterministic_session_component(
+            self,
+            local_validator_id,
+            server_hello.responder_validator_id,
+            &client_hello.nonce,
+        )?;
+        derive_session_material(self, &deterministic_component, &[], client_hello, server_hello)
+    }
+
     fn open_session(
         &self,
         local_validator_id: ValidatorId,
@@ -585,6 +893,55 @@ impl HandshakeProvider for DeterministicCryptoBackend {
 impl TranscriptHasher for DeterministicCryptoBackend {
     fn transcript_hash(&self, parts: &[&[u8]]) -> HashBytes {
         hash_many(parts)
+    }
+}
+
+impl ConfiguredCryptoBackend {
+    #[cfg(feature = "pq-ml-kem")]
+    fn expected_session_identity(&self, validator_id: ValidatorId) -> Result<Option<&SessionPublicIdentity>> {
+        self.session_identities
+            .get(&validator_id)
+            .map(|identity| identity.as_ref())
+            .ok_or_else(|| anyhow!("unknown validator id {validator_id}"))
+    }
+
+    fn local_session_identity(&self, validator_id: ValidatorId) -> Result<SessionPublicIdentity> {
+        match &self.local_session_backend {
+            LocalSessionBackend::Deterministic => {
+                Ok(deterministic_session_public_identity(validator_id))
+            }
+            #[cfg(feature = "pq-ml-kem")]
+            LocalSessionBackend::HybridDeterministicMlKem768(material) => {
+                Ok(material.session_public_identity.clone())
+            }
+        }
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    fn local_ml_kem_session_material(&self) -> Result<&LoadedMlKemSessionMaterial> {
+        match &self.local_session_backend {
+            LocalSessionBackend::HybridDeterministicMlKem768(material) => Ok(material),
+            LocalSessionBackend::Deterministic => Err(anyhow!(
+                "ML-KEM session material is unavailable for deterministic session backend"
+            )),
+        }
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    fn verify_expected_session_identity(
+        &self,
+        validator_id: ValidatorId,
+        advertised: &SessionPublicIdentity,
+    ) -> Result<()> {
+        if let Some(expected) = self.expected_session_identity(validator_id)? {
+            if expected != advertised {
+                return Err(anyhow!(
+                    "validator {} advertised a session public identity that does not match genesis",
+                    validator_id
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -784,6 +1141,222 @@ fn verify_signature_against_identity(
 }
 
 impl HandshakeProvider for ConfiguredCryptoBackend {
+    fn build_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        peer_validator_id: ValidatorId,
+        nonce: HashBytes,
+    ) -> Result<SessionClientHello> {
+        let session_public_identity = self.local_session_identity(local_validator_id)?;
+        let kem_public_material = match &self.local_session_backend {
+            LocalSessionBackend::Deterministic => Vec::new(),
+            #[cfg(feature = "pq-ml-kem")]
+            LocalSessionBackend::HybridDeterministicMlKem768(material) => {
+                material.key_file.encapsulation_key.clone()
+            }
+        };
+        let mut client_hello = SessionClientHello {
+            initiator_validator_id: local_validator_id,
+            responder_validator_id: peer_validator_id,
+            nonce,
+            session_public_identity,
+            kem_public_material,
+            signature: TypedSignature::default(),
+        };
+        let signing_message = client_hello_signing_message(&client_hello)?;
+        client_hello.signature = self.sign(local_validator_id, &signing_message)?;
+        Ok(client_hello)
+    }
+
+    fn accept_client_hello(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+    ) -> Result<(SessionServerHello, SessionMaterial)> {
+        if client_hello.responder_validator_id != local_validator_id {
+            return Err(anyhow!(
+                "client hello responder {} does not match local validator {}",
+                client_hello.responder_validator_id,
+                local_validator_id
+            ));
+        }
+        let signing_message = client_hello_signing_message(client_hello)?;
+        if !self.verify(
+            client_hello.initiator_validator_id,
+            &signing_message,
+            &client_hello.signature,
+        )? {
+            return Err(anyhow!("client hello signature verification failed"));
+        }
+
+        let (kem_component, kem_ciphertext) = match &self.local_session_backend {
+            LocalSessionBackend::Deterministic => {
+                if !client_hello.kem_public_material.is_empty() {
+                    return Err(anyhow!(
+                        "deterministic session backend does not accept ML-KEM client material"
+                    ));
+                }
+                if client_hello.session_public_identity
+                    != deterministic_session_public_identity(client_hello.initiator_validator_id)
+                {
+                    return Err(anyhow!(
+                        "validator {} advertised an unexpected deterministic session public identity",
+                        client_hello.initiator_validator_id
+                    ));
+                }
+                (Vec::new(), Vec::new())
+            }
+            #[cfg(feature = "pq-ml-kem")]
+            LocalSessionBackend::HybridDeterministicMlKem768(_) => {
+                self.verify_expected_session_identity(
+                    client_hello.initiator_validator_id,
+                    &client_hello.session_public_identity,
+                )?;
+                let expected_ml_kem = match client_hello.session_public_identity.scheme() {
+                    SessionKeyScheme::MlKem => client_hello
+                        .session_public_identity
+                        .as_single_bytes()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "validator {} session public identity missing ML-KEM bytes",
+                                client_hello.initiator_validator_id
+                            )
+                        })?,
+                    SessionKeyScheme::Hybrid => client_hello
+                        .session_public_identity
+                        .component_bytes(SessionKeyScheme::MlKem)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "validator {} session public identity missing ML-KEM component",
+                                client_hello.initiator_validator_id
+                            )
+                        })?,
+                    SessionKeyScheme::DevDeterministic => {
+                        return Err(anyhow!(
+                            "validator {} session public identity does not carry ML-KEM material",
+                            client_hello.initiator_validator_id
+                        ));
+                    }
+                };
+                if client_hello.kem_public_material.as_slice() != expected_ml_kem {
+                    return Err(anyhow!(
+                        "validator {} session public identity does not match advertised ML-KEM material",
+                        client_hello.initiator_validator_id
+                    ));
+                }
+                let initiator_encapsulation_key =
+                    decode_ml_kem_encapsulation_key(&client_hello.kem_public_material)?;
+                let mut rng = OsRng;
+                let (ciphertext, shared_key) = initiator_encapsulation_key
+                    .encapsulate(&mut rng)
+                    .map_err(|_| anyhow!("failed to encapsulate ML-KEM shared secret"))?;
+                (shared_key.as_slice().to_vec(), ciphertext.as_slice().to_vec())
+            }
+        };
+
+        let mut server_hello = SessionServerHello {
+            responder_validator_id: local_validator_id,
+            initiator_validator_id: client_hello.initiator_validator_id,
+            nonce: client_hello.nonce,
+            session_public_identity: self.local_session_identity(local_validator_id)?,
+            kem_ciphertext,
+            signature: TypedSignature::default(),
+        };
+        let signing_message = server_hello_signing_message(client_hello, &server_hello)?;
+        server_hello.signature = self.sign(local_validator_id, &signing_message)?;
+        let deterministic_component = deterministic_session_component(
+            &self.deterministic,
+            local_validator_id,
+            client_hello.initiator_validator_id,
+            &client_hello.nonce,
+        )?;
+        let session = derive_session_material(
+            self,
+            &deterministic_component,
+            kem_component.as_slice(),
+            client_hello,
+            &server_hello,
+        )?;
+        Ok((server_hello, session))
+    }
+
+    fn finalize_client_session(
+        &self,
+        local_validator_id: ValidatorId,
+        client_hello: &SessionClientHello,
+        server_hello: &SessionServerHello,
+    ) -> Result<SessionMaterial> {
+        if client_hello.initiator_validator_id != local_validator_id {
+            return Err(anyhow!(
+                "client hello initiator {} does not match local validator {}",
+                client_hello.initiator_validator_id,
+                local_validator_id
+            ));
+        }
+        if server_hello.initiator_validator_id != local_validator_id
+            || server_hello.responder_validator_id != client_hello.responder_validator_id
+            || server_hello.nonce != client_hello.nonce
+        {
+            return Err(anyhow!("server hello does not match the client hello transcript"));
+        }
+        let signing_message = server_hello_signing_message(client_hello, server_hello)?;
+        if !self.verify(
+            server_hello.responder_validator_id,
+            &signing_message,
+            &server_hello.signature,
+        )? {
+            return Err(anyhow!("server hello signature verification failed"));
+        }
+
+        let kem_component = match &self.local_session_backend {
+            LocalSessionBackend::Deterministic => {
+                if !server_hello.kem_ciphertext.is_empty() {
+                    return Err(anyhow!(
+                        "deterministic session backend does not accept ML-KEM server material"
+                    ));
+                }
+                if server_hello.session_public_identity
+                    != deterministic_session_public_identity(server_hello.responder_validator_id)
+                {
+                    return Err(anyhow!(
+                        "validator {} advertised an unexpected deterministic session public identity",
+                        server_hello.responder_validator_id
+                    ));
+                }
+                Vec::new()
+            }
+            #[cfg(feature = "pq-ml-kem")]
+            LocalSessionBackend::HybridDeterministicMlKem768(_) => {
+                self.verify_expected_session_identity(
+                    server_hello.responder_validator_id,
+                    &server_hello.session_public_identity,
+                )?;
+                let local_material = self.local_ml_kem_session_material()?;
+                let decapsulation_key =
+                    decode_ml_kem_decapsulation_key(&local_material.key_file.decapsulation_key)?;
+                let ciphertext = decode_ml_kem_ciphertext(&server_hello.kem_ciphertext)?;
+                decapsulation_key
+                    .decapsulate(&ciphertext)
+                    .map_err(|_| anyhow!("failed to decapsulate ML-KEM shared secret"))?
+                    .as_slice()
+                    .to_vec()
+            }
+        };
+        let deterministic_component = deterministic_session_component(
+            &self.deterministic,
+            local_validator_id,
+            server_hello.responder_validator_id,
+            &client_hello.nonce,
+        )?;
+        derive_session_material(
+            self,
+            &deterministic_component,
+            kem_component.as_slice(),
+            client_hello,
+            server_hello,
+        )
+    }
+
     fn open_session(
         &self,
         local_validator_id: ValidatorId,
@@ -809,7 +1382,7 @@ mod tests {
         FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PublicIdentity,
         PublicIdentityComponent, PublicKeyScheme, SessionKeyScheme, SessionPublicIdentity,
         SessionPublicIdentityComponent, SignatureScheme, SigningBackendKind, TypedSignature,
-        ValidatorConfig, empty_hash,
+        ValidatorConfig, ValidatorId, empty_hash,
     };
 
     use super::*;
@@ -1073,6 +1646,115 @@ mod tests {
             },
         ])
         .unwrap()
+    }
+
+    fn two_validator_genesis() -> GenesisConfig {
+        GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: deterministic_public_identity(1),
+                    session_public_identity: None,
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: deterministic_public_identity(2),
+                    session_public_identity: None,
+                },
+            ],
+            initial_balances: Default::default(),
+        }
+    }
+
+    fn deterministic_node_config(validator_id: ValidatorId) -> NodeConfig {
+        NodeConfig {
+            validator_id,
+            data_dir: format!("/tmp/node-{validator_id}"),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: format!("127.0.0.1:{}", 3000 + validator_id),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
+        }
+    }
+
+    #[test]
+    fn deterministic_session_handshake_round_trips_between_validators() {
+        let genesis = two_validator_genesis();
+        let client = build_crypto_backend(&genesis, &deterministic_node_config(1)).unwrap();
+        let server = build_crypto_backend(&genesis, &deterministic_node_config(2)).unwrap();
+        let nonce = [7; 32];
+
+        let client_hello = client.build_client_hello(1, 2, nonce).unwrap();
+        let (server_hello, server_session) = server.accept_client_hello(2, &client_hello).unwrap();
+        let client_session = client
+            .finalize_client_session(1, &client_hello, &server_hello)
+            .unwrap();
+
+        assert_eq!(client_session, server_session);
+    }
+
+    #[test]
+    fn handshake_rejects_invalid_client_transcript_signature() {
+        let genesis = two_validator_genesis();
+        let client = build_crypto_backend(&genesis, &deterministic_node_config(1)).unwrap();
+        let server = build_crypto_backend(&genesis, &deterministic_node_config(2)).unwrap();
+        let nonce = [9; 32];
+
+        let mut client_hello = client.build_client_hello(1, 2, nonce).unwrap();
+        client_hello.signature =
+            TypedSignature::single(SignatureScheme::DevDeterministic, vec![0; 32]);
+
+        let error = match server.accept_client_hello(2, &client_hello) {
+            Ok(_) => panic!("expected invalid client signature rejection"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("client hello signature"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn handshake_rejects_invalid_server_transcript_signature() {
+        let genesis = two_validator_genesis();
+        let client = build_crypto_backend(&genesis, &deterministic_node_config(1)).unwrap();
+        let server = build_crypto_backend(&genesis, &deterministic_node_config(2)).unwrap();
+        let nonce = [11; 32];
+
+        let client_hello = client.build_client_hello(1, 2, nonce).unwrap();
+        let (mut server_hello, _) = server.accept_client_hello(2, &client_hello).unwrap();
+        server_hello.signature =
+            TypedSignature::single(SignatureScheme::DevDeterministic, vec![1; 32]);
+
+        let error = match client.finalize_client_session(1, &client_hello, &server_hello) {
+            Ok(_) => panic!("expected invalid server signature rejection"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("server hello signature"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[cfg(not(feature = "pq-ml-kem"))]
@@ -1455,6 +2137,53 @@ mod tests {
     }
 
     #[cfg(feature = "pq-ml-kem")]
+    fn hybrid_session_genesis_and_configs() -> (GenesisConfig, NodeConfig, NodeConfig) {
+        let (key_path_one, key_one) = write_ml_kem_session_key_file("handshake-one");
+        let (key_path_two, key_two) = write_ml_kem_session_key_file("handshake-two");
+        let genesis = GenesisConfig {
+            chain_id: "entangrid-test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: deterministic_public_identity(1),
+                    session_public_identity: Some(hybrid_session_public_identity(key_one)),
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: deterministic_public_identity(2),
+                    session_public_identity: Some(hybrid_session_public_identity(key_two)),
+                },
+            ],
+            initial_balances: Default::default(),
+        };
+        let config_one = NodeConfig {
+            validator_id: 1,
+            session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
+            session_key_path: Some(key_path_one.display().to_string()),
+            ..deterministic_node_config(1)
+        };
+        let config_two = NodeConfig {
+            validator_id: 2,
+            session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
+            session_key_path: Some(key_path_two.display().to_string()),
+            ..deterministic_node_config(2)
+        };
+        (genesis, config_one, config_two)
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
     #[test]
     fn hybrid_session_backend_requires_session_key_path() {
         let (genesis, config) = session_backend_test_genesis_and_config(
@@ -1503,6 +2232,47 @@ mod tests {
             Some(key_path.display().to_string()),
         );
         build_crypto_backend(&genesis, &config).unwrap();
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn hybrid_session_handshake_round_trips_between_validators() {
+        let (genesis, client_config, server_config) = hybrid_session_genesis_and_configs();
+        let client = build_crypto_backend(&genesis, &client_config).unwrap();
+        let server = build_crypto_backend(&genesis, &server_config).unwrap();
+        let nonce = [13; 32];
+
+        let client_hello = client.build_client_hello(1, 2, nonce).unwrap();
+        let (server_hello, server_session) = server.accept_client_hello(2, &client_hello).unwrap();
+        let client_session = client
+            .finalize_client_session(1, &client_hello, &server_hello)
+            .unwrap();
+
+        assert_eq!(client_session, server_session);
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn hybrid_handshake_rejects_mismatched_peer_session_identity() {
+        let (genesis, client_config, server_config) = hybrid_session_genesis_and_configs();
+        let client = build_crypto_backend(&genesis, &client_config).unwrap();
+        let server = build_crypto_backend(&genesis, &server_config).unwrap();
+        let nonce = [17; 32];
+
+        let mut client_hello = client.build_client_hello(1, 2, nonce).unwrap();
+        client_hello.session_public_identity = hybrid_session_public_identity(vec![5; 1184]);
+        client_hello.kem_public_material = vec![5; 1184];
+        let signing_message = client_hello_signing_message(&client_hello).unwrap();
+        client_hello.signature = client.sign(1, &signing_message).unwrap();
+
+        let error = match server.accept_client_hello(2, &client_hello) {
+            Ok(_) => panic!("expected peer session identity mismatch"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("does not match genesis"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[cfg(feature = "pq-ml-dsa")]
