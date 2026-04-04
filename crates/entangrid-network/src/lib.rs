@@ -290,8 +290,11 @@ async fn run_outbound_handshake(
     peer_validator_id: ValidatorId,
     crypto: Arc<dyn CryptoBackend>,
 ) -> Result<SessionMaterial> {
-    let client_hello =
-        crypto.build_client_hello(local_validator_id, peer_validator_id, session_nonce(local_validator_id, peer_validator_id))?;
+    let client_hello = crypto.build_client_hello(
+        local_validator_id,
+        peer_validator_id,
+        session_nonce(local_validator_id, peer_validator_id),
+    )?;
     write_bincode_frame(stream, &client_hello).await?;
     let server_hello_bytes = read_frame_bytes(stream)
         .await?
@@ -604,7 +607,9 @@ mod tests {
     use super::*;
     use entangrid_crypto::{DeterministicCryptoBackend, HandshakeProvider, Signer};
     use entangrid_types::HeartbeatPulse;
-    use entangrid_types::{GenesisConfig, PublicIdentity, SessionClientHello, SessionServerHello, ValidatorConfig};
+    use entangrid_types::{
+        GenesisConfig, PublicIdentity, SessionClientHello, SessionServerHello, ValidatorConfig,
+    };
     use std::io::Error;
     use std::os::fd::AsRawFd;
     use tokio::{
@@ -835,9 +840,10 @@ mod tests {
         let first: SignedEnvelope = read_bincode_frame(&mut stream).await;
         assert_eq!(first.payload, payload_one);
 
-        let second: SignedEnvelope = timeout(Duration::from_secs(2), read_bincode_frame(&mut stream))
-            .await
-            .expect("second frame on same stream");
+        let second: SignedEnvelope =
+            timeout(Duration::from_secs(2), read_bincode_frame(&mut stream))
+                .await
+                .expect("second frame on same stream");
         assert_eq!(second.payload, payload_two);
         assert!(
             timeout(Duration::from_millis(200), listener.accept())

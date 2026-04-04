@@ -1655,7 +1655,10 @@ disable_outbound = false
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded, hybrid);
         assert_eq!(decoded.scheme(), SessionKeyScheme::Hybrid);
-        assert_eq!(decoded.component_bytes(SessionKeyScheme::MlKem), Some([6, 7, 8].as_slice()));
+        assert_eq!(
+            decoded.component_bytes(SessionKeyScheme::MlKem),
+            Some([6, 7, 8].as_slice())
+        );
     }
 
     #[test]
@@ -1665,7 +1668,11 @@ scheme = "Hybrid"
 bytes = []
 "#;
         let error = toml::from_str::<SessionPublicIdentity>(empty_hybrid).unwrap_err();
-        assert!(error.to_string().contains("requires at least one component"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one component")
+        );
 
         let stray_components = r#"
 scheme = "MlKem"
@@ -1742,7 +1749,8 @@ bytes = [1, 1, 1]
             kem_public_material: vec![5, 6, 7],
             signature: TypedSignature::single(SignatureScheme::DevDeterministic, vec![8, 9]),
         };
-        let client_bytes = bincode::serde::encode_to_vec(&client, bincode::config::standard()).unwrap();
+        let client_bytes =
+            bincode::serde::encode_to_vec(&client, bincode::config::standard()).unwrap();
         let (decoded_client, _): (SessionClientHello, usize) =
             bincode::serde::decode_from_slice(&client_bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded_client, client);
@@ -1765,7 +1773,8 @@ bytes = [1, 1, 1]
             kem_ciphertext: vec![10, 11, 12],
             signature: TypedSignature::single(SignatureScheme::DevDeterministic, vec![13, 14]),
         };
-        let server_bytes = bincode::serde::encode_to_vec(&server, bincode::config::standard()).unwrap();
+        let server_bytes =
+            bincode::serde::encode_to_vec(&server, bincode::config::standard()).unwrap();
         let (decoded_server, _): (SessionServerHello, usize) =
             bincode::serde::decode_from_slice(&server_bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded_server, server);

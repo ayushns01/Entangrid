@@ -14,6 +14,8 @@ use entangrid_consensus::ConsensusEngine;
 use entangrid_crypto::{CryptoBackend, build_crypto_backend};
 use entangrid_ledger::LedgerState;
 use entangrid_network::{NetworkEvent, NetworkFailureKind, NetworkHandle, spawn_network};
+#[cfg(test)]
+use entangrid_types::SessionBackendKind;
 use entangrid_types::{
     Block, BlockHeader, CertifiedBlockHeader, ChainSegment, ChainSnapshot, ChunkedSyncRequest,
     ChunkedSyncResponse, Epoch, EventLogEntry, GenesisConfig, HashBytes, HeartbeatPulse,
@@ -22,8 +24,6 @@ use entangrid_types::{
     ServiceCounters, SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment,
     TypedSignature, ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
-#[cfg(test)]
-use entangrid_types::SessionBackendKind;
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
 

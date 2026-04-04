@@ -6,8 +6,8 @@ use bincode::config::standard;
 use entangrid_types::SignatureComponent;
 use entangrid_types::{
     GenesisConfig, HashBytes, NodeConfig, PublicIdentity, PublicKeyScheme, SessionBackendKind,
-    SessionClientHello, SessionKeyScheme, SessionPublicIdentity, SessionServerHello, SignatureScheme,
-    SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
+    SessionClientHello, SessionKeyScheme, SessionPublicIdentity, SessionServerHello,
+    SignatureScheme, SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
 };
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{
@@ -633,11 +633,9 @@ fn deterministic_session_component(
     peer_validator_id: ValidatorId,
     nonce: &HashBytes,
 ) -> Result<HashBytes> {
-    Ok(
-        deterministic
-            .open_session(local_validator_id, peer_validator_id, nonce)?
-            .session_key,
-    )
+    Ok(deterministic
+        .open_session(local_validator_id, peer_validator_id, nonce)?
+        .session_key)
 }
 
 fn derive_session_material<H: TranscriptHasher>(
@@ -799,8 +797,13 @@ impl HandshakeProvider for DeterministicCryptoBackend {
             client_hello.initiator_validator_id,
             &client_hello.nonce,
         )?;
-        let session =
-            derive_session_material(self, &deterministic_component, &[], client_hello, &server_hello)?;
+        let session = derive_session_material(
+            self,
+            &deterministic_component,
+            &[],
+            client_hello,
+            &server_hello,
+        )?;
         Ok((server_hello, session))
     }
 
@@ -821,7 +824,9 @@ impl HandshakeProvider for DeterministicCryptoBackend {
             || server_hello.responder_validator_id != client_hello.responder_validator_id
             || server_hello.nonce != client_hello.nonce
         {
-            return Err(anyhow!("server hello does not match the client hello transcript"));
+            return Err(anyhow!(
+                "server hello does not match the client hello transcript"
+            ));
         }
         if server_hello.session_public_identity
             != deterministic_session_public_identity(server_hello.responder_validator_id)
@@ -845,7 +850,13 @@ impl HandshakeProvider for DeterministicCryptoBackend {
             server_hello.responder_validator_id,
             &client_hello.nonce,
         )?;
-        derive_session_material(self, &deterministic_component, &[], client_hello, server_hello)
+        derive_session_material(
+            self,
+            &deterministic_component,
+            &[],
+            client_hello,
+            server_hello,
+        )
     }
 
     fn open_session(
@@ -898,7 +909,10 @@ impl TranscriptHasher for DeterministicCryptoBackend {
 
 impl ConfiguredCryptoBackend {
     #[cfg(feature = "pq-ml-kem")]
-    fn expected_session_identity(&self, validator_id: ValidatorId) -> Result<Option<&SessionPublicIdentity>> {
+    fn expected_session_identity(
+        &self,
+        validator_id: ValidatorId,
+    ) -> Result<Option<&SessionPublicIdentity>> {
         self.session_identities
             .get(&validator_id)
             .map(|identity| identity.as_ref())
@@ -1250,7 +1264,10 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
                 let (ciphertext, shared_key) = initiator_encapsulation_key
                     .encapsulate(&mut rng)
                     .map_err(|_| anyhow!("failed to encapsulate ML-KEM shared secret"))?;
-                (shared_key.as_slice().to_vec(), ciphertext.as_slice().to_vec())
+                (
+                    shared_key.as_slice().to_vec(),
+                    ciphertext.as_slice().to_vec(),
+                )
             }
         };
 
@@ -1297,7 +1314,9 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
             || server_hello.responder_validator_id != client_hello.responder_validator_id
             || server_hello.nonce != client_hello.nonce
         {
-            return Err(anyhow!("server hello does not match the client hello transcript"));
+            return Err(anyhow!(
+                "server hello does not match the client hello transcript"
+            ));
         }
         let signing_message = server_hello_signing_message(client_hello, server_hello)?;
         if !self.verify(

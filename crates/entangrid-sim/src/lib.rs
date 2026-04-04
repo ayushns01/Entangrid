@@ -8,21 +8,19 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
-use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 use entangrid_crypto::deterministic_public_identity;
+use entangrid_crypto::{DeterministicCryptoBackend, Signer};
 #[cfg(feature = "pq-ml-dsa")]
-use entangrid_crypto::{
-    build_crypto_backend, measure_signing_backend,
-};
+use entangrid_crypto::{build_crypto_backend, measure_signing_backend};
 #[cfg(feature = "pq-ml-dsa")]
 use entangrid_types::{
-    Block, BlockHeader, ProposalVote, PublicIdentity, PublicIdentityComponent,
-    PublicKeyScheme, TopologyCommitment, TypedSignature, ValidatorId,
+    Block, BlockHeader, ProposalVote, PublicIdentity, PublicIdentityComponent, PublicKeyScheme,
+    TopologyCommitment, TypedSignature, ValidatorId,
 };
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
-    SessionBackendKind, SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
+    PeerConfig, ProtocolMessage, ServiceScoreWeights, SessionBackendKind, SignedEnvelope,
+    SignedTransaction, SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
     default_service_delivery_weight, default_service_diversity_weight,
     default_service_gating_start_epoch, default_service_gating_threshold,
     default_service_penalty_weight, default_service_score_weights,
@@ -856,8 +854,7 @@ fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {
 fn localnet_requires_hybrid_enforcement(manifest: &LocalnetManifest) -> Result<bool> {
     for config in read_node_configs(manifest)? {
         if config.feature_flags.require_hybrid_validator_signatures
-            || config.signing_backend
-                == SigningBackendKind::HybridDeterministicMlDsaExperimental
+            || config.signing_backend == SigningBackendKind::HybridDeterministicMlDsaExperimental
         {
             return Ok(true);
         }
@@ -2792,7 +2789,8 @@ mod tests {
 
         for config in read_node_configs(manifest)? {
             let node_dir = PathBuf::from(&config.data_dir);
-            let blocks: Vec<entangrid_types::Block> = read_json_lines(&node_dir.join("blocks.jsonl"))?;
+            let blocks: Vec<entangrid_types::Block> =
+                read_json_lines(&node_dir.join("blocks.jsonl"))?;
             if !blocks.is_empty() {
                 saw_block_progress = true;
             }
@@ -3067,12 +3065,8 @@ mod tests {
 
     #[test]
     fn init_localnet_cli_can_enable_hybrid_enforcement() {
-        let cli = Cli::try_parse_from([
-            "entangrid-sim",
-            "init-localnet",
-            "--hybrid-enforcement",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["entangrid-sim", "init-localnet", "--hybrid-enforcement"])
+            .unwrap();
 
         match cli.command {
             Commands::InitLocalnet {
@@ -3340,18 +3334,22 @@ mod tests {
         let contents = fs::read_to_string(node_one_path).unwrap();
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.consensus_v2);
-        assert!(node_config
-            .feature_flags
-            .require_hybrid_validator_signatures);
+        assert!(
+            node_config
+                .feature_flags
+                .require_hybrid_validator_signatures
+        );
         assert_eq!(
             node_config.signing_backend,
             entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental
         );
-        assert!(!node_config
-            .signing_key_path
-            .as_deref()
-            .unwrap_or_default()
-            .is_empty());
+        assert!(
+            !node_config
+                .signing_key_path
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "pq-ml-dsa")]
@@ -3385,10 +3383,12 @@ mod tests {
         let contents = fs::read_to_string(genesis_path).unwrap();
         let genesis: GenesisConfig = toml::from_str(&contents).unwrap();
         assert!(!genesis.validators.is_empty());
-        assert!(genesis
-            .validators
-            .iter()
-            .all(|validator| validator.public_identity.scheme == PublicKeyScheme::Hybrid));
+        assert!(
+            genesis
+                .validators
+                .iter()
+                .all(|validator| validator.public_identity.scheme == PublicKeyScheme::Hybrid)
+        );
     }
 
     #[cfg(feature = "pq-ml-dsa")]
@@ -3491,9 +3491,11 @@ mod tests {
             entangrid_types::SigningBackendKind::DevDeterministic
         );
         assert_eq!(node_config.signing_key_path, None);
-        assert!(!node_config
-            .feature_flags
-            .require_hybrid_validator_signatures);
+        assert!(
+            !node_config
+                .feature_flags
+                .require_hybrid_validator_signatures
+        );
         assert!(!unique_dir.join("node-1").join("ml-dsa-key.json").exists());
     }
 
