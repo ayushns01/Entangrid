@@ -27,6 +27,9 @@ It also now contains the first crypto-agility primitives for the PQ work:
 - `TypedSignature`
 - `PublicIdentity`
 - `SigningBackendKind`
+- `SessionKeyScheme`
+- `SessionPublicIdentity`
+- `SessionBackendKind`
 
 - `GenesisConfig` describes the chain start state:
   - validator list
@@ -42,6 +45,11 @@ It also now contains the first crypto-agility primitives for the PQ work:
   - fault profile
   - `signing_backend`
   - optional `signing_key_path`
+  - `session_backend`
+  - optional `session_key_path`
+- `ValidatorConfig` now carries both:
+  - signing-facing `public_identity`
+  - optional transport-facing `session_public_identity`
 - `Transaction` is a native balance transfer:
   - `from`
   - `to`
@@ -96,6 +104,11 @@ This crate also provides a few shared helpers:
 - `hash_many(...)` for combining byte parts
 - `validator_account(id)` for mapping validator ids to current account names like `validator-1`
 
+It now also carries the Stage 1G handshake wire types shared by crypto and transport:
+
+- `SessionClientHello`
+- `SessionServerHello`
+
 ## What this means in the current implementation
 
 Today, the chain is built around validator-owned accounts and transfer-only state transitions.
@@ -117,6 +130,13 @@ One recent example of that role is service gating:
 - the node reports score breakdowns back into `NodeMetrics` through these shared types
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
 - `NodeMetrics` now also carries the active score-weight profile so reports can explain not just the counters, but the policy that turned them into a score
+
+Another recent example is Stage 1G session establishment:
+
+- validator metadata can now advertise a separate session public identity
+- node-local config can now point at a separate session key file
+- crypto and network share one handshake wire format through this crate
+- the deterministic session path remains the default when `pq-ml-kem` is disabled
 
 The current recommended prototype policy now lives in these shared defaults too:
 

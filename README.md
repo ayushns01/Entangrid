@@ -106,7 +106,7 @@ The repository now includes a working Rust workspace with:
 Important:
 
 - the current backend is a deterministic development backend, not a production-strength post-quantum implementation
-- real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
+- production-strength PQ rollout still remains a later milestone behind the stable crypto interfaces already in place
 - `stage-1/pq-integration` is now the active branch for Stage 1 PQ work:
   - typed signatures and typed public identities are in
   - node-local signing backend selection is in
@@ -116,8 +116,12 @@ Important:
   - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
   - that mode writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
   - `--hybrid-enforcement` is an operational/bootstrap slice, not a full hybrid performance matrix
-  - transactions, receipts, service evidence, and session/KEM enforcement still come later
-  - session/KEM upgrades still come later
+  - Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
+  - validators now keep signing identity and session identity separate
+  - session setup is per-stream and mutually signed, then derives material from deterministic + ML-KEM components
+  - deterministic transport remains the default path when `pq-ml-kem` is off
+  - encrypted framing, session rotation, and simulator-generated KEM key material still come later
+  - transactions, receipts, and service evidence still remain outside the strict hybrid-enforcement slice
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back

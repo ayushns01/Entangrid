@@ -204,7 +204,16 @@ Current PQ Stage 1E note on `stage-1/pq-integration`:
 - when enabled, every validator in genesis must advertise a hybrid public identity
 - validator-originated block signatures must be hybrid
 - validator-originated proposal-vote signatures, including votes imported through quorum certificates, must be hybrid
-- transactions, receipts, service evidence, and session/KEM behavior remain outside this enforcement slice
+- transactions, receipts, and service evidence remain outside this enforcement slice
+
+Current PQ Stage 1G note on `stage-1/pq-integration`:
+
+- session identity is now separate from signing identity
+- the transport layer can run a feature-gated per-stream hybrid handshake behind `pq-ml-kem`
+- each handshake is mutually signed with the validators' existing signing identities
+- the derived session material mixes the existing deterministic component with an ML-KEM component
+- deterministic session establishment remains the default path when the feature is off
+- encrypted framing and session rotation are still out of scope for this slice
 
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 

@@ -28,8 +28,9 @@ and two concrete backend paths:
 
 - `DeterministicCryptoBackend`
 - `MlDsa65Experimental` behind the `pq-ml-dsa` cargo feature
+- a feature-gated hybrid session KEM path behind `pq-ml-kem`
 
-The deterministic backend is still the default development path. The ML-DSA path is experimental and only covers signing/authentication so far.
+The deterministic backend is still the default development path. The ML-DSA path is experimental for signing/authentication, and the ML-KEM path is experimental for session establishment.
 
 Current behavior:
 
@@ -66,12 +67,17 @@ The current PQ branch now also supports:
 - permissive verification against hybrid identities so single-scheme and hybrid signatures can coexist during rollout
 - an opt-in `require_hybrid_validator_signatures` mode in node policy that now enforces hybrid validator identities plus hybrid block/proposal-vote signatures
 - the simulator's Stage 1F strict hybrid localnet bootstrap path uses the same hybrid backend, requires a `pq-ml-dsa` build, and turns on `require_hybrid_validator_signatures = true` together with `consensus_v2 = true`
+- a separate session identity/config surface through `ValidatorConfig.session_public_identity`, `NodeConfig.session_backend`, and `NodeConfig.session_key_path`
+- a feature-gated per-stream handshake behind `pq-ml-kem` using `SessionClientHello` / `SessionServerHello`
+- mutually signed handshake transcripts that bind the transport session to validator signing identities
+- session material derived from the existing deterministic component plus an ML-KEM component when `HybridDeterministicMlKemExperimental` is selected
 
 Current enforcement boundary:
 
 - blocks: enforced when the flag is on
 - proposal votes, including votes imported via quorum certificates: enforced when the flag is on
-- transactions, receipts, service evidence, and session/KEM behavior: not enforced yet
+- transactions, receipts, and service evidence: not enforced yet
+- Stage 1G establishes authenticated session material only; it does not encrypt frames yet
 
 ## How to measure ML-DSA signing right now
 
@@ -136,8 +142,9 @@ Current PQ branch focus:
   - make signing and identity types scheme-aware
   - add node-local backend selection
   - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
-- that branch is intentionally limited to signing/authentication first
-- KEM/session upgrades come later
+  - add a feature-gated hybrid ML-KEM session handshake behind `pq-ml-kem`
+- that branch now covers signing/authentication plus handshake-only session establishment
+- encrypted framing, session rotation, and simulator-generated KEM key material still come later
 
 ## Why this crate matters
 

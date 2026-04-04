@@ -56,7 +56,11 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 - an opt-in `require_hybrid_validator_signatures` flag now adds network-wide startup enforcement for hybrid validator identities and runtime enforcement for block and proposal-vote signatures
 - Stage 1F adds a strict hybrid localnet bootstrap path via `init-localnet --hybrid-enforcement`; it requires a `pq-ml-dsa` build, writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - this Stage 1F slice is operational/bootstrap coverage, not the full hybrid performance matrix
-- the current slice is intentionally limited to signing/authentication, not session KEM changes yet
+- Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
+- session identity is now separate from signing identity in config and validator metadata
+- each TCP stream performs one mutually signed handshake and derives session material from deterministic + ML-KEM components before normal frames flow
+- deterministic session establishment remains the default path when `pq-ml-kem` is disabled
+- this slice adds handshake-only session establishment, not encrypted framing or rekeying yet
 
 ### 3. Network Layer
 
@@ -64,12 +68,18 @@ Responsibilities:
 
 - peer discovery for localnet
 - authenticated session setup
-- encrypted framing
+- encrypted framing later
 - gossip for transactions and blocks
 - witness pulse delivery
 - backpressure and connection management
 
 The network layer should not know consensus rules beyond message priority classes.
+
+Current Stage 1G note:
+
+- the network layer now performs one handshake per TCP stream before normal protocol frames
+- handshake success records session metadata and transcript hash for metrics/events
+- the frame format after handshake is unchanged in this slice
 
 ### 4. Witness Engine
 
