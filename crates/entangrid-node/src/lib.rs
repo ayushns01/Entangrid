@@ -22,6 +22,8 @@ use entangrid_types::{
     ServiceCounters, SignedTransaction, StateSnapshot, SyncQcAnchor, TopologyCommitment,
     TypedSignature, ValidatorId, canonical_hash, empty_hash, now_unix_millis,
 };
+#[cfg(test)]
+use entangrid_types::{SessionBackendKind, SessionPublicIdentity};
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::info;
 
@@ -5474,6 +5476,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: SessionPublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: balances,
@@ -5721,6 +5724,8 @@ mod tests {
             sync_on_startup: false,
             signing_backend: entangrid_types::SigningBackendKind::DevDeterministic,
             signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         }
     }
 
@@ -12683,6 +12688,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: SessionPublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: balances,

@@ -22,7 +22,8 @@ use entangrid_types::{
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
     PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
-    SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
+    SessionBackendKind, SessionPublicIdentity, SigningBackendKind, Transaction, ValidatorConfig,
+    canonical_hash,
     default_service_delivery_weight, default_service_diversity_weight,
     default_service_gating_start_epoch, default_service_gating_threshold,
     default_service_penalty_weight, default_service_score_weights,
@@ -326,6 +327,7 @@ pub fn init_localnet(
                     address: address.clone(),
                     dev_secret: format!("entangrid-dev-secret-{validator_id}"),
                     public_identity: deterministic_public_identity(validator_id),
+                    session_public_identity: SessionPublicIdentity::default(),
                 },
                 signing_backend: SigningBackendKind::DevDeterministic,
                 signing_key_path: None,
@@ -341,6 +343,7 @@ pub fn init_localnet(
                     address: address.clone(),
                     dev_secret: format!("entangrid-dev-secret-{validator_id}"),
                     public_identity: deterministic_public_identity(validator_id),
+                    session_public_identity: SessionPublicIdentity::default(),
                 },
                 signing_backend: SigningBackendKind::DevDeterministic,
                 signing_key_path: None,
@@ -413,6 +416,8 @@ pub fn init_localnet(
             sync_on_startup: true,
             signing_backend: material.signing_backend.clone(),
             signing_key_path: material.signing_key_path.clone(),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let config_path = node_dir.join("node.toml");
         fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -467,6 +472,7 @@ fn generate_hybrid_validator_material(
             address: format!("127.0.0.1:{}", 4100 + (validator_id - 1)),
             dev_secret: format!("entangrid-dev-secret-{validator_id}"),
             public_identity,
+            session_public_identity: SessionPublicIdentity::default(),
         },
         SigningBackendKind::HybridDeterministicMlDsaExperimental,
         key_path.display().to_string(),
@@ -2140,6 +2146,7 @@ fn build_measurement_validators(
             } else {
                 deterministic_public_identity(validator_id)
             },
+            session_public_identity: SessionPublicIdentity::default(),
         })
         .collect()
 }
@@ -2179,6 +2186,8 @@ fn deterministic_measurement_config() -> NodeConfig {
         sync_on_startup: true,
         signing_backend: SigningBackendKind::DevDeterministic,
         signing_key_path: None,
+        session_backend: SessionBackendKind::DevDeterministic,
+        session_key_path: None,
     }
 }
 
@@ -2208,6 +2217,8 @@ fn ml_dsa_measurement_setup(validator_count: usize) -> Result<(GenesisConfig, No
     let config = NodeConfig {
         signing_backend: SigningBackendKind::MlDsa65Experimental,
         signing_key_path: Some(key_path.display().to_string()),
+        session_backend: SessionBackendKind::DevDeterministic,
+        session_key_path: None,
         ..deterministic_measurement_config()
     };
     Ok((genesis, config))
@@ -2937,6 +2948,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
                     public_identity: entangrid_types::PublicIdentity::default(),
+                    session_public_identity: SessionPublicIdentity::default(),
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),

@@ -8,6 +8,8 @@ use entangrid_types::{
     GenesisConfig, HashBytes, NodeConfig, PublicIdentity, PublicKeyScheme, SignatureScheme,
     SigningBackendKind, TypedSignature, ValidatorConfig, ValidatorId, hash_many,
 };
+#[cfg(test)]
+use entangrid_types::{SessionBackendKind, SessionPublicIdentity};
 #[cfg(feature = "pq-ml-dsa")]
 use ml_dsa::{
     EncodedSigningKey, EncodedVerifyingKey, MlDsa65, Signature as MlDsaSignature,
@@ -742,6 +744,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -767,6 +770,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -796,6 +800,7 @@ mod tests {
                     PublicKeyScheme::DevDeterministic,
                     b"validator-1".to_vec(),
                 ),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -812,6 +817,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::DevDeterministic,
             signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let backend = build_crypto_backend(&genesis, &config).unwrap();
         let signature = backend.sign(1, b"factory").unwrap();
@@ -837,6 +844,7 @@ mod tests {
                     PublicKeyScheme::DevDeterministic,
                     b"wrong-validator".to_vec(),
                 ),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -853,6 +861,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::DevDeterministic,
             signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected deterministic identity mismatch"),
@@ -882,6 +892,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: deterministic_public_identity(1),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -898,6 +909,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::DevDeterministic,
             signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let report = measure_signing_backend(
             "deterministic",
@@ -936,6 +949,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::single(PublicKeyScheme::MlDsa, vec![7, 7, 7]),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -952,6 +966,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::MlDsa65Experimental,
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected ML-DSA feature gate failure"),
@@ -999,6 +1015,7 @@ mod tests {
                     PublicKeyScheme::MlDsa,
                     verifying_key.encode().as_slice().to_vec(),
                 ),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -1015,6 +1032,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::MlDsa65Experimental,
             signing_key_path: Some(key_path.display().to_string()),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let backend = build_crypto_backend(&genesis, &config).unwrap();
         let signature = backend.sign(1, b"ml-dsa-backend").unwrap();
@@ -1060,6 +1079,7 @@ mod tests {
                     PublicKeyScheme::MlDsa,
                     verifying_key.encode().as_slice().to_vec(),
                 ),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -1076,6 +1096,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::MlDsa65Experimental,
             signing_key_path: Some(key_path.display().to_string()),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let report =
             measure_signing_backend("ml-dsa", &genesis, &config, 1, b"stage1c-measurement", 4)
@@ -1115,6 +1137,7 @@ mod tests {
                     },
                 ])
                 .unwrap(),
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -1131,6 +1154,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend: SigningBackendKind::HybridDeterministicMlDsaExperimental,
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected hybrid feature gate failure"),
@@ -1189,6 +1214,7 @@ mod tests {
                 address: "127.0.0.1:3001".into(),
                 dev_secret: "secret-1".into(),
                 public_identity,
+                session_public_identity: SessionPublicIdentity::default(),
             }],
             initial_balances: Default::default(),
         };
@@ -1205,6 +1231,8 @@ mod tests {
             sync_on_startup: true,
             signing_backend,
             signing_key_path: key_path,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         (genesis, config)
     }

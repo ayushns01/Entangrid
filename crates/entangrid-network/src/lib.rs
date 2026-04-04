@@ -484,7 +484,7 @@ mod tests {
     use super::*;
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::HeartbeatPulse;
-    use entangrid_types::{GenesisConfig, PublicIdentity, ValidatorConfig};
+    use entangrid_types::{GenesisConfig, PublicIdentity, SessionPublicIdentity, ValidatorConfig};
     use std::io::Error;
     use tokio::{
         net::TcpListener,
@@ -500,6 +500,7 @@ mod tests {
                 address: "127.0.0.1:4100".into(),
                 dev_secret: "secret-1".into(),
                 public_identity: PublicIdentity::default(),
+                session_public_identity: SessionPublicIdentity::default(),
             },
             ValidatorConfig {
                 validator_id: 2,
@@ -507,6 +508,7 @@ mod tests {
                 address: "127.0.0.1:4101".into(),
                 dev_secret: "secret-2".into(),
                 public_identity: PublicIdentity::default(),
+                session_public_identity: SessionPublicIdentity::default(),
             },
         ]
     }

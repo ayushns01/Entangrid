@@ -42,6 +42,19 @@ impl Default for PublicKeyScheme {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SessionKeyScheme {
+    DevDeterministic,
+    MlKem,
+    Hybrid,
+}
+
+impl Default for SessionKeyScheme {
+    fn default() -> Self {
+        Self::DevDeterministic
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum SigningBackendKind {
     DevDeterministic,
@@ -50,6 +63,19 @@ pub enum SigningBackendKind {
 }
 
 impl Default for SigningBackendKind {
+    fn default() -> Self {
+        Self::DevDeterministic
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionBackendKind {
+    DevDeterministic,
+    HybridDeterministicMlKemExperimental,
+}
+
+impl Default for SessionBackendKind {
     fn default() -> Self {
         Self::DevDeterministic
     }
@@ -310,6 +336,12 @@ pub struct PublicIdentityComponent {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionPublicIdentityComponent {
+    pub scheme: SessionKeyScheme,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PublicIdentity {
     pub scheme: PublicKeyScheme,
@@ -557,6 +589,259 @@ impl PublicIdentity {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionPublicIdentity {
+    pub scheme: SessionKeyScheme,
+    pub bytes: Vec<u8>,
+    pub components: Vec<SessionPublicIdentityComponent>,
+}
+
+impl Default for SessionPublicIdentity {
+    fn default() -> Self {
+        Self::single(SessionKeyScheme::DevDeterministic, Vec::new())
+    }
+}
+
+impl Serialize for SessionPublicIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            let field_count = if self.components.is_empty() { 2 } else { 3 };
+            let mut state = serializer.serialize_struct("SessionPublicIdentity", field_count)?;
+            state.serialize_field("scheme", &self.scheme)?;
+            state.serialize_field("bytes", &self.bytes)?;
+            if !self.components.is_empty() {
+                state.serialize_field("components", &self.components)?;
+            }
+            state.end()
+        } else {
+            let payload = if self.scheme == SessionKeyScheme::Hybrid {
+                bincode::serde::encode_to_vec(&self.components, standard())
+                    .map_err(serde::ser::Error::custom)?
+            } else {
+                self.bytes.clone()
+            };
+            let mut state = serializer.serialize_struct("SessionPublicIdentity", 2)?;
+            state.serialize_field("scheme", &self.scheme)?;
+            state.serialize_field("bytes", &payload)?;
+            state.end()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionPublicIdentity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &["scheme", "bytes", "components"];
+
+        enum Field {
+            Scheme,
+            Bytes,
+            Components,
+        }
+
+        impl<'de> Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl<'de> Visitor<'de> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("`scheme`, `bytes`, or `components`")
+                    }
+
+                    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+                    where
+                        E: de::Error,
+                    {
+                        match value {
+                            "scheme" => Ok(Field::Scheme),
+                            "bytes" => Ok(Field::Bytes),
+                            "components" => Ok(Field::Components),
+                            _ => Err(de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct SessionPublicIdentityVisitor;
+
+        impl<'de> Visitor<'de> for SessionPublicIdentityVisitor {
+            type Value = SessionPublicIdentity;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a session public identity")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let scheme = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+                let bytes = seq
+                    .next_element()?
+                    .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+                let components = seq.next_element()?.unwrap_or_default();
+                Ok(SessionPublicIdentity {
+                    scheme,
+                    bytes,
+                    components,
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut scheme = None;
+                let mut bytes = None;
+                let mut components = None;
+                while let Some(key) = map.next_key()? {
+                    match key {
+                        Field::Scheme => {
+                            if scheme.is_some() {
+                                return Err(de::Error::duplicate_field("scheme"));
+                            }
+                            scheme = Some(map.next_value()?);
+                        }
+                        Field::Bytes => {
+                            if bytes.is_some() {
+                                return Err(de::Error::duplicate_field("bytes"));
+                            }
+                            bytes = Some(map.next_value()?);
+                        }
+                        Field::Components => {
+                            if components.is_some() {
+                                return Err(de::Error::duplicate_field("components"));
+                            }
+                            components = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(SessionPublicIdentity {
+                    scheme: scheme.ok_or_else(|| de::Error::missing_field("scheme"))?,
+                    bytes: bytes.ok_or_else(|| de::Error::missing_field("bytes"))?,
+                    components: components.unwrap_or_default(),
+                })
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_struct(
+                "SessionPublicIdentity",
+                FIELDS,
+                SessionPublicIdentityVisitor,
+            )
+        } else {
+            #[derive(Deserialize)]
+            struct BinarySessionPublicIdentity {
+                scheme: SessionKeyScheme,
+                bytes: Vec<u8>,
+            }
+
+            let raw = BinarySessionPublicIdentity::deserialize(deserializer)?;
+            if raw.scheme == SessionKeyScheme::Hybrid {
+                let (components, consumed): (Vec<SessionPublicIdentityComponent>, usize) =
+                    bincode::serde::decode_from_slice(&raw.bytes, standard())
+                        .map_err(de::Error::custom)?;
+                if consumed != raw.bytes.len() {
+                    return Err(de::Error::custom(
+                        "hybrid session public identity payload contained trailing bytes",
+                    ));
+                }
+                Ok(SessionPublicIdentity {
+                    scheme: SessionKeyScheme::Hybrid,
+                    bytes: Vec::new(),
+                    components,
+                })
+            } else {
+                Ok(SessionPublicIdentity {
+                    scheme: raw.scheme,
+                    bytes: raw.bytes,
+                    components: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+impl SessionPublicIdentity {
+    pub fn single(scheme: SessionKeyScheme, bytes: Vec<u8>) -> Self {
+        Self {
+            scheme,
+            bytes,
+            components: Vec::new(),
+        }
+    }
+
+    pub fn try_hybrid(components: Vec<SessionPublicIdentityComponent>) -> Result<Self, String> {
+        if components.is_empty() {
+            return Err("hybrid session public identity requires at least one component".into());
+        }
+        let mut seen = Vec::new();
+        for component in &components {
+            if component.scheme == SessionKeyScheme::Hybrid {
+                return Err(
+                    "hybrid session public identity cannot contain a nested hybrid component"
+                        .into(),
+                );
+            }
+            if seen.contains(&component.scheme) {
+                return Err(
+                    "hybrid session public identity cannot contain duplicate component schemes"
+                        .into(),
+                );
+            }
+            seen.push(component.scheme.clone());
+        }
+        Ok(Self {
+            scheme: SessionKeyScheme::Hybrid,
+            bytes: Vec::new(),
+            components,
+        })
+    }
+
+    pub fn scheme(&self) -> SessionKeyScheme {
+        self.scheme.clone()
+    }
+
+    pub fn as_single_bytes(&self) -> Option<&[u8]> {
+        if self.scheme == SessionKeyScheme::Hybrid {
+            None
+        } else {
+            Some(self.bytes.as_slice())
+        }
+    }
+
+    pub fn components(&self) -> &[SessionPublicIdentityComponent] {
+        self.components.as_slice()
+    }
+
+    pub fn component_bytes(&self, scheme: SessionKeyScheme) -> Option<&[u8]> {
+        if self.scheme == scheme && self.scheme != SessionKeyScheme::Hybrid {
+            Some(self.bytes.as_slice())
+        } else {
+            self.components
+                .iter()
+                .find(|component| component.scheme == scheme)
+                .map(|component| component.bytes.as_slice())
+        }
+    }
+}
+
 pub const RECOMMENDED_SERVICE_GATING_START_EPOCH: Epoch = 3;
 pub const RECOMMENDED_SERVICE_GATING_THRESHOLD: f64 = 0.40;
 pub const RECOMMENDED_SERVICE_SCORE_WINDOW_EPOCHS: u64 = 4;
@@ -611,6 +896,8 @@ pub struct ValidatorConfig {
     pub address: String,
     pub dev_secret: String,
     pub public_identity: PublicIdentity,
+    #[serde(default)]
+    pub session_public_identity: SessionPublicIdentity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -642,6 +929,30 @@ pub struct NodeConfig {
     pub signing_backend: SigningBackendKind,
     #[serde(default)]
     pub signing_key_path: Option<String>,
+    #[serde(default)]
+    pub session_backend: SessionBackendKind,
+    #[serde(default)]
+    pub session_key_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionClientHello {
+    pub initiator_validator_id: ValidatorId,
+    pub responder_validator_id: ValidatorId,
+    pub nonce: HashBytes,
+    pub session_public_identity: SessionPublicIdentity,
+    pub kem_public_material: Vec<u8>,
+    pub signature: TypedSignature,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionServerHello {
+    pub responder_validator_id: ValidatorId,
+    pub initiator_validator_id: ValidatorId,
+    pub nonce: HashBytes,
+    pub session_public_identity: SessionPublicIdentity,
+    pub kem_ciphertext: Vec<u8>,
+    pub signature: TypedSignature,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1282,6 +1593,118 @@ disable_outbound = false
     }
 
     #[test]
+    fn session_key_scheme_round_trips_through_toml_and_bincode() {
+        #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+        struct SessionKeySchemeWrapper {
+            scheme: SessionKeyScheme,
+        }
+
+        let scheme = SessionKeyScheme::MlKem;
+        let wrapper = SessionKeySchemeWrapper {
+            scheme: scheme.clone(),
+        };
+        let serialized = toml::to_string(&wrapper).unwrap();
+        let parsed: SessionKeySchemeWrapper = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed, wrapper);
+
+        let bytes = bincode::serde::encode_to_vec(&scheme, bincode::config::standard()).unwrap();
+        let (decoded, _): (SessionKeyScheme, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, scheme);
+    }
+
+    #[test]
+    fn session_public_identity_round_trips_with_single_and_hybrid_components() {
+        let single = SessionPublicIdentity::single(SessionKeyScheme::DevDeterministic, vec![1, 2, 3]);
+        let single_toml = toml::to_string(&single).unwrap();
+        let parsed_single: SessionPublicIdentity = toml::from_str(&single_toml).unwrap();
+        assert_eq!(parsed_single, single);
+
+        let hybrid = SessionPublicIdentity::try_hybrid(vec![
+            SessionPublicIdentityComponent {
+                scheme: SessionKeyScheme::DevDeterministic,
+                bytes: vec![4, 5],
+            },
+            SessionPublicIdentityComponent {
+                scheme: SessionKeyScheme::MlKem,
+                bytes: vec![6, 7, 8],
+            },
+        ])
+        .unwrap();
+        let bytes = bincode::serde::encode_to_vec(&hybrid, bincode::config::standard()).unwrap();
+        let (decoded, _): (SessionPublicIdentity, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, hybrid);
+        assert_eq!(decoded.scheme(), SessionKeyScheme::Hybrid);
+        assert_eq!(decoded.component_bytes(SessionKeyScheme::MlKem), Some([6, 7, 8].as_slice()));
+    }
+
+    #[test]
+    fn validator_config_carries_separate_session_public_identity() {
+        let validator = ValidatorConfig {
+            validator_id: 42,
+            stake: 7,
+            address: "127.0.0.1:4042".into(),
+            dev_secret: "secret-42".into(),
+            public_identity: PublicIdentity::single(PublicKeyScheme::DevDeterministic, vec![1, 1, 1]),
+            session_public_identity: SessionPublicIdentity::single(
+                SessionKeyScheme::MlKem,
+                vec![2, 2, 2],
+            ),
+        };
+        let serialized = toml::to_string(&validator).unwrap();
+        let parsed: ValidatorConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.public_identity, validator.public_identity);
+        assert_eq!(
+            parsed.session_public_identity,
+            validator.session_public_identity
+        );
+        assert_ne!(parsed.public_identity.bytes, parsed.session_public_identity.bytes);
+    }
+
+    #[test]
+    fn session_handshake_wire_structs_round_trip_through_bincode() {
+        let client = SessionClientHello {
+            initiator_validator_id: 1,
+            responder_validator_id: 2,
+            nonce: [3; 32],
+            session_public_identity: SessionPublicIdentity::single(
+                SessionKeyScheme::DevDeterministic,
+                vec![4, 4, 4],
+            ),
+            kem_public_material: vec![5, 6, 7],
+            signature: TypedSignature::single(SignatureScheme::DevDeterministic, vec![8, 9]),
+        };
+        let client_bytes = bincode::serde::encode_to_vec(&client, bincode::config::standard()).unwrap();
+        let (decoded_client, _): (SessionClientHello, usize) =
+            bincode::serde::decode_from_slice(&client_bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded_client, client);
+
+        let server = SessionServerHello {
+            responder_validator_id: 2,
+            initiator_validator_id: 1,
+            nonce: [3; 32],
+            session_public_identity: SessionPublicIdentity::try_hybrid(vec![
+                SessionPublicIdentityComponent {
+                    scheme: SessionKeyScheme::DevDeterministic,
+                    bytes: vec![4, 4, 4],
+                },
+                SessionPublicIdentityComponent {
+                    scheme: SessionKeyScheme::MlKem,
+                    bytes: vec![7, 7, 7],
+                },
+            ])
+            .unwrap(),
+            kem_ciphertext: vec![10, 11, 12],
+            signature: TypedSignature::single(SignatureScheme::DevDeterministic, vec![13, 14]),
+        };
+        let server_bytes = bincode::serde::encode_to_vec(&server, bincode::config::standard()).unwrap();
+        let (decoded_server, _): (SessionServerHello, usize) =
+            bincode::serde::decode_from_slice(&server_bytes, bincode::config::standard()).unwrap();
+        assert_eq!(decoded_server, server);
+    }
+
+    #[test]
     fn legacy_single_signature_encoding_still_round_trips_through_typed_signature() {
         #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
         struct LegacyTypedSignature {
@@ -1462,6 +1885,8 @@ disable_outbound = false
         let parsed: NodeConfig = toml::from_str(config).unwrap();
         assert_eq!(parsed.signing_backend, SigningBackendKind::DevDeterministic);
         assert_eq!(parsed.signing_key_path, None);
+        assert_eq!(parsed.session_backend, SessionBackendKind::DevDeterministic);
+        assert_eq!(parsed.session_key_path, None);
     }
 
     #[test]
@@ -1515,6 +1940,8 @@ disable_outbound = false
             sync_on_startup: true,
             signing_backend: SigningBackendKind::MlDsa65Experimental,
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
         };
         let serialized = toml::to_string(&config).unwrap();
         let decoded: NodeConfig = toml::from_str(&serialized).unwrap();
