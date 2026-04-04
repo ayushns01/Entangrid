@@ -6,11 +6,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use entangrid_crypto::CryptoBackend;
+use entangrid_crypto::{CryptoBackend, SessionMaterial};
 use entangrid_types::{
-    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SignedEnvelope, ValidatorId,
-    canonical_hash,
+    FaultProfile, HashBytes, NodeMetrics, PeerConfig, ProtocolMessage, SessionClientHello,
+    SessionServerHello, SignedEnvelope, ValidatorId, canonical_hash, now_unix_millis,
 };
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -65,6 +66,11 @@ struct OutboundRequest {
     peer: PeerConfig,
     payload: ProtocolMessage,
     service_accountable: bool,
+}
+
+struct EstablishedOutboundStream {
+    stream: TcpStream,
+    session: SessionMaterial,
 }
 
 impl NetworkHandle {
@@ -240,6 +246,75 @@ pub async fn spawn_network(
     })
 }
 
+fn session_nonce(local_validator_id: ValidatorId, peer_validator_id: ValidatorId) -> HashBytes {
+    canonical_hash(&(
+        "entangrid-network-session",
+        local_validator_id,
+        peer_validator_id,
+        now_unix_millis(),
+    ))
+}
+
+async fn read_frame_bytes(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+    let frame_len = match stream.read_u32().await {
+        Ok(length) => length as usize,
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if frame_len > MAX_FRAME_SIZE_BYTES {
+        return Err(anyhow!(
+            "frame length {frame_len} exceeds max {}",
+            MAX_FRAME_SIZE_BYTES
+        ));
+    }
+    let mut frame = vec![0u8; frame_len];
+    stream.read_exact(&mut frame).await?;
+    Ok(Some(frame))
+}
+
+fn decode_frame<T: DeserializeOwned>(bytes: &[u8], frame_kind: &str) -> Result<T> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::standard())
+        .map(|(decoded, _)| decoded)
+        .map_err(|error| anyhow!("failed to decode {frame_kind}: {error}"))
+}
+
+async fn write_bincode_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+    write_frame(stream, &bytes).await?;
+    Ok(())
+}
+
+async fn run_outbound_handshake(
+    stream: &mut TcpStream,
+    local_validator_id: ValidatorId,
+    peer_validator_id: ValidatorId,
+    crypto: Arc<dyn CryptoBackend>,
+) -> Result<SessionMaterial> {
+    let client_hello =
+        crypto.build_client_hello(local_validator_id, peer_validator_id, session_nonce(local_validator_id, peer_validator_id))?;
+    write_bincode_frame(stream, &client_hello).await?;
+    let server_hello_bytes = read_frame_bytes(stream)
+        .await?
+        .ok_or_else(|| anyhow!("expected server hello before stream closed"))?;
+    let server_hello: SessionServerHello = decode_frame(&server_hello_bytes, "server hello")?;
+    crypto.finalize_client_session(local_validator_id, &client_hello, &server_hello)
+}
+
+async fn accept_inbound_handshake(
+    stream: &mut TcpStream,
+    local_validator_id: ValidatorId,
+    crypto: Arc<dyn CryptoBackend>,
+) -> Result<(ValidatorId, SessionMaterial)> {
+    let client_hello_bytes = read_frame_bytes(stream)
+        .await?
+        .ok_or_else(|| anyhow!("expected client hello before stream closed"))?;
+    let client_hello: SessionClientHello = decode_frame(&client_hello_bytes, "client hello")?;
+    let peer_validator_id = client_hello.initiator_validator_id;
+    let (server_hello, session) = crypto.accept_client_hello(local_validator_id, &client_hello)?;
+    write_bincode_frame(stream, &server_hello).await?;
+    Ok((peer_validator_id, session))
+}
+
 async fn send_message(
     local_validator_id: ValidatorId,
     request: OutboundRequest,
@@ -247,7 +322,7 @@ async fn send_message(
     crypto: Arc<dyn CryptoBackend>,
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
-    stream: &mut Option<TcpStream>,
+    stream: &mut Option<EstablishedOutboundStream>,
 ) -> Result<()> {
     if fault_profile.disable_outbound {
         let _ = event_tx.send(NetworkEvent::SessionFailed {
@@ -272,16 +347,9 @@ async fn send_message(
         return Ok(());
     }
 
-    update_metrics(&metrics, |metrics| {
-        metrics.handshake_attempts += 1;
-    });
-
     if fault_profile.artificial_delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(fault_profile.artificial_delay_ms)).await;
     }
-
-    let session =
-        crypto.open_session(local_validator_id, request.peer.validator_id, &message_hash)?;
     let signature = crypto.sign(local_validator_id, &message_hash)?;
     let envelope = SignedEnvelope {
         from_validator_id: local_validator_id,
@@ -289,28 +357,62 @@ async fn send_message(
         signature,
         payload: request.payload,
     };
-
     let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
     let mut retried = false;
     loop {
         if stream.is_none() {
-            let connected = connect_with_retries(&request.peer.address).await?;
+            let mut connected = connect_with_retries(&request.peer.address).await?;
             connected.set_nodelay(true)?;
-            *stream = Some(connected);
+            update_metrics(&metrics, |metrics| {
+                metrics.handshake_attempts += 1;
+            });
+            let session = match run_outbound_handshake(
+                &mut connected,
+                local_validator_id,
+                request.peer.validator_id,
+                Arc::clone(&crypto),
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    update_metrics(&metrics, |metrics| {
+                        metrics.handshake_failures += 1;
+                        metrics.active_sessions = 0;
+                    });
+                    return Err(error);
+                }
+            };
+            update_metrics(&metrics, |metrics| {
+                metrics.active_sessions = 1;
+            });
+            *stream = Some(EstablishedOutboundStream {
+                stream: connected,
+                session,
+            });
         }
 
-        match write_frame(stream.as_mut().expect("stream populated"), &bytes).await {
+        let established = stream.as_mut().expect("stream populated");
+        match write_frame(&mut established.stream, &bytes).await {
             Ok(()) => break,
             Err(error) if !retried && is_retryable_stream_error(&error) => {
+                update_metrics(&metrics, |metrics| {
+                    metrics.active_sessions = 0;
+                });
                 *stream = None;
                 retried = true;
             }
             Err(error) => {
+                update_metrics(&metrics, |metrics| {
+                    metrics.active_sessions = 0;
+                });
                 *stream = None;
                 return Err(error.into());
             }
         }
     }
+
+    let session = &stream.as_ref().expect("stream retained").session;
 
     let _ = event_tx.send(NetworkEvent::SessionObserved {
         peer_validator_id: request.peer.validator_id,
@@ -321,7 +423,6 @@ async fn send_message(
 
     update_metrics(&metrics, |metrics| {
         metrics.bytes_sent += bytes.len() as u64;
-        metrics.active_sessions = 0;
     });
     Ok(())
 }
@@ -333,31 +434,44 @@ async fn handle_inbound(
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
-    loop {
-        let frame_len = match stream.read_u32().await {
-            Ok(length) => length as usize,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        if frame_len > MAX_FRAME_SIZE_BYTES {
+    update_metrics(&metrics, |metrics| {
+        metrics.handshake_attempts += 1;
+    });
+    let (peer_validator_id, session) = match accept_inbound_handshake(
+        &mut stream,
+        local_validator_id,
+        Arc::clone(&crypto),
+    )
+    .await
+    {
+        Ok(handshake) => {
+            update_metrics(&metrics, |metrics| {
+                metrics.active_sessions = 1;
+            });
+            handshake
+        }
+        Err(error) => {
             update_metrics(&metrics, |metrics| {
                 metrics.handshake_failures += 1;
                 metrics.active_sessions = 0;
             });
-            return Err(anyhow!(
-                "frame length {frame_len} exceeds max {}",
-                MAX_FRAME_SIZE_BYTES
-            ));
+            return Err(error);
         }
-        let mut frame = vec![0u8; frame_len];
-        stream.read_exact(&mut frame).await?;
+    };
 
-        let (envelope, _): (SignedEnvelope, usize) =
-            bincode::serde::decode_from_slice(&frame, bincode::config::standard())?;
+    loop {
+        let frame = match read_frame_bytes(&mut stream).await? {
+            Some(frame) => frame,
+            None => {
+                update_metrics(&metrics, |metrics| {
+                    metrics.active_sessions = 0;
+                });
+                return Ok(());
+            }
+        };
+        let envelope: SignedEnvelope = decode_frame(&frame, "signed envelope")?;
         update_metrics(&metrics, |metrics| {
-            metrics.bytes_received += frame_len as u64;
-            metrics.handshake_attempts += 1;
-            metrics.active_sessions = 1;
+            metrics.bytes_received += frame.len() as u64;
         });
 
         let expected_hash = canonical_hash(&envelope.payload);
@@ -368,14 +482,20 @@ async fn handle_inbound(
             });
             return Err(anyhow!("payload hash mismatch"));
         }
+        if envelope.from_validator_id != peer_validator_id {
+            update_metrics(&metrics, |metrics| {
+                metrics.handshake_failures += 1;
+                metrics.active_sessions = 0;
+            });
+            return Err(anyhow!(
+                "envelope validator {} does not match established peer {}",
+                envelope.from_validator_id,
+                peer_validator_id
+            ));
+        }
 
-        let session = crypto.open_session(
-            local_validator_id,
-            envelope.from_validator_id,
-            &envelope.message_hash,
-        )?;
         let _ = event_tx.send(NetworkEvent::SessionObserved {
-            peer_validator_id: envelope.from_validator_id,
+            peer_validator_id,
             transcript_hash: session.transcript_hash,
             outbound: false,
             service_accountable: true,
@@ -399,7 +519,7 @@ async fn handle_inbound(
         let _ = event_tx.send(NetworkEvent::Received {
             from_validator_id: envelope.from_validator_id,
             payload: envelope.payload,
-            bytes: frame_len,
+            bytes: frame.len(),
         });
     }
 }
@@ -482,10 +602,11 @@ fn update_metrics(metrics: &Arc<Mutex<NodeMetrics>>, update: impl FnOnce(&mut No
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+    use entangrid_crypto::{DeterministicCryptoBackend, HandshakeProvider, Signer};
     use entangrid_types::HeartbeatPulse;
-    use entangrid_types::{GenesisConfig, PublicIdentity, SessionPublicIdentity, ValidatorConfig};
+    use entangrid_types::{GenesisConfig, PublicIdentity, SessionClientHello, SessionServerHello, ValidatorConfig};
     use std::io::Error;
+    use std::os::fd::AsRawFd;
     use tokio::{
         net::TcpListener,
         sync::mpsc,
@@ -532,6 +653,40 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         drop(listener);
         address
+    }
+
+    async fn read_bincode_frame<T: serde::de::DeserializeOwned>(stream: &mut TcpStream) -> T {
+        let frame_len = stream.read_u32().await.unwrap() as usize;
+        let mut frame = vec![0u8; frame_len];
+        stream.read_exact(&mut frame).await.unwrap();
+        let (decoded, _): (T, usize) =
+            bincode::serde::decode_from_slice(&frame, bincode::config::standard()).unwrap();
+        decoded
+    }
+
+    async fn write_bincode_frame<T: serde::Serialize>(stream: &mut TcpStream, value: &T) {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard()).unwrap();
+        stream.write_u32(bytes.len() as u32).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    fn abort_tcp_stream(stream: std::net::TcpStream) {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                &linger as *const libc::linger as *const libc::c_void,
+                std::mem::size_of::<libc::linger>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0, "failed to set SO_LINGER=0 for reconnect test");
+        drop(stream);
     }
 
     #[test]
@@ -672,21 +827,17 @@ mod tests {
             .await
             .expect("accepted in time")
             .unwrap();
-        let first_len = stream.read_u32().await.unwrap() as usize;
-        let mut first_frame = vec![0u8; first_len];
-        stream.read_exact(&mut first_frame).await.unwrap();
-        let (first, _): (SignedEnvelope, usize) =
-            bincode::serde::decode_from_slice(&first_frame, bincode::config::standard()).unwrap();
+        let server_crypto = DeterministicCryptoBackend::from_validators(&validators);
+        let client_hello: SessionClientHello = read_bincode_frame(&mut stream).await;
+        let (server_hello, _) = server_crypto.accept_client_hello(2, &client_hello).unwrap();
+        write_bincode_frame(&mut stream, &server_hello).await;
+
+        let first: SignedEnvelope = read_bincode_frame(&mut stream).await;
         assert_eq!(first.payload, payload_one);
 
-        let second_len = timeout(Duration::from_secs(2), stream.read_u32())
+        let second: SignedEnvelope = timeout(Duration::from_secs(2), read_bincode_frame(&mut stream))
             .await
-            .expect("second frame on same stream")
-            .unwrap() as usize;
-        let mut second_frame = vec![0u8; second_len];
-        stream.read_exact(&mut second_frame).await.unwrap();
-        let (second, _): (SignedEnvelope, usize) =
-            bincode::serde::decode_from_slice(&second_frame, bincode::config::standard()).unwrap();
+            .expect("second frame on same stream");
         assert_eq!(second.payload, payload_two);
         assert!(
             timeout(Duration::from_millis(200), listener.accept())
@@ -723,6 +874,12 @@ mod tests {
 
         let client_crypto = DeterministicCryptoBackend::from_genesis(&genesis);
         let mut stream = TcpStream::connect(&listen_address).await.unwrap();
+        let client_hello = client_crypto.build_client_hello(1, 2, [7; 32]).unwrap();
+        write_bincode_frame(&mut stream, &client_hello).await;
+        let server_hello: SessionServerHello = read_bincode_frame(&mut stream).await;
+        client_crypto
+            .finalize_client_session(1, &client_hello, &server_hello)
+            .unwrap();
         for slot in [1u64, 2u64] {
             let payload = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
                 epoch: 0,
@@ -738,11 +895,7 @@ mod tests {
                 signature: client_crypto.sign(1, &message_hash).unwrap(),
                 payload,
             };
-            let bytes =
-                bincode::serde::encode_to_vec(&envelope, bincode::config::standard()).unwrap();
-            stream.write_u32(bytes.len() as u32).await.unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            stream.flush().await.unwrap();
+            write_bincode_frame(&mut stream, &envelope).await;
         }
 
         let mut received = Vec::new();
@@ -774,5 +927,153 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_rejects_frames_before_handshake_success() {
+        let listen_address = reserve_local_address().await;
+        let genesis = sample_genesis();
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_genesis(&genesis));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 2,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let _network = spawn_network(
+            2,
+            listen_address.clone(),
+            vec![PeerConfig {
+                validator_id: 1,
+                address: reserve_local_address().await,
+            }],
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            Arc::clone(&metrics),
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let client_crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let mut stream = TcpStream::connect(&listen_address).await.unwrap();
+        let payload = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let message_hash = canonical_hash(&payload);
+        let envelope = SignedEnvelope {
+            from_validator_id: 1,
+            message_hash,
+            signature: client_crypto.sign(1, &message_hash).unwrap(),
+            payload,
+        };
+        write_bincode_frame(&mut stream, &envelope).await;
+
+        let event = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("event in time")
+            .expect("event received");
+        match event {
+            NetworkEvent::SessionFailed { detail, .. } => {
+                assert!(detail.contains("client hello") || detail.contains("handshake"));
+            }
+            other => panic!("expected SessionFailed, got {other:?}"),
+        }
+        assert_eq!(metrics.lock().unwrap().handshake_failures, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_replays_full_handshake_before_resuming_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap().to_string();
+        let local_address = reserve_local_address().await;
+        let validators = sample_validators();
+        let crypto: Arc<dyn CryptoBackend> =
+            Arc::new(DeterministicCryptoBackend::from_validators(&validators));
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            1,
+            local_address,
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            FaultProfile::default(),
+            Arc::clone(&crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let payload_one = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_one.clone(),
+            )
+            .unwrap();
+
+        let server_crypto = DeterministicCryptoBackend::from_validators(&validators);
+        let (mut first_stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted first connection")
+            .unwrap();
+        let first_client_hello: SessionClientHello = read_bincode_frame(&mut first_stream).await;
+        let (first_server_hello, _) = server_crypto
+            .accept_client_hello(2, &first_client_hello)
+            .unwrap();
+        write_bincode_frame(&mut first_stream, &first_server_hello).await;
+        let first_envelope: SignedEnvelope = read_bincode_frame(&mut first_stream).await;
+        assert_eq!(first_envelope.payload, payload_one);
+        abort_tcp_stream(first_stream.into_std().unwrap());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let payload_two = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 2,
+            source_validator_id: 1,
+            sequence_number: 2,
+            emitted_at_unix_millis: 2,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_two.clone(),
+            )
+            .unwrap();
+
+        let (mut second_stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted second connection")
+            .unwrap();
+        let second_client_hello: SessionClientHello = read_bincode_frame(&mut second_stream).await;
+        assert_ne!(first_client_hello.nonce, second_client_hello.nonce);
+        let (second_server_hello, _) = server_crypto
+            .accept_client_hello(2, &second_client_hello)
+            .unwrap();
+        write_bincode_frame(&mut second_stream, &second_server_hello).await;
+        let second_envelope: SignedEnvelope = read_bincode_frame(&mut second_stream).await;
+        assert_eq!(second_envelope.payload, payload_two);
     }
 }

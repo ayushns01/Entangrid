@@ -302,6 +302,8 @@ dependencies = [
  "bincode",
  "entangrid-crypto",
  "entangrid-types",
+ "libc",
+ "serde",
  "tokio",
 ]
 

@@ -13,4 +13,8 @@ anyhow.workspace = true
 bincode.workspace = true
 entangrid-crypto = { path = "../entangrid-crypto" }
 entangrid-types = { path = "../entangrid-types" }
+serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+libc = "0.2"
