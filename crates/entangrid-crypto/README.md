@@ -71,13 +71,14 @@ The current PQ branch now also supports:
 - a feature-gated per-stream handshake behind `pq-ml-kem` using `SessionClientHello` / `SessionServerHello`
 - mutually signed handshake transcripts that bind the transport session to validator signing identities
 - session material derived from the existing deterministic component plus an ML-KEM component when `HybridDeterministicMlKemExperimental` is selected
+- Stage 1I encrypted framing over that hybrid session using ChaCha20-Poly1305 for every post-handshake frame body while leaving the handshake and outer frame length plaintext
 
 Current enforcement boundary:
 
 - blocks: enforced when the flag is on
 - proposal votes, including votes imported via quorum certificates: enforced when the flag is on
 - transactions, receipts, and service evidence: not enforced yet
-- Stage 1G establishes authenticated session material only; it does not encrypt frames yet
+- hybrid transport sessions now authenticate the handshake and encrypt later frame bodies automatically
 
 ## How to measure ML-DSA signing right now
 
@@ -144,7 +145,7 @@ Current PQ branch focus:
   - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
   - add a feature-gated hybrid ML-KEM session handshake behind `pq-ml-kem`
 - that branch now covers signing/authentication plus handshake-only session establishment
-- encrypted framing, session rotation, and simulator-generated KEM key material still come later
+- session rotation and richer transport hardening still come later
 
 ## Why this crate matters
 

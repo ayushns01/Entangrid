@@ -2,6 +2,11 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::{Result, anyhow};
 use bincode::config::standard;
+#[cfg(feature = "pq-ml-kem")]
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    aead::{AeadInPlace, KeyInit},
+};
 #[cfg(feature = "pq-ml-dsa")]
 use entangrid_types::SignatureComponent;
 use entangrid_types::{
@@ -29,7 +34,19 @@ use serde::{Deserialize, Serialize};
 pub struct SessionMaterial {
     pub session_key: HashBytes,
     pub transcript_hash: HashBytes,
+    pub encrypt_frames: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameDirection {
+    Outbound,
+    Inbound,
+}
+
+#[cfg(feature = "pq-ml-kem")]
+const FRAME_SESSION_ID_BYTES: usize = 16;
+#[cfg(feature = "pq-ml-kem")]
+const FRAME_TAG_SIZE_BYTES: usize = 16;
 
 pub trait Signer: Send + Sync {
     fn sign(&self, validator_id: ValidatorId, message: &[u8]) -> Result<TypedSignature>;
@@ -180,6 +197,101 @@ pub fn render_signing_measurement_report(reports: &[SigningMeasurementReport]) -
         ));
     }
     markdown
+}
+
+impl FrameDirection {
+    #[cfg(feature = "pq-ml-kem")]
+    fn as_byte(self) -> u8 {
+        match self {
+            Self::Outbound => 0,
+            Self::Inbound => 1,
+        }
+    }
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn frame_nonce(direction: FrameDirection, counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[0] = direction.as_byte();
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn frame_session_id(session: &SessionMaterial) -> [u8; FRAME_SESSION_ID_BYTES] {
+    let mut session_id = [0u8; FRAME_SESSION_ID_BYTES];
+    session_id.copy_from_slice(&session.transcript_hash[..FRAME_SESSION_ID_BYTES]);
+    session_id
+}
+
+#[cfg(feature = "pq-ml-kem")]
+fn frame_associated_data(
+    session: &SessionMaterial,
+    direction: FrameDirection,
+    counter: u64,
+) -> [u8; 1 + 8 + FRAME_SESSION_ID_BYTES] {
+    let mut associated_data = [0u8; 1 + 8 + FRAME_SESSION_ID_BYTES];
+    associated_data[0] = direction.as_byte();
+    associated_data[1..9].copy_from_slice(&counter.to_be_bytes());
+    associated_data[9..].copy_from_slice(&frame_session_id(session));
+    associated_data
+}
+
+pub fn encrypt_frame_payload(
+    session: &SessionMaterial,
+    direction: FrameDirection,
+    counter: u64,
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    #[cfg(not(feature = "pq-ml-kem"))]
+    {
+        let _ = (session, direction, counter, plaintext);
+        Err(anyhow!("encrypted framing requires a build with pq-ml-kem"))
+    }
+    #[cfg(feature = "pq-ml-kem")]
+    {
+        let cipher = ChaCha20Poly1305::new_from_slice(&session.session_key)
+            .map_err(|error| anyhow!("invalid frame key: {error}"))?;
+        let nonce = frame_nonce(direction, counter);
+        let associated_data = frame_associated_data(session, direction, counter);
+        let mut ciphertext = plaintext.to_vec();
+        let tag = cipher
+            .encrypt_in_place_detached((&nonce).into(), &associated_data, &mut ciphertext)
+            .map_err(|error| anyhow!("frame encryption failed: {error}"))?;
+        ciphertext.extend_from_slice(tag.as_slice());
+        Ok(ciphertext)
+    }
+}
+
+pub fn decrypt_frame_payload(
+    session: &SessionMaterial,
+    direction: FrameDirection,
+    counter: u64,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    #[cfg(not(feature = "pq-ml-kem"))]
+    {
+        let _ = (session, direction, counter, ciphertext);
+        Err(anyhow!("encrypted framing requires a build with pq-ml-kem"))
+    }
+    #[cfg(feature = "pq-ml-kem")]
+    {
+        if ciphertext.len() < FRAME_TAG_SIZE_BYTES {
+            return Err(anyhow!("frame decryption failed: truncated ciphertext"));
+        }
+        let cipher = ChaCha20Poly1305::new_from_slice(&session.session_key)
+            .map_err(|error| anyhow!("invalid frame key: {error}"))?;
+        let nonce = frame_nonce(direction, counter);
+        let associated_data = frame_associated_data(session, direction, counter);
+        let split_at = ciphertext.len() - FRAME_TAG_SIZE_BYTES;
+        let (encrypted_bytes, tag_bytes) = ciphertext.split_at(split_at);
+        let mut plaintext = encrypted_bytes.to_vec();
+        let tag = chacha20poly1305::Tag::from_slice(tag_bytes);
+        cipher
+            .decrypt_in_place_detached((&nonce).into(), &associated_data, &mut plaintext, tag)
+            .map_err(|_| anyhow!("frame decryption failed"))?;
+        Ok(plaintext)
+    }
 }
 
 pub fn deterministic_public_identity(validator_id: ValidatorId) -> PublicIdentity {
@@ -644,6 +756,7 @@ fn derive_session_material<H: TranscriptHasher>(
     kem_component: &[u8],
     client_hello: &SessionClientHello,
     server_hello: &SessionServerHello,
+    encrypt_frames: bool,
 ) -> Result<SessionMaterial> {
     let transcript_hash = session_transcript_hash(hasher, client_hello, server_hello)?;
     let session_key = hash_many(&[
@@ -655,6 +768,7 @@ fn derive_session_material<H: TranscriptHasher>(
     Ok(SessionMaterial {
         session_key,
         transcript_hash,
+        encrypt_frames,
     })
 }
 
@@ -803,6 +917,7 @@ impl HandshakeProvider for DeterministicCryptoBackend {
             &[],
             client_hello,
             &server_hello,
+            false,
         )?;
         Ok((server_hello, session))
     }
@@ -856,6 +971,7 @@ impl HandshakeProvider for DeterministicCryptoBackend {
             &[],
             client_hello,
             server_hello,
+            false,
         )
     }
 
@@ -897,6 +1013,7 @@ impl HandshakeProvider for DeterministicCryptoBackend {
         Ok(SessionMaterial {
             session_key,
             transcript_hash,
+            encrypt_frames: false,
         })
     }
 }
@@ -1293,6 +1410,7 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
             kem_component.as_slice(),
             client_hello,
             &server_hello,
+            true,
         )?;
         Ok((server_hello, session))
     }
@@ -1373,6 +1491,7 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
             kem_component.as_slice(),
             client_hello,
             server_hello,
+            true,
         )
     }
 
@@ -2290,6 +2409,83 @@ mod tests {
         };
         assert!(
             error.to_string().contains("does not match genesis"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn encrypted_frame_round_trips_with_matching_counter() {
+        let session = SessionMaterial {
+            session_key: [1; 32],
+            transcript_hash: [2; 32],
+            encrypt_frames: true,
+        };
+        let plaintext = b"encrypted framing";
+
+        let ciphertext =
+            encrypt_frame_payload(&session, FrameDirection::Outbound, 0, plaintext).unwrap();
+        let decrypted =
+            decrypt_frame_payload(&session, FrameDirection::Outbound, 0, &ciphertext).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn encrypted_frame_rejects_tampered_ciphertext() {
+        let session = SessionMaterial {
+            session_key: [1; 32],
+            transcript_hash: [2; 32],
+            encrypt_frames: true,
+        };
+        let plaintext = b"tamper-check";
+        let mut ciphertext =
+            encrypt_frame_payload(&session, FrameDirection::Outbound, 0, plaintext).unwrap();
+        let last = ciphertext.last_mut().expect("ciphertext tag byte");
+        *last ^= 0x01;
+
+        let error = decrypt_frame_payload(&session, FrameDirection::Outbound, 0, &ciphertext)
+            .expect_err("tampered ciphertext should fail");
+        assert!(
+            error.to_string().contains("frame decryption failed"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn encrypted_frame_nonce_depends_on_direction() {
+        let session = SessionMaterial {
+            session_key: [1; 32],
+            transcript_hash: [2; 32],
+            encrypt_frames: true,
+        };
+        let plaintext = b"direction matters";
+
+        let outbound =
+            encrypt_frame_payload(&session, FrameDirection::Outbound, 7, plaintext).unwrap();
+        let inbound =
+            encrypt_frame_payload(&session, FrameDirection::Inbound, 7, plaintext).unwrap();
+
+        assert_ne!(outbound, inbound);
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[test]
+    fn encrypted_frame_rejects_wrong_counter() {
+        let session = SessionMaterial {
+            session_key: [1; 32],
+            transcript_hash: [2; 32],
+            encrypt_frames: true,
+        };
+        let ciphertext =
+            encrypt_frame_payload(&session, FrameDirection::Outbound, 3, b"counter-check").unwrap();
+
+        let error = decrypt_frame_payload(&session, FrameDirection::Outbound, 4, &ciphertext)
+            .expect_err("wrong counter should fail");
+        assert!(
+            error.to_string().contains("frame decryption failed"),
             "unexpected error: {error:?}"
         );
     }

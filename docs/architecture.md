@@ -60,7 +60,8 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 - session identity is now separate from signing identity in config and validator metadata
 - each TCP stream performs one mutually signed handshake and derives session material from deterministic + ML-KEM components before normal frames flow
 - deterministic session establishment remains the default path when `pq-ml-kem` is disabled
-- this slice adds handshake-only session establishment, not encrypted framing or rekeying yet
+- Stage 1I now turns those hybrid sessions into encrypted transport lanes by protecting every post-handshake frame body while keeping the handshake and outer frame length plaintext
+- rekeying and richer traffic-shaping still come later
 
 ### 3. Network Layer
 
@@ -68,18 +69,19 @@ Responsibilities:
 
 - peer discovery for localnet
 - authenticated session setup
-- encrypted framing later
+- encrypted framing on hybrid session lanes
 - gossip for transactions and blocks
 - witness pulse delivery
 - backpressure and connection management
 
 The network layer should not know consensus rules beyond message priority classes.
 
-Current Stage 1G note:
+Current Stage 1I note:
 
 - the network layer now performs one handshake per TCP stream before normal protocol frames
 - handshake success records session metadata and transcript hash for metrics/events
-- the frame format after handshake is unchanged in this slice
+- when the hybrid session backend is active, every later frame body is ChaCha20-Poly1305 protected
+- the deterministic/default path still keeps plaintext post-handshake framing
 
 ### 4. Witness Engine
 

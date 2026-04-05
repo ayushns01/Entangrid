@@ -119,8 +119,10 @@ Important:
   - Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
   - validators now keep signing identity and session identity separate
   - session setup is per-stream and mutually signed, then derives material from deterministic + ML-KEM components
+  - Stage 1I now encrypts every post-handshake frame body automatically when the hybrid session backend is active
+  - the handshake stays in cleartext, the outer frame length stays plaintext, and the frame body is protected after session establishment
   - deterministic transport remains the default path when `pq-ml-kem` is off
-  - encrypted framing, session rotation, and simulator-generated KEM key material still come later
+  - session rotation and stronger traffic-shaping features still come later
   - transactions, receipts, and service evidence still remain outside the strict hybrid-enforcement slice
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`

@@ -131,11 +131,12 @@ One recent example of that role is service gating:
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
 - `NodeMetrics` now also carries the active score-weight profile so reports can explain not just the counters, but the policy that turned them into a score
 
-Another recent example is Stage 1G session establishment:
+Another recent example is Stage 1G plus Stage 1I transport setup:
 
 - validator metadata can now advertise a separate session public identity
 - node-local config can now point at a separate session key file
 - crypto and network share one handshake wire format through this crate
+- that shared handshake now feeds an encrypted post-handshake transport lane when the hybrid session backend is active
 - the deterministic session path remains the default when `pq-ml-kem` is disabled
 
 The current recommended prototype policy now lives in these shared defaults too:
