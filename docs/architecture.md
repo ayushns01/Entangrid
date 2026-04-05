@@ -54,7 +54,7 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 - first-class hybrid signature and identity containers now exist for the core signed objects
 - verification is permissive during rollout: deterministic-only, ML-DSA-only, and hybrid signatures can all validate against the right identities
 - an opt-in `require_hybrid_validator_signatures` flag now adds network-wide startup enforcement for hybrid validator identities and runtime enforcement for block and proposal-vote signatures
-- Stage 1F adds a strict hybrid localnet bootstrap path via `init-localnet --hybrid-enforcement`; it requires a `pq-ml-dsa` build, writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+- Stage 1F plus Stage 1H now provide a strict hybrid localnet bootstrap path via `init-localnet --hybrid-enforcement`; it requires a `pq-ml-dsa pq-ml-kem` build, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA signing key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - this Stage 1F slice is operational/bootstrap coverage, not the full hybrid performance matrix
 - Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
 - session identity is now separate from signing identity in config and validator metadata

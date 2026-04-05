@@ -19,7 +19,7 @@ Current status note:
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
 - stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
 - on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, blocks, and proposal votes
-- Stage 1F adds a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa`, writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+- Stage 1F plus Stage 1H add a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - that Stage 1F mode is an operational/bootstrap slice, not the full hybrid performance matrix
 
 On the active `consensus_v2` path on `main`, the protocol direction is tightening further:
@@ -256,7 +256,7 @@ Current PQ Stage 1 direction:
 - hybrid signature and identity bundles now exist for the core signed objects
 - verification is permissive during rollout, so matching deterministic-only, ML-DSA-only, and hybrid signatures can all validate
 - hybrid policy enforcement is now available for validator startup, blocks, and proposal votes behind the current rollout flag, while wider enforcement across the rest of the signed surfaces still comes later
-- Stage 1F extends this with a strict hybrid localnet bootstrap path that turns the hybrid policy into runnable simulator output, but only for the operational smoke case described above
+- Stage 1F and Stage 1H extend this with a strict hybrid localnet bootstrap path that turns the hybrid signing and session policy into runnable simulator output, but only for the operational smoke case described above
 
 ## Slashing And Rewards
 

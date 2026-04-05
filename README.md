@@ -113,8 +113,8 @@ Important:
   - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
   - first-class hybrid signature and identity containers are now in for transactions, blocks, and proposal votes
   - permissive hybrid verification is in
-  - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
-  - that mode writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+  - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
+  - that mode writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
   - `--hybrid-enforcement` is an operational/bootstrap slice, not a full hybrid performance matrix
   - Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
   - validators now keep signing identity and session identity separate
@@ -209,18 +209,18 @@ To run the active V2 line on `main`, pass `--consensus-v2` when you initialize t
 To boot the strict hybrid Stage 1F slice, use:
 
 ```bash
-cargo run -p entangrid-sim --features pq-ml-dsa -- init-localnet \
+cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- init-localnet \
   --validators 4 \
   --hybrid-enforcement \
   --base-dir var/pq-hybrid-smoke
 ```
 
-This mode requires a `pq-ml-dsa` build, writes hybrid validator identities into genesis, generates one ML-DSA key file per node, selects `HybridDeterministicMlDsaExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`. It is meant as a bootstrap/operational smoke path, not as the full hybrid performance matrix.
+This mode now requires a build with both `pq-ml-dsa` and `pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one `ml-dsa-key.json` plus one `ml-kem-session-key.json` per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`. It is meant as a bootstrap/operational smoke path, not as the full hybrid performance matrix.
 
 To start that hybrid localnet, use the same feature-enabled simulator and the matching base directory:
 
 ```bash
-cargo run -p entangrid-sim --features pq-ml-dsa -- up --base-dir var/pq-hybrid-smoke
+cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- up --base-dir var/pq-hybrid-smoke
 ```
 
 Start the localnet:

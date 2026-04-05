@@ -7,6 +7,7 @@ license.workspace = true
 [features]
 default = []
 pq-ml-dsa = ["entangrid-crypto/pq-ml-dsa", "dep:ml-dsa", "dep:rand_core"]
+pq-ml-kem = ["entangrid-crypto/pq-ml-kem", "dep:ml-kem", "dep:rand_core"]
 
 [dependencies]
 anyhow.workspace = true
@@ -15,6 +16,7 @@ clap.workspace = true
 entangrid-crypto = { path = "../entangrid-crypto" }
 entangrid-types = { path = "../entangrid-types" }
 ml-dsa = { version = "0.0.4", optional = true }
+ml-kem = { version = "0.2.3", optional = true }
 rand.workspace = true
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 serde.workspace = true

@@ -66,7 +66,7 @@ The current PQ branch now also supports:
 - hybrid deterministic + ML-DSA signing through `HybridDeterministicMlDsaExperimental`
 - permissive verification against hybrid identities so single-scheme and hybrid signatures can coexist during rollout
 - an opt-in `require_hybrid_validator_signatures` mode in node policy that now enforces hybrid validator identities plus hybrid block/proposal-vote signatures
-- the simulator's Stage 1F strict hybrid localnet bootstrap path uses the same hybrid backend, requires a `pq-ml-dsa` build, and turns on `require_hybrid_validator_signatures = true` together with `consensus_v2 = true`
+- the simulator's strict hybrid localnet bootstrap path now requires `pq-ml-dsa` and `pq-ml-kem`, writes both signing and session key files, and turns on `require_hybrid_validator_signatures = true` together with `consensus_v2 = true`
 - a separate session identity/config surface through `ValidatorConfig.session_public_identity`, `NodeConfig.session_backend`, and `NodeConfig.session_key_path`
 - a feature-gated per-stream handshake behind `pq-ml-kem` using `SessionClientHello` / `SessionServerHello`
 - mutually signed handshake transcripts that bind the transport session to validator signing identities

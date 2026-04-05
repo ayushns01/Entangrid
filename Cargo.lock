@@ -338,6 +338,7 @@ dependencies = [
  "entangrid-crypto",
  "entangrid-types",
  "ml-dsa",
+ "ml-kem",
  "rand",
  "rand_core 0.6.4",
  "serde",
