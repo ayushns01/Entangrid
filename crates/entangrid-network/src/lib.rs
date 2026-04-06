@@ -25,6 +25,7 @@ const MAX_CONCURRENT_INBOUND_SESSIONS: usize = 64;
 const INBOUND_SESSION_ACQUIRE_TIMEOUT_MILLIS: u64 = 75;
 const MAX_CONNECT_RETRIES: u32 = 4;
 const CONNECT_RETRY_BACKOFF_MILLIS: u64 = 15;
+const DEFAULT_HYBRID_SESSION_TTL_MILLIS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkFailureKind {
@@ -74,6 +75,14 @@ struct EstablishedOutboundStream {
     stream: TcpStream,
     session: SessionMaterial,
     send_counter: u64,
+    session_established_at_unix_millis: u64,
+    session_ttl_millis: Option<u64>,
+}
+
+enum ApplicationFrameRead {
+    Frame { payload: Vec<u8>, wire_len: usize },
+    StreamClosed,
+    SessionExpired,
 }
 
 impl NetworkHandle {
@@ -126,6 +135,7 @@ pub async fn spawn_network(
     listen_address: String,
     peers: Vec<PeerConfig>,
     fault_profile: FaultProfile,
+    session_ttl_millis: Option<u64>,
     crypto: Arc<dyn CryptoBackend>,
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
@@ -180,6 +190,7 @@ pub async fn spawn_network(
                         if let Err(error) = handle_inbound(
                             stream,
                             local_validator_id,
+                            session_ttl_millis,
                             crypto,
                             metrics,
                             event_tx.clone(),
@@ -225,6 +236,7 @@ pub async fn spawn_network(
                     local_validator_id,
                     request,
                     fault_profile.clone(),
+                    session_ttl_millis,
                     Arc::clone(&crypto),
                     Arc::clone(&metrics),
                     event_tx.clone(),
@@ -311,22 +323,63 @@ async fn read_application_frame(
     stream: &mut TcpStream,
     session: &SessionMaterial,
     receive_counter: &mut u64,
-) -> Result<Option<(Vec<u8>, usize)>> {
+    session_established_at_unix_millis: u64,
+    session_ttl_millis: Option<u64>,
+) -> Result<ApplicationFrameRead> {
     let frame = match read_frame_bytes(stream).await? {
         Some(frame) => frame,
-        None => return Ok(None),
+        None => return Ok(ApplicationFrameRead::StreamClosed),
     };
     let wire_len = frame.len();
+    if session_is_expired(
+        session_established_at_unix_millis,
+        session_ttl_millis,
+        now_unix_millis(),
+    ) {
+        return Ok(ApplicationFrameRead::SessionExpired);
+    }
     if session.encrypt_frames {
         let counter = *receive_counter;
         let plaintext =
             decrypt_frame_payload(session, FrameDirection::Outbound, counter, &frame)
                 .map_err(|error| anyhow!("encrypted frame authentication failed: {error}"))?;
         *receive_counter = (*receive_counter).saturating_add(1);
-        Ok(Some((plaintext, wire_len)))
+        Ok(ApplicationFrameRead::Frame {
+            payload: plaintext,
+            wire_len,
+        })
     } else {
-        Ok(Some((frame, wire_len)))
+        Ok(ApplicationFrameRead::Frame {
+            payload: frame,
+            wire_len,
+        })
     }
+}
+
+fn effective_session_ttl_millis(
+    configured_session_ttl_millis: Option<u64>,
+    session: &SessionMaterial,
+) -> Option<u64> {
+    if !session.encrypt_frames {
+        return None;
+    }
+    match configured_session_ttl_millis {
+        Some(0) => None,
+        Some(ttl_millis) => Some(ttl_millis),
+        None => Some(DEFAULT_HYBRID_SESSION_TTL_MILLIS),
+    }
+}
+
+fn session_is_expired(
+    session_established_at_unix_millis: u64,
+    session_ttl_millis: Option<u64>,
+    now_unix_millis_value: u64,
+) -> bool {
+    session_ttl_millis
+        .map(|ttl_millis| {
+            now_unix_millis_value.saturating_sub(session_established_at_unix_millis) >= ttl_millis
+        })
+        .unwrap_or(false)
 }
 
 async fn run_outbound_handshake(
@@ -367,6 +420,7 @@ async fn send_message(
     local_validator_id: ValidatorId,
     request: OutboundRequest,
     fault_profile: FaultProfile,
+    configured_session_ttl_millis: Option<u64>,
     crypto: Arc<dyn CryptoBackend>,
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
@@ -408,6 +462,18 @@ async fn send_message(
     let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
     let mut retried = false;
     loop {
+        if stream.as_ref().is_some_and(|established| {
+            session_is_expired(
+                established.session_established_at_unix_millis,
+                established.session_ttl_millis,
+                now_unix_millis(),
+            )
+        }) {
+            update_metrics(&metrics, |metrics| {
+                metrics.active_sessions = 0;
+            });
+            *stream = None;
+        }
         if stream.is_none() {
             let mut connected = connect_with_retries(&request.peer.address).await?;
             connected.set_nodelay(true)?;
@@ -434,10 +500,15 @@ async fn send_message(
             update_metrics(&metrics, |metrics| {
                 metrics.active_sessions = 1;
             });
+            let session_established_at_unix_millis = now_unix_millis();
+            let session_ttl_millis =
+                effective_session_ttl_millis(configured_session_ttl_millis, &session);
             *stream = Some(EstablishedOutboundStream {
                 stream: connected,
                 session,
                 send_counter: 0,
+                session_established_at_unix_millis,
+                session_ttl_millis,
             });
         }
 
@@ -488,6 +559,7 @@ async fn send_message(
 async fn handle_inbound(
     mut stream: TcpStream,
     local_validator_id: ValidatorId,
+    configured_session_ttl_millis: Option<u64>,
     crypto: Arc<dyn CryptoBackend>,
     metrics: Arc<Mutex<NodeMetrics>>,
     event_tx: mpsc::UnboundedSender<NetworkEvent>,
@@ -516,26 +588,35 @@ async fn handle_inbound(
             return Err(error);
         }
     };
+    let session_established_at_unix_millis = now_unix_millis();
+    let session_ttl_millis = effective_session_ttl_millis(configured_session_ttl_millis, &session);
 
     let mut receive_counter = 0u64;
     loop {
-        let (frame, wire_len) =
-            match read_application_frame(&mut stream, &session, &mut receive_counter).await {
-                Ok(Some(frame)) => frame,
-                Ok(None) => {
-                    update_metrics(&metrics, |metrics| {
-                        metrics.active_sessions = 0;
-                    });
-                    return Ok(());
-                }
-                Err(error) => {
-                    update_metrics(&metrics, |metrics| {
-                        metrics.handshake_failures += 1;
-                        metrics.active_sessions = 0;
-                    });
-                    return Err(error);
-                }
-            };
+        let (frame, wire_len) = match read_application_frame(
+            &mut stream,
+            &session,
+            &mut receive_counter,
+            session_established_at_unix_millis,
+            session_ttl_millis,
+        )
+        .await
+        {
+            Ok(ApplicationFrameRead::Frame { payload, wire_len }) => (payload, wire_len),
+            Ok(ApplicationFrameRead::StreamClosed | ApplicationFrameRead::SessionExpired) => {
+                update_metrics(&metrics, |metrics| {
+                    metrics.active_sessions = 0;
+                });
+                return Ok(());
+            }
+            Err(error) => {
+                update_metrics(&metrics, |metrics| {
+                    metrics.handshake_failures += 1;
+                    metrics.active_sessions = 0;
+                });
+                return Err(error);
+            }
+        };
         let envelope: SignedEnvelope = decode_frame(&frame, "signed envelope")?;
         update_metrics(&metrics, |metrics| {
             metrics.bytes_received += wire_len as u64;
@@ -774,10 +855,16 @@ mod tests {
         session: &SessionMaterial,
         receive_counter: &mut u64,
     ) -> T {
-        let (frame, _) = read_application_frame(stream, session, receive_counter)
+        let (frame, _) = match read_application_frame(stream, session, receive_counter, 0, None)
             .await
             .unwrap()
-            .expect("application frame present");
+        {
+            ApplicationFrameRead::Frame { payload, wire_len } => (payload, wire_len),
+            ApplicationFrameRead::StreamClosed => panic!("expected application frame, got EOF"),
+            ApplicationFrameRead::SessionExpired => {
+                panic!("expected application frame, got expired session")
+            }
+        };
         let (decoded, _): (T, usize) =
             bincode::serde::decode_from_slice(&frame, bincode::config::standard()).unwrap();
         decoded
@@ -893,6 +980,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
             session_key_path: Some(key_path_one.display().to_string()),
+            session_ttl_millis: None,
         };
         let config_two = NodeConfig {
             validator_id: 2,
@@ -909,6 +997,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
             session_key_path: Some(key_path_two.display().to_string()),
+            session_ttl_millis: None,
         };
         (genesis, config_one, config_two)
     }
@@ -931,6 +1020,34 @@ mod tests {
         assert!(!is_retryable_connect_error(&Error::from(
             ErrorKind::PermissionDenied
         )));
+    }
+
+    #[test]
+    fn effective_session_ttl_defaults_only_for_hybrid_sessions() {
+        let deterministic_session = SessionMaterial {
+            session_key: [0u8; 32],
+            transcript_hash: [1u8; 32],
+            encrypt_frames: false,
+        };
+        let hybrid_session = SessionMaterial {
+            session_key: [2u8; 32],
+            transcript_hash: [3u8; 32],
+            encrypt_frames: true,
+        };
+
+        assert_eq!(
+            effective_session_ttl_millis(None, &deterministic_session),
+            None
+        );
+        assert_eq!(
+            effective_session_ttl_millis(None, &hybrid_session),
+            Some(DEFAULT_HYBRID_SESSION_TTL_MILLIS)
+        );
+        assert_eq!(effective_session_ttl_millis(Some(0), &hybrid_session), None);
+        assert_eq!(
+            effective_session_ttl_millis(Some(42), &hybrid_session),
+            Some(42)
+        );
     }
 
     #[test]
@@ -1007,6 +1124,7 @@ mod tests {
                 address: peer_address.clone(),
             }],
             FaultProfile::default(),
+            None,
             Arc::clone(&crypto),
             metrics,
             event_tx,
@@ -1096,6 +1214,7 @@ mod tests {
                 address: reserve_local_address().await,
             }],
             FaultProfile::default(),
+            None,
             Arc::clone(&crypto),
             metrics,
             event_tx,
@@ -1184,6 +1303,7 @@ mod tests {
                 address: reserve_local_address().await,
             }],
             FaultProfile::default(),
+            None,
             Arc::clone(&crypto),
             Arc::clone(&metrics),
             event_tx,
@@ -1243,6 +1363,7 @@ mod tests {
                 address: peer_address.clone(),
             }],
             FaultProfile::default(),
+            None,
             Arc::clone(&crypto),
             metrics,
             event_tx,
@@ -1347,6 +1468,7 @@ mod tests {
                 address: peer_address.clone(),
             }],
             FaultProfile::default(),
+            None,
             Arc::clone(&crypto),
             metrics,
             event_tx,
@@ -1422,6 +1544,7 @@ mod tests {
                 address: peer_address.clone(),
             }],
             FaultProfile::default(),
+            client_config.session_ttl_millis,
             Arc::clone(&client_crypto),
             metrics,
             event_tx,
@@ -1475,6 +1598,372 @@ mod tests {
 
     #[cfg(feature = "pq-ml-kem")]
     #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_outbound_stream_reconnects_after_ttl_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap().to_string();
+        let local_address = reserve_local_address().await;
+        let (genesis, mut client_config, server_config) = hybrid_session_genesis_and_configs();
+        client_config.session_ttl_millis = Some(1);
+        let client_crypto = build_crypto_backend(&genesis, &client_config).unwrap();
+        let server_crypto = build_crypto_backend(&genesis, &server_config).unwrap();
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            1,
+            local_address,
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            FaultProfile::default(),
+            client_config.session_ttl_millis,
+            Arc::clone(&client_crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let payload_one = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let payload_two = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 2,
+            source_validator_id: 1,
+            sequence_number: 2,
+            emitted_at_unix_millis: 2,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_one.clone(),
+            )
+            .unwrap();
+
+        let (mut first_stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted first connection")
+            .unwrap();
+        let first_client_hello: SessionClientHello = read_bincode_frame(&mut first_stream).await;
+        let (first_server_hello, first_server_session) = server_crypto
+            .accept_client_hello(2, &first_client_hello)
+            .unwrap();
+        write_bincode_frame(&mut first_stream, &first_server_hello).await;
+        let mut first_receive_counter = 0;
+        let first_envelope: SignedEnvelope = read_application_bincode_frame(
+            &mut first_stream,
+            &first_server_session,
+            &mut first_receive_counter,
+        )
+        .await;
+        assert_eq!(first_envelope.payload, payload_one);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_two.clone(),
+            )
+            .unwrap();
+
+        let (mut second_stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted second connection")
+            .unwrap();
+        let second_client_hello: SessionClientHello = read_bincode_frame(&mut second_stream).await;
+        assert_ne!(first_client_hello.nonce, second_client_hello.nonce);
+        let (second_server_hello, second_server_session) = server_crypto
+            .accept_client_hello(2, &second_client_hello)
+            .unwrap();
+        write_bincode_frame(&mut second_stream, &second_server_hello).await;
+        let mut second_receive_counter = 0;
+        let second_envelope: SignedEnvelope = read_application_bincode_frame(
+            &mut second_stream,
+            &second_server_session,
+            &mut second_receive_counter,
+        )
+        .await;
+        assert_eq!(second_envelope.payload, payload_two);
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_outbound_stream_reuses_same_connection_before_ttl_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap().to_string();
+        let local_address = reserve_local_address().await;
+        let (genesis, mut client_config, server_config) = hybrid_session_genesis_and_configs();
+        client_config.session_ttl_millis = Some(5_000);
+        let client_crypto = build_crypto_backend(&genesis, &client_config).unwrap();
+        let server_crypto = build_crypto_backend(&genesis, &server_config).unwrap();
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            1,
+            local_address,
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            FaultProfile::default(),
+            client_config.session_ttl_millis,
+            Arc::clone(&client_crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let payload_one = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let payload_two = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 2,
+            source_validator_id: 1,
+            sequence_number: 2,
+            emitted_at_unix_millis: 2,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_one.clone(),
+            )
+            .unwrap();
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_two.clone(),
+            )
+            .unwrap();
+
+        let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted hybrid connection")
+            .unwrap();
+        let client_hello: SessionClientHello = read_bincode_frame(&mut stream).await;
+        let (server_hello, server_session) =
+            server_crypto.accept_client_hello(2, &client_hello).unwrap();
+        write_bincode_frame(&mut stream, &server_hello).await;
+
+        let mut receive_counter = 0;
+        let first: SignedEnvelope =
+            read_application_bincode_frame(&mut stream, &server_session, &mut receive_counter)
+                .await;
+        let second: SignedEnvelope = timeout(
+            Duration::from_secs(2),
+            read_application_bincode_frame(&mut stream, &server_session, &mut receive_counter),
+        )
+        .await
+        .expect("second frame on same stream");
+        assert_eq!(first.payload, payload_one);
+        assert_eq!(second.payload, payload_two);
+        assert!(
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_ttl_zero_disables_hybrid_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap().to_string();
+        let local_address = reserve_local_address().await;
+        let (genesis, mut client_config, server_config) = hybrid_session_genesis_and_configs();
+        client_config.session_ttl_millis = Some(0);
+        let client_crypto = build_crypto_backend(&genesis, &client_config).unwrap();
+        let server_crypto = build_crypto_backend(&genesis, &server_config).unwrap();
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let network = spawn_network(
+            1,
+            local_address,
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            FaultProfile::default(),
+            client_config.session_ttl_millis,
+            Arc::clone(&client_crypto),
+            metrics,
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let payload_one = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 1,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let payload_two = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 2,
+            source_validator_id: 1,
+            sequence_number: 2,
+            emitted_at_unix_millis: 2,
+        });
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_one.clone(),
+            )
+            .unwrap();
+
+        let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accepted hybrid connection")
+            .unwrap();
+        let client_hello: SessionClientHello = read_bincode_frame(&mut stream).await;
+        let (server_hello, server_session) =
+            server_crypto.accept_client_hello(2, &client_hello).unwrap();
+        write_bincode_frame(&mut stream, &server_hello).await;
+        let mut receive_counter = 0;
+        let first: SignedEnvelope =
+            read_application_bincode_frame(&mut stream, &server_session, &mut receive_counter)
+                .await;
+        assert_eq!(first.payload, payload_one);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        network
+            .send_to(
+                PeerConfig {
+                    validator_id: 2,
+                    address: peer_address.clone(),
+                },
+                payload_two.clone(),
+            )
+            .unwrap();
+        let second: SignedEnvelope = timeout(
+            Duration::from_secs(2),
+            read_application_bincode_frame(&mut stream, &server_session, &mut receive_counter),
+        )
+        .await
+        .expect("second frame on same disabled-expiry stream");
+        assert_eq!(second.payload, payload_two);
+        assert!(
+            timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn inbound_expired_hybrid_stream_rejects_next_application_frame() {
+        let listen_address = reserve_local_address().await;
+        let (genesis, mut server_config, client_config) = hybrid_session_genesis_and_configs();
+        server_config.session_ttl_millis = Some(1);
+        let server_crypto = build_crypto_backend(&genesis, &server_config).unwrap();
+        let client_crypto = build_crypto_backend(&genesis, &client_config).unwrap();
+        let metrics = Arc::new(Mutex::new(NodeMetrics {
+            validator_id: 1,
+            ..NodeMetrics::default()
+        }));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let _network = spawn_network(
+            1,
+            listen_address.clone(),
+            vec![PeerConfig {
+                validator_id: 2,
+                address: reserve_local_address().await,
+            }],
+            FaultProfile::default(),
+            server_config.session_ttl_millis,
+            Arc::clone(&server_crypto),
+            Arc::clone(&metrics),
+            event_tx,
+        )
+        .await
+        .unwrap();
+
+        let mut stream = TcpStream::connect(&listen_address).await.unwrap();
+        let client_hello = client_crypto
+            .build_client_hello(2, 1, session_nonce(2, 1))
+            .unwrap();
+        write_bincode_frame(&mut stream, &client_hello).await;
+        let server_hello: SessionServerHello = read_bincode_frame(&mut stream).await;
+        let client_session = client_crypto
+            .finalize_client_session(2, &client_hello, &server_hello)
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let payload = ProtocolMessage::HeartbeatPulse(HeartbeatPulse {
+            epoch: 0,
+            slot: 1,
+            source_validator_id: 2,
+            sequence_number: 1,
+            emitted_at_unix_millis: 1,
+        });
+        let message_hash = canonical_hash(&payload);
+        let envelope = SignedEnvelope {
+            from_validator_id: 2,
+            message_hash,
+            signature: client_crypto.sign(2, &message_hash).unwrap(),
+            payload,
+        };
+        let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard()).unwrap();
+        let mut send_counter = 0;
+        write_application_frame(&mut stream, &client_session, &mut send_counter, &bytes)
+            .await
+            .unwrap();
+
+        let mut read_buf = [0u8; 1];
+        let read_len = timeout(Duration::from_secs(2), stream.read(&mut read_buf))
+            .await
+            .expect("server closed expired stream in time")
+            .unwrap();
+        assert_eq!(read_len, 0, "expected EOF after inbound expiry");
+        assert!(
+            timeout(Duration::from_millis(200), event_rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(metrics.lock().unwrap().handshake_failures, 0);
+    }
+
+    #[cfg(feature = "pq-ml-kem")]
+    #[tokio::test(flavor = "current_thread")]
     async fn tampered_encrypted_frame_drops_stream() {
         let listen_address = reserve_local_address().await;
         let (genesis, server_config, client_config) = hybrid_session_genesis_and_configs();
@@ -1493,6 +1982,7 @@ mod tests {
                 address: reserve_local_address().await,
             }],
             FaultProfile::default(),
+            server_config.session_ttl_millis,
             Arc::clone(&server_crypto),
             Arc::clone(&metrics),
             event_tx,
