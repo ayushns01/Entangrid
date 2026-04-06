@@ -121,6 +121,10 @@ Important:
   - session setup is per-stream and mutually signed, then derives material from deterministic + ML-KEM components
   - Stage 1I now encrypts every post-handshake frame body automatically when the hybrid session backend is active
   - the handshake stays in cleartext, the outer frame length stays plaintext, and the frame body is protected after session establishment
+  - Stage 1J now adds node-local hybrid session lifetime control through `NodeConfig.session_ttl_millis`
+  - when that TTL is omitted, hybrid lanes default to a 10 minute lifetime while deterministic transport remains unchanged
+  - outbound hybrid lanes lazily drop expired cached streams and reconnect through a fresh handshake before sending the pending frame
+  - inbound hybrid lanes close expired streams before accepting the next application frame, so expiry stays transport-local instead of leaking into node logic
   - deterministic transport remains the default path when `pq-ml-kem` is off
   - session rotation and stronger traffic-shaping features still come later
   - transactions, receipts, and service evidence still remain outside the strict hybrid-enforcement slice

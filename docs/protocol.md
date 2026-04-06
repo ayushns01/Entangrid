@@ -216,6 +216,15 @@ Current PQ Stage 1I note on `stage-1/pq-integration`:
 - deterministic session establishment remains the default path when the feature is off
 - session rotation is still out of scope for this slice
 
+Current PQ Stage 1J note on `stage-1/pq-integration`:
+
+- hybrid session lifetime is now node-local through `NodeConfig.session_ttl_millis`
+- omitted TTL keeps deterministic transport unchanged but gives hybrid lanes a 10 minute default lifetime
+- `session_ttl_millis = 0` disables expiry explicitly
+- outbound hybrid lanes transparently reconnect through a fresh handshake before sending the next frame after expiry
+- inbound hybrid lanes close expired streams before accepting another application frame
+- expiry is treated as lifecycle turnover, not as a transport authentication failure
+
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 
 This protocol rejects the original shortcut:

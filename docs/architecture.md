@@ -61,6 +61,7 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 - each TCP stream performs one mutually signed handshake and derives session material from deterministic + ML-KEM components before normal frames flow
 - deterministic session establishment remains the default path when `pq-ml-kem` is disabled
 - Stage 1I now turns those hybrid sessions into encrypted transport lanes by protecting every post-handshake frame body while keeping the handshake and outer frame length plaintext
+- Stage 1J now adds node-local hybrid session TTL expiry via `NodeConfig.session_ttl_millis`; omitted TTL uses a 10 minute default on hybrid lanes, `0` disables expiry, outbound lanes reconnect transparently on expiry, and inbound lanes close expired streams before the next application frame
 - rekeying and richer traffic-shaping still come later
 
 ### 3. Network Layer
@@ -82,6 +83,11 @@ Current Stage 1I note:
 - handshake success records session metadata and transcript hash for metrics/events
 - when the hybrid session backend is active, every later frame body is ChaCha20-Poly1305 protected
 - the deterministic/default path still keeps plaintext post-handshake framing
+- Stage 1J adds transport-local turnover on top of that:
+  - hybrid lanes use a 10 minute TTL by default when `session_ttl_millis` is omitted
+  - outbound cached streams reconnect lazily on the next send after expiry
+  - inbound streams close before delivering the next post-expiry application frame
+  - deterministic lanes still skip TTL-driven expiry
 
 ### 4. Witness Engine
 

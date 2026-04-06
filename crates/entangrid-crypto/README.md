@@ -72,6 +72,7 @@ The current PQ branch now also supports:
 - mutually signed handshake transcripts that bind the transport session to validator signing identities
 - session material derived from the existing deterministic component plus an ML-KEM component when `HybridDeterministicMlKemExperimental` is selected
 - Stage 1I encrypted framing over that hybrid session using ChaCha20-Poly1305 for every post-handshake frame body while leaving the handshake and outer frame length plaintext
+- Stage 1J transport-local session lifecycle hardening through `NodeConfig.session_ttl_millis`, with a 10 minute default TTL on hybrid lanes, lazy outbound reconnect on expiry, and clean inbound close semantics while keeping expiry policy out of the crypto backend itself
 
 Current enforcement boundary:
 
