@@ -5726,6 +5726,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         }
     }
 

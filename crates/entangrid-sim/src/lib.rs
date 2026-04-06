@@ -438,6 +438,7 @@ pub fn init_localnet(
             signing_key_path: material.signing_key_path.clone(),
             session_backend: material.session_backend.clone(),
             session_key_path: material.session_key_path.clone(),
+            session_ttl_millis: None,
         };
         let config_path = node_dir.join("node.toml");
         fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -2242,6 +2243,7 @@ fn deterministic_measurement_config() -> NodeConfig {
         signing_key_path: None,
         session_backend: SessionBackendKind::DevDeterministic,
         session_key_path: None,
+        session_ttl_millis: None,
     }
 }
 
@@ -2273,6 +2275,7 @@ fn ml_dsa_measurement_setup(validator_count: usize) -> Result<(GenesisConfig, No
         signing_key_path: Some(key_path.display().to_string()),
         session_backend: SessionBackendKind::DevDeterministic,
         session_key_path: None,
+        session_ttl_millis: None,
         ..deterministic_measurement_config()
     };
     Ok((genesis, config))

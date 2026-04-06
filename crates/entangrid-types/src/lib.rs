@@ -951,6 +951,8 @@ pub struct NodeConfig {
     pub session_backend: SessionBackendKind,
     #[serde(default)]
     pub session_key_path: Option<String>,
+    #[serde(default)]
+    pub session_ttl_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1963,6 +1965,43 @@ disable_outbound = false
         assert_eq!(parsed.signing_key_path, None);
         assert_eq!(parsed.session_backend, SessionBackendKind::DevDeterministic);
         assert_eq!(parsed.session_key_path, None);
+        assert_eq!(parsed.session_ttl_millis, None);
+    }
+
+    #[test]
+    fn node_config_defaults_session_ttl_to_none_when_omitted() {
+        let config = r#"
+validator_id = 1
+data_dir = "/tmp/node-1"
+genesis_path = "/tmp/genesis.toml"
+listen_address = "127.0.0.1:3001"
+peers = []
+log_path = "/tmp/events.log"
+metrics_path = "/tmp/metrics.json"
+sync_on_startup = true
+
+[feature_flags]
+enable_receipts = true
+enable_service_gating = false
+consensus_v2 = false
+service_gating_start_epoch = 3
+service_gating_threshold = 0.40
+service_score_window_epochs = 4
+
+[feature_flags.service_score_weights]
+uptime_weight = 0.25
+delivery_weight = 0.50
+diversity_weight = 0.25
+penalty_weight = 1.0
+
+[fault_profile]
+artificial_delay_ms = 0
+outbound_drop_probability = 0.0
+pause_slot_production = false
+disable_outbound = false
+"#;
+        let parsed: NodeConfig = toml::from_str(config).unwrap();
+        assert_eq!(parsed.session_ttl_millis, None);
     }
 
     #[test]
@@ -2018,6 +2057,7 @@ disable_outbound = false
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: Some(60_000),
         };
         let serialized = toml::to_string(&config).unwrap();
         let decoded: NodeConfig = toml::from_str(&serialized).unwrap();
@@ -2026,5 +2066,38 @@ disable_outbound = false
             SigningBackendKind::MlDsa65Experimental
         );
         assert_eq!(decoded.signing_key_path.as_deref(), Some("/tmp/ml-dsa.sk"));
+        assert_eq!(decoded.session_ttl_millis, Some(60_000));
+    }
+
+    #[test]
+    fn node_config_round_trips_explicit_session_ttl_values() {
+        let zero_ttl_config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::DevDeterministic,
+            signing_key_path: None,
+            session_backend: SessionBackendKind::DevDeterministic,
+            session_key_path: None,
+            session_ttl_millis: Some(0),
+        };
+        let zero_serialized = toml::to_string(&zero_ttl_config).unwrap();
+        let zero_decoded: NodeConfig = toml::from_str(&zero_serialized).unwrap();
+        assert_eq!(zero_decoded.session_ttl_millis, Some(0));
+
+        let nonzero_ttl_config = NodeConfig {
+            session_ttl_millis: Some(12_345),
+            ..zero_ttl_config
+        };
+        let nonzero_serialized = toml::to_string(&nonzero_ttl_config).unwrap();
+        let nonzero_decoded: NodeConfig = toml::from_str(&nonzero_serialized).unwrap();
+        assert_eq!(nonzero_decoded.session_ttl_millis, Some(12_345));
     }
 }
