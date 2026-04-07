@@ -63,7 +63,7 @@ Current PQ Stage 1 detail on `stage-1/pq-integration`:
 - deterministic session establishment remains the default path when `pq-ml-kem` is disabled
 - Stage 1I now turns those hybrid sessions into encrypted transport lanes by protecting every post-handshake frame body while keeping the handshake and outer frame length plaintext
 - Stage 1J now adds node-local hybrid session TTL expiry via `NodeConfig.session_ttl_millis`; omitted TTL uses a 10 minute default on hybrid lanes, `0` disables expiry, outbound lanes reconnect transparently on expiry, and inbound lanes close expired streams before the next application frame
-- rekeying and richer traffic-shaping still come later
+- rekeying and richer traffic-shaping are explicitly deferred to the post-Stage-1 hardening milestone
 
 ### 3. Network Layer
 

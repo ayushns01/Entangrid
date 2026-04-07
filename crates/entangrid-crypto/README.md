@@ -148,8 +148,8 @@ Current PQ branch focus:
   - add node-local backend selection
   - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
   - add a feature-gated hybrid ML-KEM session handshake behind `pq-ml-kem`
-- that branch now covers signing/authentication plus handshake-only session establishment
-- session rotation and richer transport hardening still come later
+- that branch now covers signing/authentication, strict hybrid enforcement across transactions and consensus-relevant validator evidence, hybrid session establishment, encrypted framing, and transport-local TTL turnover
+- session rotation and richer transport hardening are explicitly deferred to the post-Stage-1 hardening milestone
 
 ## Why this crate matters
 

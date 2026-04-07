@@ -226,6 +226,7 @@ Current PQ Stage 1J note on `stage-1/pq-integration`:
 - outbound hybrid lanes transparently reconnect through a fresh handshake before sending the next frame after expiry
 - inbound hybrid lanes close expired streams before accepting another application frame
 - expiry is treated as lifecycle turnover, not as a transport authentication failure
+- Stage 1 treats rekeying and stronger traffic-shaping as later hardening work, not as blockers for the first mergeable PQ milestone
 
 ## Why This Is Better Than Raw Shared-Secret Lotteries
 
@@ -267,7 +268,7 @@ Current PQ Stage 1 direction:
 - the first experimental PQ signing path is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - hybrid signature and identity bundles now exist for the core signed objects
 - verification is permissive during rollout, so matching deterministic-only, ML-DSA-only, and hybrid signatures can all validate
-- hybrid policy enforcement is now available for validator startup, transactions, blocks, proposal votes, relay receipts, and service attestations behind the current rollout flag; service aggregates inherit that enforcement transitively through their embedded attestation set, while wider enforcement across the rest of the signed surfaces still comes later
+- hybrid policy enforcement is now available for validator startup, transactions, blocks, proposal votes, relay receipts, and service attestations behind the current rollout flag; service aggregates inherit that enforcement transitively through their embedded attestation set
 - Stage 1F and Stage 1H extend this with a strict hybrid localnet bootstrap path that turns the hybrid signing and session policy into runnable simulator output, but only for the operational smoke case described above
 
 ## Slashing And Rewards

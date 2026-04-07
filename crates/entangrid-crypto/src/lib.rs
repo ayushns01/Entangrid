@@ -1616,6 +1616,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let backend = build_crypto_backend(&genesis, &config).unwrap();
         let signature = backend.sign(1, b"factory").unwrap();
@@ -1660,6 +1661,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
 
         build_crypto_backend(&genesis, &config).unwrap();
@@ -1703,6 +1705,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected deterministic identity mismatch"),
@@ -1751,6 +1754,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let report = measure_signing_backend(
             "deterministic",
@@ -1833,6 +1837,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         }
     }
 
@@ -1931,6 +1936,7 @@ mod tests {
             signing_key_path: None,
             session_backend: SessionBackendKind::HybridDeterministicMlKemExperimental,
             session_key_path: Some("/tmp/ml-kem.session".into()),
+            session_ttl_millis: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected ML-KEM feature gate failure"),
@@ -1978,6 +1984,7 @@ mod tests {
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected ML-DSA feature gate failure"),
@@ -2044,6 +2051,7 @@ mod tests {
             signing_key_path: Some(key_path.display().to_string()),
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let backend = build_crypto_backend(&genesis, &config).unwrap();
         let signature = backend.sign(1, b"ml-dsa-backend").unwrap();
@@ -2108,6 +2116,7 @@ mod tests {
             signing_key_path: Some(key_path.display().to_string()),
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let report =
             measure_signing_backend("ml-dsa", &genesis, &config, 1, b"stage1c-measurement", 4)
@@ -2166,6 +2175,7 @@ mod tests {
             signing_key_path: Some("/tmp/ml-dsa.sk".into()),
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         let error = match build_crypto_backend(&genesis, &config) {
             Ok(_) => panic!("expected hybrid feature gate failure"),
@@ -2270,6 +2280,7 @@ mod tests {
             signing_key_path: None,
             session_backend,
             session_key_path,
+            session_ttl_millis: None,
         };
         (genesis, config)
     }
@@ -2529,6 +2540,7 @@ mod tests {
             signing_key_path: key_path,
             session_backend: SessionBackendKind::DevDeterministic,
             session_key_path: None,
+            session_ttl_millis: None,
         };
         (genesis, config)
     }
