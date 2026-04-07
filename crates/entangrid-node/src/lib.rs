@@ -1503,6 +1503,7 @@ impl NodeRunner {
         };
         let receipt_hash = receipt_signing_hash(&receipt);
         receipt.signature = self.crypto.sign(self.config.validator_id, &receipt_hash)?;
+        self.validate_hybrid_receipt_policy(&receipt)?;
         if self.store_receipt(receipt.clone())? {
             self.network
                 .broadcast(&self.config.peers, ProtocolMessage::RelayReceipt(receipt))?;
@@ -1528,6 +1529,11 @@ impl NodeRunner {
         let receipt_hash = canonical_hash(&receipt);
         if self.seen_receipts.contains(&receipt_hash) {
             return Ok(());
+        }
+        if let Err(error) = self.validate_hybrid_receipt_policy(receipt) {
+            self.invalid_receipts += 1;
+            self.record_invalid_receipt(receipt.epoch, receipt.witness_validator_id);
+            return Err(error);
         }
         let receipt_hash_to_verify = receipt_signing_hash(&receipt);
         let verified = self.crypto.verify(
@@ -1778,6 +1784,23 @@ impl NodeRunner {
             return Err(anyhow!(
                 "hybrid enforcement requires block proposer {} to sign with a hybrid signature",
                 block.header.proposer_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_hybrid_receipt_policy(&self, receipt: &RelayReceipt) -> Result<()> {
+        if !self
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures
+        {
+            return Ok(());
+        }
+        if receipt.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires relay receipt from validator {} to use a hybrid signature",
+                receipt.witness_validator_id
             ));
         }
         Ok(())
@@ -5543,6 +5566,59 @@ mod tests {
         }
     }
 
+    fn signed_receipt(
+        crypto: &dyn CryptoBackend,
+        witness_validator_id: ValidatorId,
+        source_validator_id: ValidatorId,
+        destination_validator_id: ValidatorId,
+        epoch: Epoch,
+        slot: u64,
+        message_class: MessageClass,
+    ) -> RelayReceipt {
+        let mut receipt = RelayReceipt {
+            epoch,
+            slot,
+            source_validator_id,
+            destination_validator_id,
+            witness_validator_id,
+            message_class,
+            transcript_digest: [1u8; 32],
+            latency_bucket_ms: 100,
+            byte_count_bucket: 8,
+            sequence_number: 7,
+            signature: TypedSignature::default(),
+        };
+        let receipt_hash = receipt_signing_hash(&receipt);
+        receipt.signature = crypto.sign(witness_validator_id, &receipt_hash).unwrap();
+        receipt
+    }
+
+    fn valid_receipt_assignment_for_witness(
+        consensus: &ConsensusEngine,
+        epoch: Epoch,
+        witness_validator_id: ValidatorId,
+    ) -> (ValidatorId, ValidatorId) {
+        consensus
+            .assignments_for_epoch(epoch)
+            .into_iter()
+            .find_map(|(source_validator_id, assignment)| {
+                assignment
+                    .witnesses
+                    .contains(&witness_validator_id)
+                    .then(|| {
+                        assignment
+                            .relay_targets
+                            .first()
+                            .copied()
+                            .map(|destination_validator_id| {
+                                (source_validator_id, destination_validator_id)
+                            })
+                    })
+                    .flatten()
+            })
+            .expect("receipt fixture should find a valid assignment")
+    }
+
     fn first_valid_block(genesis: &GenesisConfig) -> Block {
         let crypto = DeterministicCryptoBackend::from_genesis(genesis);
         let consensus = ConsensusEngine::new(genesis.clone());
@@ -6098,6 +6174,251 @@ mod tests {
         );
         assert!(runner.proposal_votes.is_empty());
         assert!(runner.buffered_proposal_votes.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_receipt_signature() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "receipt-reject");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let epoch = 1;
+        let (source_validator_id, destination_validator_id) =
+            valid_receipt_assignment_for_witness(&runner.consensus, epoch, 3);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let receipt = signed_receipt(
+            &crypto,
+            3,
+            source_validator_id,
+            destination_validator_id,
+            epoch,
+            epoch * runner.genesis.slots_per_epoch,
+            MessageClass::Transaction,
+        );
+
+        assert!(
+            !runner.store_receipt(receipt).unwrap(),
+            "strict receipt import should reject a non-hybrid signature"
+        );
+        assert!(runner.receipts.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_non_hybrid_receipt_signature_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "receipt-permissive");
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let epoch = 1;
+        let (source_validator_id, destination_validator_id) =
+            valid_receipt_assignment_for_witness(&runner.consensus, epoch, 3);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let receipt = signed_receipt(
+            &crypto,
+            3,
+            source_validator_id,
+            destination_validator_id,
+            epoch,
+            epoch * runner.genesis.slots_per_epoch,
+            MessageClass::Transaction,
+        );
+        assert!(runner.store_receipt(receipt.clone()).unwrap());
+        assert_eq!(runner.receipts.len(), 1);
+        assert_eq!(runner.receipts[0], receipt);
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_hybrid_receipt_signature() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-node-hybrid-receipt-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut genesis = hybridized_sample_genesis();
+        genesis.validators[0].public_identity = PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{}", 1).into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: verifying_key.encode().as_slice().to_vec(),
+            },
+        ])
+        .unwrap();
+
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "hybrid-receipt-runner",
+        );
+        config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        config.signing_key_path = Some(key_path.display().to_string());
+        config.feature_flags.require_hybrid_validator_signatures = true;
+
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let epoch = 1;
+        let (source_validator_id, destination_validator_id) = valid_receipt_assignment_for_witness(
+            &runner.consensus,
+            epoch,
+            runner.config.validator_id,
+        );
+        let receipt = signed_receipt(
+            runner.crypto.as_ref(),
+            runner.config.validator_id,
+            source_validator_id,
+            destination_validator_id,
+            epoch,
+            epoch * runner.genesis.slots_per_epoch,
+            MessageClass::Transaction,
+        );
+
+        assert_eq!(receipt.signature.scheme(), SignatureScheme::Hybrid);
+        assert!(runner.store_receipt(receipt.clone()).unwrap());
+        assert_eq!(runner.receipts.len(), 1);
+        assert_eq!(runner.receipts[0], receipt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_local_receipt_emission() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(
+            3,
+            reserve_local_address(),
+            Vec::new(),
+            "receipt-local-reject",
+        );
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(3, config, genesis.clone()).await;
+        let epoch = 1;
+        let (source_validator_id, destination_validator_id) = valid_receipt_assignment_for_witness(
+            &runner.consensus,
+            epoch,
+            runner.config.validator_id,
+        );
+
+        let error = runner
+            .maybe_issue_receipt(
+                source_validator_id,
+                destination_validator_id,
+                MessageClass::Transaction,
+                epoch * runner.genesis.slots_per_epoch,
+                [2u8; 32],
+                [3u8; 32],
+                9,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("hybrid signature"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.receipts.is_empty());
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_hybrid_mode_emits_hybrid_relay_receipts() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-node-hybrid-receipt-emission-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut genesis = hybridized_sample_genesis();
+        genesis.validators[2].public_identity = PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{}", 3).into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: verifying_key.encode().as_slice().to_vec(),
+            },
+        ])
+        .unwrap();
+
+        let mut config = sample_node_config(
+            3,
+            reserve_local_address(),
+            Vec::new(),
+            "receipt-local-hybrid",
+        );
+        config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        config.signing_key_path = Some(key_path.display().to_string());
+        config.feature_flags.require_hybrid_validator_signatures = true;
+
+        let mut runner = build_test_runner(3, config, genesis.clone()).await;
+        let epoch = 1;
+        let (source_validator_id, destination_validator_id) = valid_receipt_assignment_for_witness(
+            &runner.consensus,
+            epoch,
+            runner.config.validator_id,
+        );
+
+        runner
+            .maybe_issue_receipt(
+                source_validator_id,
+                destination_validator_id,
+                MessageClass::Transaction,
+                epoch * runner.genesis.slots_per_epoch,
+                [2u8; 32],
+                [3u8; 32],
+                9,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(runner.receipts.len(), 1);
+        assert_eq!(runner.receipts[0].witness_validator_id, 3);
+        assert_eq!(
+            runner.receipts[0].signature.scheme(),
+            SignatureScheme::Hybrid
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
