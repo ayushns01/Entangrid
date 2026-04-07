@@ -18,7 +18,7 @@ Current status note:
 - committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
 - stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
-- on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, blocks, proposal votes, and relay receipts
+- on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, blocks, proposal votes, relay receipts, and service attestations
 - Stage 1F plus Stage 1H add a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - that Stage 1F mode is an operational/bootstrap slice, not the full hybrid performance matrix
 
@@ -265,7 +265,7 @@ Current PQ Stage 1 direction:
 - the first experimental PQ signing path is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - hybrid signature and identity bundles now exist for the core signed objects
 - verification is permissive during rollout, so matching deterministic-only, ML-DSA-only, and hybrid signatures can all validate
-- hybrid policy enforcement is now available for validator startup, blocks, proposal votes, and relay receipts behind the current rollout flag, while wider enforcement across the rest of the signed surfaces still comes later
+- hybrid policy enforcement is now available for validator startup, blocks, proposal votes, relay receipts, and service attestations behind the current rollout flag, while wider enforcement across the rest of the signed surfaces still comes later
 - Stage 1F and Stage 1H extend this with a strict hybrid localnet bootstrap path that turns the hybrid signing and session policy into runnable simulator output, but only for the operational smoke case described above
 
 ## Slashing And Rewards

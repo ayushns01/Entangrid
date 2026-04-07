@@ -127,7 +127,7 @@ Important:
   - inbound hybrid lanes close expired streams before accepting the next application frame, so expiry stays transport-local instead of leaking into node logic
   - deterministic transport remains the default path when `pq-ml-kem` is off
   - session rotation and stronger traffic-shaping features still come later
-  - relay receipts now join blocks and proposal votes under the strict hybrid-enforcement slice, while transactions and service evidence still remain outside it
+  - relay receipts and service attestations now join blocks and proposal votes under the strict hybrid-enforcement slice, while transactions and service aggregates still remain outside it
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back

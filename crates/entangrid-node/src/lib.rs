@@ -1806,6 +1806,26 @@ impl NodeRunner {
         Ok(())
     }
 
+    fn validate_hybrid_service_attestation_policy(
+        &self,
+        attestation: &ServiceAttestation,
+    ) -> Result<()> {
+        if !self
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures
+        {
+            return Ok(());
+        }
+        if attestation.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires service attestation from committee member {} to use a hybrid signature",
+                attestation.committee_member_id
+            ));
+        }
+        Ok(())
+    }
+
     fn maybe_broadcast_vote_for_competing_block(&mut self, block: &Block) -> Result<()> {
         if !self.config.feature_flags.consensus_v2 {
             return Ok(());
@@ -4357,6 +4377,7 @@ impl NodeRunner {
         };
         let hash = service_attestation_signing_hash(&attestation);
         attestation.signature = self.crypto.sign(self.config.validator_id, &hash)?;
+        self.validate_hybrid_service_attestation_policy(&attestation)?;
         Ok(attestation)
     }
 
@@ -4377,6 +4398,7 @@ impl NodeRunner {
                 "service attestation signer is not in the service committee"
             ));
         }
+        self.validate_hybrid_service_attestation_policy(attestation)?;
         let hash = service_attestation_signing_hash(attestation);
         let verified = self.crypto.verify(
             attestation.committee_member_id,
@@ -5468,7 +5490,9 @@ mod tests {
         time::Duration,
     };
 
-    use entangrid_crypto::{CryptoBackend, DeterministicCryptoBackend, Signer};
+    use entangrid_crypto::{
+        CryptoBackend, DeterministicCryptoBackend, Signer, build_crypto_backend,
+    };
     use entangrid_network::{NetworkEvent, spawn_network};
     use entangrid_types::{
         ChunkedSyncResponse, FaultProfile, FeatureFlags, GenesisConfig, NodeConfig, PeerConfig,
@@ -5617,6 +5641,29 @@ mod tests {
                     .flatten()
             })
             .expect("receipt fixture should find a valid assignment")
+    }
+
+    fn first_service_committee_member_for_subject(
+        consensus: &ConsensusEngine,
+        epoch: Epoch,
+        subject_validator_id: ValidatorId,
+    ) -> ValidatorId {
+        consensus.service_committee_for(epoch, subject_validator_id)[0]
+    }
+
+    fn service_attestation_subject_for_committee_member(
+        consensus: &ConsensusEngine,
+        validator_count: usize,
+        epoch: Epoch,
+        committee_member_id: ValidatorId,
+    ) -> ValidatorId {
+        (1..=validator_count as ValidatorId)
+            .find(|subject_validator_id| {
+                consensus
+                    .service_committee_for(epoch, *subject_validator_id)
+                    .contains(&committee_member_id)
+            })
+            .expect("attestation fixture should find a valid subject for the committee member")
     }
 
     fn first_valid_block(genesis: &GenesisConfig) -> Block {
@@ -14188,6 +14235,256 @@ mod tests {
                 .to_string()
                 .contains("invalid service attestation signature")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_service_attestation_signature() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "attestation-reject");
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let subject_validator_id = 1;
+        let committee_member_id =
+            first_service_committee_member_for_subject(&runner.consensus, 1, subject_validator_id);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let attestation = signed_service_attestation(
+            &crypto,
+            subject_validator_id,
+            committee_member_id,
+            1,
+            ServiceCounters::default(),
+        );
+
+        let error = runner.import_service_attestation(attestation).unwrap_err();
+
+        assert!(
+            error.to_string().contains("hybrid signature"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.service_attestations.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_non_hybrid_service_attestation_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-permissive",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let subject_validator_id = 1;
+        let committee_member_id =
+            first_service_committee_member_for_subject(&runner.consensus, 1, subject_validator_id);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let attestation = signed_service_attestation(
+            &crypto,
+            subject_validator_id,
+            committee_member_id,
+            1,
+            ServiceCounters::default(),
+        );
+
+        assert!(
+            runner
+                .import_service_attestation(attestation.clone())
+                .unwrap()
+        );
+        let stored = runner
+            .service_attestations
+            .get(&(subject_validator_id, 1))
+            .and_then(|by_member| by_member.get(&committee_member_id))
+            .expect("attestation should be stored under permissive mode");
+        assert_eq!(stored, &attestation);
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_hybrid_service_attestation_signature() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut genesis = sample_genesis();
+        let subject_validator_id = 1;
+        let committee_member_id = first_service_committee_member_for_subject(
+            &ConsensusEngine::new(genesis.clone()),
+            1,
+            subject_validator_id,
+        );
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-node-hybrid-attestation-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        genesis.validators[(committee_member_id - 1) as usize].public_identity =
+            PublicIdentity::try_hybrid(vec![
+                entangrid_types::PublicIdentityComponent {
+                    scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                    bytes: format!("validator-{committee_member_id}").into_bytes(),
+                },
+                entangrid_types::PublicIdentityComponent {
+                    scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                    bytes: verifying_key.encode().as_slice().to_vec(),
+                },
+            ])
+            .unwrap();
+
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "attestation-hybrid");
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+
+        let mut signer_config = sample_node_config(
+            committee_member_id,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-hybrid-signer",
+        );
+        signer_config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        signer_config.signing_key_path = Some(key_path.display().to_string());
+        let signer = build_crypto_backend(&genesis, &signer_config).unwrap();
+
+        let attestation = signed_service_attestation(
+            signer.as_ref(),
+            subject_validator_id,
+            committee_member_id,
+            1,
+            ServiceCounters::default(),
+        );
+
+        assert_eq!(attestation.signature.scheme(), SignatureScheme::Hybrid);
+        assert!(
+            runner
+                .import_service_attestation(attestation.clone())
+                .unwrap()
+        );
+        let stored = runner
+            .service_attestations
+            .get(&(subject_validator_id, 1))
+            .and_then(|by_member| by_member.get(&committee_member_id))
+            .expect("hybrid attestation should be stored");
+        assert_eq!(stored, &attestation);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_local_service_attestation_emission() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(
+            2,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-local-reject",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let runner = build_test_runner(2, config, genesis.clone()).await;
+        let subject_validator_id = service_attestation_subject_for_committee_member(
+            &runner.consensus,
+            runner.genesis.validators.len(),
+            1,
+            runner.config.validator_id,
+        );
+
+        let error = runner
+            .build_local_service_attestation(subject_validator_id, 1)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("hybrid signature"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_hybrid_mode_emits_hybrid_service_attestations() {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-node-hybrid-attestation-emission-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut genesis = hybridized_sample_genesis();
+        genesis.validators[1].public_identity = PublicIdentity::try_hybrid(vec![
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                bytes: format!("validator-{}", 2).into_bytes(),
+            },
+            entangrid_types::PublicIdentityComponent {
+                scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                bytes: verifying_key.encode().as_slice().to_vec(),
+            },
+        ])
+        .unwrap();
+
+        let mut config = sample_node_config(
+            2,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-local-hybrid",
+        );
+        config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        config.signing_key_path = Some(key_path.display().to_string());
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+
+        let runner = build_test_runner(2, config, genesis.clone()).await;
+        let subject_validator_id = service_attestation_subject_for_committee_member(
+            &runner.consensus,
+            runner.genesis.validators.len(),
+            1,
+            runner.config.validator_id,
+        );
+        let attestation = runner
+            .build_local_service_attestation(subject_validator_id, 1)
+            .unwrap();
+
+        assert_eq!(attestation.committee_member_id, 2);
+        assert_eq!(attestation.subject_validator_id, subject_validator_id);
+        assert_eq!(attestation.signature.scheme(), SignatureScheme::Hybrid);
     }
 
     #[tokio::test(flavor = "current_thread")]
