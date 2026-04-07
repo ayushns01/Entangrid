@@ -18,7 +18,7 @@ Current status note:
 - committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
 - stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
-- on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, blocks, proposal votes, relay receipts, and service attestations
+- on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, transactions, blocks, proposal votes, relay receipts, and service attestations
 - service aggregates remain unsigned, but they now inherit strict hybrid enforcement transitively through validated embedded service attestations, which closes Stage 1K
 - Stage 1F plus Stage 1H add a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - that Stage 1F mode is an operational/bootstrap slice, not the full hybrid performance matrix
@@ -203,9 +203,10 @@ Current PQ Stage 1E note on `stage-1/pq-integration`:
 
 - hybrid enforcement is opt-in, not default
 - when enabled, every validator in genesis must advertise a hybrid public identity
+- validator-originated transaction signatures must be hybrid
 - validator-originated block signatures must be hybrid
 - validator-originated proposal-vote signatures, including votes imported through quorum certificates, must be hybrid
-- transactions, receipts, and service evidence remain outside this enforcement slice
+- relay receipts and service attestations must also be hybrid, while service aggregates inherit that policy transitively through their embedded attestation set
 
 Current PQ Stage 1I note on `stage-1/pq-integration`:
 
@@ -266,7 +267,7 @@ Current PQ Stage 1 direction:
 - the first experimental PQ signing path is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - hybrid signature and identity bundles now exist for the core signed objects
 - verification is permissive during rollout, so matching deterministic-only, ML-DSA-only, and hybrid signatures can all validate
-- hybrid policy enforcement is now available for validator startup, blocks, proposal votes, relay receipts, and service attestations behind the current rollout flag; service aggregates inherit that enforcement transitively through their embedded attestation set, while wider enforcement across the rest of the signed surfaces still comes later
+- hybrid policy enforcement is now available for validator startup, transactions, blocks, proposal votes, relay receipts, and service attestations behind the current rollout flag; service aggregates inherit that enforcement transitively through their embedded attestation set, while wider enforcement across the rest of the signed surfaces still comes later
 - Stage 1F and Stage 1H extend this with a strict hybrid localnet bootstrap path that turns the hybrid signing and session policy into runnable simulator output, but only for the operational smoke case described above
 
 ## Slashing And Rewards

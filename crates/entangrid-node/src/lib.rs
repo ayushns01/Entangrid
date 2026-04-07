@@ -732,8 +732,9 @@ impl NodeRunner {
         let mut simulated_ledger = self.ledger.clone();
         let mut accepted = Vec::new();
         for transaction in transactions {
-            if simulated_ledger
-                .validate_tx(&transaction, self.crypto.as_ref())
+            if self
+                .validate_hybrid_transaction_policy(&transaction)
+                .and_then(|_| simulated_ledger.validate_tx(&transaction, self.crypto.as_ref()))
                 .is_ok()
                 && simulated_ledger.apply_transaction(&transaction).is_ok()
             {
@@ -1451,10 +1452,15 @@ impl NodeRunner {
             .collect();
         pending.sort_by_key(|pending| pending.transaction.nonce);
         for pending_tx in pending {
-            if state.validate_tx(&pending_tx, self.crypto.as_ref()).is_ok() {
+            if self
+                .validate_hybrid_transaction_policy(&pending_tx)
+                .and_then(|_| state.validate_tx(&pending_tx, self.crypto.as_ref()))
+                .is_ok()
+            {
                 let _ = state.apply_transaction(&pending_tx);
             }
         }
+        self.validate_hybrid_transaction_policy(transaction)?;
         state.validate_tx(transaction, self.crypto.as_ref())
     }
 
@@ -1632,6 +1638,9 @@ impl NodeRunner {
         if let Some(commitment) = &block.commitment {
             self.validate_commitment(commitment, &block.commitment_receipts)?;
         }
+        for transaction in &block.transactions {
+            self.validate_hybrid_transaction_policy(transaction)?;
+        }
         self.validate_hybrid_block_policy(&block)?;
 
         if block.header.parent_hash != self.ledger.snapshot().tip_hash {
@@ -1784,6 +1793,23 @@ impl NodeRunner {
             return Err(anyhow!(
                 "hybrid enforcement requires block proposer {} to sign with a hybrid signature",
                 block.header.proposer_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_hybrid_transaction_policy(&self, transaction: &SignedTransaction) -> Result<()> {
+        if !self
+            .config
+            .feature_flags
+            .require_hybrid_validator_signatures
+        {
+            return Ok(());
+        }
+        if transaction.signature.scheme() != entangrid_types::SignatureScheme::Hybrid {
+            return Err(anyhow!(
+                "hybrid enforcement requires transaction from validator {} to use a hybrid signature",
+                transaction.signer_id
             ));
         }
         Ok(())
@@ -6186,7 +6212,7 @@ mod tests {
         let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "block-reject");
         config.feature_flags.require_hybrid_validator_signatures = true;
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
-        let block = first_valid_block(&genesis);
+        let block = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
 
         let error = runner.accept_block(block, true).await.unwrap_err();
         assert!(
@@ -6325,6 +6351,191 @@ mod tests {
         assert!(runner.store_receipt(receipt.clone()).unwrap());
         assert_eq!(runner.receipts.len(), 1);
         assert_eq!(runner.receipts[0], receipt);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_non_hybrid_transaction_signature() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "tx-reject");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let transaction = Transaction {
+            from: validator_account(2),
+            to: validator_account(1),
+            amount: 10,
+            nonce: 0,
+            memo: Some("tx-reject".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed_transaction = SignedTransaction {
+            transaction,
+            signer_id: 2,
+            signature: crypto.sign(2, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        let error = runner
+            .handle_transaction(signed_transaction, 2, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("transaction from validator 2"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.mempool.is_empty());
+        assert!(runner.seen_transactions.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_non_hybrid_transaction_signature_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "tx-permissive");
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let transaction = Transaction {
+            from: validator_account(2),
+            to: validator_account(1),
+            amount: 10,
+            nonce: 0,
+            memo: Some("tx-permissive".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed_transaction = SignedTransaction {
+            transaction,
+            signer_id: 2,
+            signature: crypto.sign(2, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        runner
+            .handle_transaction(signed_transaction.clone(), 2, false)
+            .await
+            .unwrap();
+
+        assert_eq!(runner.mempool.len(), 1);
+        let stored = runner
+            .mempool
+            .get(&signed_transaction.tx_hash)
+            .expect("transaction should be stored under permissive mode");
+        assert_eq!(stored, &signed_transaction);
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_hybrid_transaction_signature() {
+        let mut genesis = hybridized_sample_genesis();
+        let signer = real_hybrid_signer_for_validator(&mut genesis, 2, "hybrid-tx-signer");
+        let mut config = sample_node_config(1, reserve_local_address(), Vec::new(), "tx-hybrid");
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let transaction = Transaction {
+            from: validator_account(2),
+            to: validator_account(1),
+            amount: 10,
+            nonce: 0,
+            memo: Some("tx-hybrid".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed_transaction = SignedTransaction {
+            transaction,
+            signer_id: 2,
+            signature: signer.sign(2, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        assert_eq!(
+            signed_transaction.signature.scheme(),
+            SignatureScheme::Hybrid
+        );
+        runner
+            .handle_transaction(signed_transaction.clone(), 2, false)
+            .await
+            .unwrap();
+
+        let stored = runner
+            .mempool
+            .get(&signed_transaction.tx_hash)
+            .expect("hybrid transaction should be stored");
+        assert_eq!(stored.signature.scheme(), SignatureScheme::Hybrid);
+        assert_eq!(stored, &signed_transaction);
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_block_with_non_hybrid_transaction_signature() {
+        let mut genesis = hybridized_sample_genesis();
+        let block_signer = real_hybrid_signer_for_validator(&mut genesis, 1, "hybrid-block-tx");
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "block-non-hybrid-tx-reject",
+        );
+        config.feature_flags.consensus_v2 = false;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let deterministic_crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let mut ledger = LedgerState::from_genesis(&genesis);
+
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: Some("block-non-hybrid-tx".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed_transaction = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: deterministic_crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+        ledger.apply_transaction(&signed_transaction).unwrap();
+
+        let slot = (0..20)
+            .find(|slot| consensus.proposer_for_slot(*slot) == 1)
+            .unwrap();
+        let epoch = consensus.epoch_for_slot(slot);
+        let transactions = vec![signed_transaction];
+        let commitment: Option<TopologyCommitment> = None;
+        let header = BlockHeader {
+            block_number: 1,
+            parent_hash: empty_hash(),
+            slot,
+            epoch,
+            proposer_id: 1,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: ledger.state_root(),
+            transactions_root: canonical_hash(&transactions),
+            topology_root: empty_hash(),
+        };
+        let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+        let block = Block {
+            header,
+            transactions,
+            commitment,
+            commitment_receipts: Vec::new(),
+            signature: block_signer.sign(1, &block_hash).unwrap(),
+            block_hash,
+        };
+
+        assert_eq!(block.signature.scheme(), SignatureScheme::Hybrid);
+        let error = runner.accept_block(block, false).await.unwrap_err();
+        assert!(
+            error.to_string().contains("transaction from validator 1"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.blocks.is_empty());
     }
 
     #[cfg(feature = "pq-ml-dsa")]

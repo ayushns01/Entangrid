@@ -65,7 +65,7 @@ The current PQ branch now also supports:
 - scheme-aware verification for both deterministic and ML-DSA signatures
 - hybrid deterministic + ML-DSA signing through `HybridDeterministicMlDsaExperimental`
 - permissive verification against hybrid identities so single-scheme and hybrid signatures can coexist during rollout
-- an opt-in `require_hybrid_validator_signatures` mode in node policy that now enforces hybrid validator identities plus hybrid block/proposal-vote/relay-receipt/service-attestation signatures
+- an opt-in `require_hybrid_validator_signatures` mode in node policy that now enforces hybrid validator identities plus hybrid transaction/block/proposal-vote/relay-receipt/service-attestation signatures
 - the simulator's strict hybrid localnet bootstrap path now requires `pq-ml-dsa` and `pq-ml-kem`, writes both signing and session key files, and turns on `require_hybrid_validator_signatures = true` together with `consensus_v2 = true`
 - a separate session identity/config surface through `ValidatorConfig.session_public_identity`, `NodeConfig.session_backend`, and `NodeConfig.session_key_path`
 - a feature-gated per-stream handshake behind `pq-ml-kem` using `SessionClientHello` / `SessionServerHello`
@@ -78,10 +78,10 @@ Current enforcement boundary:
 
 - blocks: enforced when the flag is on
 - proposal votes, including votes imported via quorum certificates: enforced when the flag is on
+- transactions: enforced when the flag is on
 - relay receipts: enforced when the flag is on
 - service attestations: enforced when the flag is on
 - service aggregates: inherit enforcement transitively because aggregate validation re-validates each embedded attestation
-- transactions: not enforced yet
 - hybrid transport sessions now authenticate the handshake and encrypt later frame bodies automatically
 
 ## How to measure ML-DSA signing right now
