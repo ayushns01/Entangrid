@@ -5666,6 +5666,57 @@ mod tests {
             .expect("attestation fixture should find a valid subject for the committee member")
     }
 
+    #[cfg(feature = "pq-ml-dsa")]
+    fn real_hybrid_signer_for_validator(
+        genesis: &mut GenesisConfig,
+        validator_id: ValidatorId,
+        label: &str,
+    ) -> Arc<dyn CryptoBackend> {
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-node-{label}-{validator_id}-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        genesis.validators[(validator_id - 1) as usize].public_identity =
+            PublicIdentity::try_hybrid(vec![
+                entangrid_types::PublicIdentityComponent {
+                    scheme: entangrid_types::PublicKeyScheme::DevDeterministic,
+                    bytes: format!("validator-{validator_id}").into_bytes(),
+                },
+                entangrid_types::PublicIdentityComponent {
+                    scheme: entangrid_types::PublicKeyScheme::MlDsa,
+                    bytes: verifying_key.encode().as_slice().to_vec(),
+                },
+            ])
+            .unwrap();
+
+        let mut config =
+            sample_node_config(validator_id, reserve_local_address(), Vec::new(), label);
+        config.signing_backend =
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        config.signing_key_path = Some(key_path.display().to_string());
+        build_crypto_backend(genesis, &config).unwrap()
+    }
+
     fn first_valid_block(genesis: &GenesisConfig) -> Block {
         let crypto = DeterministicCryptoBackend::from_genesis(genesis);
         let consensus = ConsensusEngine::new(genesis.clone());
@@ -14504,6 +14555,169 @@ mod tests {
         let error = runner.import_service_aggregate(aggregate).unwrap_err();
 
         assert!(error.to_string().contains("aggregate payload is malformed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_rejects_service_aggregate_with_non_hybrid_attestation() {
+        let genesis = hybridized_sample_genesis();
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "aggregate-hybrid-reject",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let aggregate = service_aggregate_for_subject(
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+
+        let error = runner.import_service_aggregate(aggregate).unwrap_err();
+
+        assert!(
+            error.to_string().contains("hybrid signature"),
+            "unexpected error: {error}"
+        );
+        assert!(runner.service_aggregates.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_service_aggregate_when_disabled() {
+        let genesis = sample_genesis();
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "aggregate-permissive",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = false;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let aggregate = service_aggregate_for_subject(
+            &DeterministicCryptoBackend::from_genesis(&genesis),
+            &runner.consensus,
+            1,
+            1,
+            ServiceCounters::default(),
+        );
+
+        assert!(runner.import_service_aggregate(aggregate.clone()).unwrap());
+        assert_eq!(runner.service_aggregates.get(&(1, 1)).unwrap(), &aggregate);
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_enforcement_accepts_service_aggregate_with_hybrid_attestations() {
+        let mut genesis = hybridized_sample_genesis();
+        let subject_validator_id = 1;
+        let epoch = 1;
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let committee = consensus.service_committee_for(epoch, subject_validator_id);
+        let mut signers = BTreeMap::new();
+        for committee_member_id in &committee {
+            let signer = real_hybrid_signer_for_validator(
+                &mut genesis,
+                *committee_member_id,
+                "aggregate-hybrid-signer",
+            );
+            signers.insert(*committee_member_id, signer);
+        }
+
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "aggregate-hybrid-accept",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let attestations = committee
+            .into_iter()
+            .map(|committee_member_id| {
+                signed_service_attestation(
+                    signers.get(&committee_member_id).unwrap().as_ref(),
+                    subject_validator_id,
+                    committee_member_id,
+                    epoch,
+                    ServiceCounters::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let aggregate =
+            service_aggregate_from_attestations(subject_validator_id, epoch, attestations);
+
+        assert!(
+            aggregate
+                .attestations
+                .iter()
+                .all(|attestation| attestation.signature.scheme() == SignatureScheme::Hybrid)
+        );
+        assert!(runner.import_service_aggregate(aggregate.clone()).unwrap());
+        assert_eq!(
+            runner
+                .service_aggregates
+                .get(&(subject_validator_id, epoch))
+                .unwrap(),
+            &aggregate
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn strict_hybrid_mode_builds_service_aggregate_from_hybrid_attestations() {
+        let mut genesis = hybridized_sample_genesis();
+        let subject_validator_id = 1;
+        let epoch = 1;
+        let consensus = ConsensusEngine::new(genesis.clone());
+        let committee = consensus.service_committee_for(epoch, subject_validator_id);
+        let mut signers = BTreeMap::new();
+        for committee_member_id in &committee {
+            let signer = real_hybrid_signer_for_validator(
+                &mut genesis,
+                *committee_member_id,
+                "aggregate-hybrid-build",
+            );
+            signers.insert(*committee_member_id, signer);
+        }
+
+        let mut config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "aggregate-hybrid-build-runner",
+        );
+        config.feature_flags.consensus_v2 = true;
+        config.feature_flags.require_hybrid_validator_signatures = true;
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        for committee_member_id in committee.clone() {
+            let attestation = signed_service_attestation(
+                signers.get(&committee_member_id).unwrap().as_ref(),
+                subject_validator_id,
+                committee_member_id,
+                epoch,
+                ServiceCounters::default(),
+            );
+            runner.import_service_attestation(attestation).unwrap();
+        }
+
+        let aggregate = runner
+            .build_service_aggregate(subject_validator_id, epoch)
+            .unwrap()
+            .expect("strict mode should build aggregate from imported hybrid attestations");
+
+        assert_eq!(aggregate.subject_validator_id, subject_validator_id);
+        assert!(
+            aggregate
+                .attestations
+                .iter()
+                .all(|attestation| attestation.signature.scheme() == SignatureScheme::Hybrid)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

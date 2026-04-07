@@ -80,7 +80,8 @@ Current enforcement boundary:
 - proposal votes, including votes imported via quorum certificates: enforced when the flag is on
 - relay receipts: enforced when the flag is on
 - service attestations: enforced when the flag is on
-- transactions and service aggregates: not enforced yet
+- service aggregates: inherit enforcement transitively because aggregate validation re-validates each embedded attestation
+- transactions: not enforced yet
 - hybrid transport sessions now authenticate the handshake and encrypt later frame bodies automatically
 
 ## How to measure ML-DSA signing right now
