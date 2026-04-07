@@ -1025,6 +1025,14 @@ impl TranscriptHasher for DeterministicCryptoBackend {
 }
 
 impl ConfiguredCryptoBackend {
+    fn encrypt_frames_for_local_session_backend(&self) -> bool {
+        match &self.local_session_backend {
+            LocalSessionBackend::Deterministic => false,
+            #[cfg(feature = "pq-ml-kem")]
+            LocalSessionBackend::HybridDeterministicMlKem768(_) => true,
+        }
+    }
+
     #[cfg(feature = "pq-ml-kem")]
     fn expected_session_identity(
         &self,
@@ -1410,7 +1418,7 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
             kem_component.as_slice(),
             client_hello,
             &server_hello,
-            true,
+            self.encrypt_frames_for_local_session_backend(),
         )?;
         Ok((server_hello, session))
     }
@@ -1491,7 +1499,7 @@ impl HandshakeProvider for ConfiguredCryptoBackend {
             kem_component.as_slice(),
             client_hello,
             server_hello,
-            true,
+            self.encrypt_frames_for_local_session_backend(),
         )
     }
 
@@ -1855,6 +1863,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(client_session, server_session);
+        assert!(!client_session.encrypt_frames);
+        assert!(!server_session.encrypt_frames);
     }
 
     #[test]
@@ -2398,6 +2408,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(client_session, server_session);
+        assert!(client_session.encrypt_frames);
+        assert!(server_session.encrypt_frames);
     }
 
     #[cfg(feature = "pq-ml-kem")]

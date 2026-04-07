@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use entangrid_crypto::deterministic_public_identity;
-use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+use entangrid_crypto::{
+    DeterministicCryptoBackend, FrameDirection, HandshakeProvider, Signer, encrypt_frame_payload,
+};
 #[cfg(feature = "pq-ml-dsa")]
 use entangrid_crypto::{build_crypto_backend, measure_signing_backend};
 #[cfg(feature = "pq-ml-dsa")]
@@ -19,9 +21,9 @@ use entangrid_types::{
 };
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, ProtocolMessage, ServiceScoreWeights, SessionBackendKind, SignedEnvelope,
-    SignedTransaction, SigningBackendKind, Transaction, ValidatorConfig, canonical_hash,
-    default_service_delivery_weight, default_service_diversity_weight,
+    PeerConfig, ProtocolMessage, ServiceScoreWeights, SessionBackendKind, SessionServerHello,
+    SignedEnvelope, SignedTransaction, SigningBackendKind, Transaction, ValidatorConfig,
+    canonical_hash, default_service_delivery_weight, default_service_diversity_weight,
     default_service_gating_start_epoch, default_service_gating_threshold,
     default_service_penalty_weight, default_service_score_weights,
     default_service_score_window_epochs, default_service_uptime_weight, empty_hash,
@@ -35,9 +37,9 @@ use ml_dsa::{KeyGen, MlDsa65};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 #[cfg(any(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
 use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     process::{Child, Command},
 };
@@ -725,7 +727,7 @@ async fn run_matrix_scenario(
         scenario.degraded_delay_ms,
         scenario.degraded_drop_probability,
         scenario.degraded_disable_outbound,
-        false,
+        true,
         false,
     )?;
 
@@ -877,6 +879,22 @@ async fn send_protocol_message(
     peer: &PeerConfig,
     payload: ProtocolMessage,
 ) -> Result<()> {
+    let mut stream = TcpStream::connect(&peer.address).await?;
+    let client_hello = crypto.build_client_hello(
+        from_validator_id,
+        peer.validator_id,
+        canonical_hash(&(
+            "entangrid-network-session",
+            from_validator_id,
+            peer.validator_id,
+            now_unix_millis(),
+        )),
+    )?;
+    write_bincode_frame(&mut stream, &client_hello).await?;
+    let server_hello: SessionServerHello = read_bincode_frame(&mut stream).await?;
+    let session =
+        crypto.finalize_client_session(from_validator_id, &client_hello, &server_hello)?;
+
     let message_hash = canonical_hash(&payload);
     let envelope = SignedEnvelope {
         from_validator_id,
@@ -884,12 +902,35 @@ async fn send_protocol_message(
         signature: crypto.sign(from_validator_id, &message_hash)?,
         payload,
     };
-    let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
-    let mut stream = TcpStream::connect(&peer.address).await?;
+    let payload = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
+    let frame = if session.encrypt_frames {
+        encrypt_frame_payload(&session, FrameDirection::Outbound, 0, &payload)?
+    } else {
+        payload
+    };
+    write_frame(&mut stream, &frame).await?;
+    Ok(())
+}
+
+async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
+    stream.write_all(bytes).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn write_bincode_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+    write_frame(stream, &bytes).await
+}
+
+async fn read_bincode_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
+    let frame_len = stream.read_u32().await? as usize;
+    let mut bytes = vec![0; frame_len];
+    stream.read_exact(&mut bytes).await?;
+    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+        .map(|(decoded, _)| decoded)
+        .map_err(|error| anyhow!("failed to decode simulator handshake frame: {error}"))
 }
 
 fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {

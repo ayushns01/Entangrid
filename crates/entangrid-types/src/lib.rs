@@ -1079,6 +1079,8 @@ pub struct ChainSnapshot {
     pub snapshot: StateSnapshot,
     pub blocks: Vec<Block>,
     pub receipts: Vec<RelayReceipt>,
+    #[serde(default)]
+    pub proposal_votes: Vec<ProposalVote>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

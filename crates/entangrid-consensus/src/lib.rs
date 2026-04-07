@@ -559,6 +559,7 @@ mod tests {
                     address: "127.0.0.1:3001".into(),
                     dev_secret: "one".into(),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 2,
@@ -566,6 +567,7 @@ mod tests {
                     address: "127.0.0.1:3002".into(),
                     dev_secret: "two".into(),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 3,
@@ -573,6 +575,7 @@ mod tests {
                     address: "127.0.0.1:3003".into(),
                     dev_secret: "three".into(),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 4,
@@ -580,6 +583,7 @@ mod tests {
                     address: "127.0.0.1:3004".into(),
                     dev_secret: "four".into(),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
             ],
             initial_balances: BTreeMap::new(),
@@ -602,6 +606,7 @@ mod tests {
                     address: format!("127.0.0.1:{}", 3000 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
                     public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),
