@@ -4460,7 +4460,7 @@ impl NodeRunner {
                 return Ok(false);
             }
             if !service_counters_dominate(&attestation.counters, &existing.counters) {
-                return Err(anyhow!("conflicting service attestation"));
+                return Ok(false);
             }
         }
         by_member.insert(attestation.committee_member_id, attestation.clone());
@@ -13185,6 +13185,126 @@ mod tests {
                 .counters,
             improved.counters
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomparable_service_attestation_update_is_ignored_not_fatal() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "attestation-incomparable",
+        );
+        let mut runner = build_test_runner(1, config, genesis).await;
+        let original = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 6,
+                total_windows: 6,
+                timely_deliveries: 1,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        let incomparable = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 6,
+                timely_deliveries: 6,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        assert!(runner.import_service_attestation(original.clone()).unwrap());
+        assert!(!runner.import_service_attestation(incomparable).unwrap());
+        assert_eq!(
+            runner
+                .service_attestations
+                .get(&(1, 1))
+                .and_then(|by_member| by_member.get(&2))
+                .unwrap()
+                .counters,
+            original.counters
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incomparable_service_attestation_in_aggregate_does_not_abort_merge() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(1, reserve_local_address(), Vec::new(), "aggregate-ignore");
+        let mut runner = build_test_runner(1, config, genesis).await;
+
+        let original = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 6,
+                total_windows: 6,
+                timely_deliveries: 1,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        let incomparable = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            2,
+            1,
+            ServiceCounters {
+                uptime_windows: 5,
+                total_windows: 6,
+                timely_deliveries: 6,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+        let additional = signed_service_attestation(
+            runner.crypto.as_ref(),
+            1,
+            3,
+            1,
+            ServiceCounters {
+                uptime_windows: 6,
+                total_windows: 6,
+                timely_deliveries: 6,
+                expected_deliveries: 6,
+                distinct_peers: 1,
+                expected_peers: 1,
+                failed_sessions: 0,
+                invalid_receipts: 0,
+            },
+        );
+
+        assert!(runner.import_service_attestation(original.clone()).unwrap());
+        let aggregate = service_aggregate_from_attestations(1, 1, vec![incomparable, additional]);
+        assert!(runner.import_service_aggregate(aggregate).unwrap());
+
+        let by_member = runner.service_attestations.get(&(1, 1)).unwrap();
+        assert_eq!(by_member.get(&2).unwrap().counters, original.counters);
+        assert_eq!(by_member.get(&3).unwrap().counters.timely_deliveries, 6);
     }
 
     #[tokio::test(flavor = "current_thread")]
