@@ -1284,35 +1284,19 @@ impl NodeRunner {
                         Ok(true) => {
                             self.try_promote_orphans().await?;
                             self.announce_certified_progress()?;
-                            if self.peer_status_is_ahead(from_validator_id) {
-                                self.request_sync_from(from_validator_id)?;
-                            }
                         }
                         Ok(false) => {
                             if let Some(responder_id) = unavailable_from {
-                                let tried_followup =
-                                    self.request_best_available_sync_from_ahead_peers();
-                                match tried_followup {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        if let Err(error) =
-                                            self.request_legacy_sync_from(responder_id)
-                                        {
-                                            self.log_event(
-                                                "sync-request-failed",
-                                                format!("to {responder_id} detail {error}"),
-                                            )?;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        self.log_event(
-                                            "sync-request-failed",
-                                            format!("to {responder_id} detail {error}"),
-                                        )?;
-                                    }
+                                if let Err(error) = self
+                                    .request_best_available_sync_from_ahead_peers_excluding(Some(
+                                        responder_id,
+                                    ))
+                                {
+                                    self.log_event(
+                                        "sync-request-failed",
+                                        format!("to {responder_id} detail {error}"),
+                                    )?;
                                 }
-                            } else if self.peer_status_is_ahead(from_validator_id) {
-                                self.request_sync_from(from_validator_id)?;
                             }
                         }
                         Err(error) => {
@@ -1320,8 +1304,11 @@ impl NodeRunner {
                                 "certified-sync-rejected",
                                 format!("from {from_validator_id} detail {error}"),
                             )?;
-                            if let Err(request_error) =
-                                self.request_legacy_sync_from(from_validator_id)
+                            self.record_sync_repair_failure(from_validator_id);
+                            if let Err(request_error) = self
+                                .request_best_available_sync_from_ahead_peers_excluding(Some(
+                                    from_validator_id,
+                                ))
                             {
                                 self.log_event(
                                     "sync-request-failed",
@@ -3529,6 +3516,16 @@ impl NodeRunner {
             };
         };
         let local_sync_view = self.local_sync_view();
+        if self
+            .peer_sync_repair_failures
+            .get(&validator_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+            && (status.highest_qc_height > 0 || local_sync_view.highest_qc_height > 0)
+        {
+            return V2SyncMode::Certified;
+        }
         let local_height = local_sync_view.height;
         let local_tip_hash = local_sync_view.tip_hash;
         let local_qc_height = local_sync_view.highest_qc_height;
@@ -9660,7 +9657,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn certified_sync_response_with_ahead_tip_requests_legacy_followup() {
+    async fn certified_sync_response_with_ahead_tip_does_not_immediately_request_followup() {
         let genesis = sample_genesis();
         let local_address = reserve_local_address();
         let peer_address = reserve_local_address();
@@ -9790,32 +9787,32 @@ mod tests {
             .await
             .unwrap();
 
-        loop {
-            match recv_protocol_message(&mut peer_events).await {
-                ProtocolMessage::SyncRequest {
-                    requester_id,
-                    known_height,
-                    known_tip_hash,
-                } => {
-                    assert_eq!(requester_id, 1);
-                    assert_eq!(known_height, certified_tip.header.block_number);
-                    assert_eq!(known_tip_hash, certified_tip.block_hash);
-                    break;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, recv_protocol_message(&mut peer_events)).await {
+                Ok(
+                    ProtocolMessage::ProposalVote(_)
+                    | ProtocolMessage::QuorumCertificate(_)
+                    | ProtocolMessage::SyncStatus { .. }
+                    | ProtocolMessage::SyncBlocks { .. }
+                    | ProtocolMessage::SyncResponse { .. }
+                    | ProtocolMessage::HeartbeatPulse(_)
+                    | ProtocolMessage::ReceiptFetch { .. },
+                ) => {}
+                Ok(
+                    ProtocolMessage::SyncRequest { .. } | ProtocolMessage::CertifiedSyncRequest(_),
+                ) => {
+                    panic!("expected certified sync apply to avoid immediate follow-up request");
                 }
-                ProtocolMessage::ProposalVote(_)
-                | ProtocolMessage::QuorumCertificate(_)
-                | ProtocolMessage::SyncStatus { .. }
-                | ProtocolMessage::SyncBlocks { .. }
-                | ProtocolMessage::SyncResponse { .. }
-                | ProtocolMessage::HeartbeatPulse(_)
-                | ProtocolMessage::ReceiptFetch { .. } => {}
-                other => panic!("expected legacy sync follow-up request, got {other:?}"),
+                Err(_) => break,
+                Ok(other) => panic!("unexpected message after certified sync apply: {other:?}"),
             }
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn skipped_certified_sync_response_with_ahead_peer_requests_legacy_followup() {
+    async fn skipped_certified_sync_response_with_ahead_peer_does_not_request_legacy_followup() {
         let genesis = sample_genesis();
         let local_address = reserve_local_address();
         let peer_address = reserve_local_address();
@@ -9897,28 +9894,26 @@ mod tests {
             .await
             .unwrap();
 
-        loop {
-            match recv_protocol_message(&mut peer_events).await {
-                ProtocolMessage::SyncRequest {
-                    requester_id,
-                    known_height,
-                    known_tip_hash,
-                } => {
-                    assert_eq!(requester_id, 1);
-                    assert_eq!(known_height, shared_root.header.block_number);
-                    assert_eq!(known_tip_hash, shared_root.block_hash);
-                    break;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, recv_protocol_message(&mut peer_events)).await {
+                Ok(
+                    ProtocolMessage::ProposalVote(_)
+                    | ProtocolMessage::QuorumCertificate(_)
+                    | ProtocolMessage::SyncStatus { .. }
+                    | ProtocolMessage::SyncBlocks { .. }
+                    | ProtocolMessage::SyncResponse { .. }
+                    | ProtocolMessage::HeartbeatPulse(_)
+                    | ProtocolMessage::ReceiptFetch { .. },
+                ) => {}
+                Ok(
+                    ProtocolMessage::SyncRequest { .. } | ProtocolMessage::CertifiedSyncRequest(_),
+                ) => {
+                    panic!("expected skipped certified sync to avoid immediate follow-up request");
                 }
-                ProtocolMessage::ProposalVote(_)
-                | ProtocolMessage::QuorumCertificate(_)
-                | ProtocolMessage::SyncStatus { .. }
-                | ProtocolMessage::SyncBlocks { .. }
-                | ProtocolMessage::SyncResponse { .. }
-                | ProtocolMessage::HeartbeatPulse(_)
-                | ProtocolMessage::ReceiptFetch { .. } => {}
-                other => panic!(
-                    "expected legacy sync request after skipped certified sync, got {other:?}"
-                ),
+                Err(_) => break,
+                Ok(other) => panic!("unexpected message after skipped certified sync: {other:?}"),
             }
         }
     }
@@ -11265,6 +11260,99 @@ mod tests {
                 .is_err(),
             "expected duplicate proactive sync push to be suppressed"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certified_sync_request_replies_without_legacy_sync_blocks() {
+        let genesis = sample_genesis();
+        let local_address = reserve_local_address();
+        let peer_address = reserve_local_address();
+        let peer = PeerConfig {
+            validator_id: 2,
+            address: peer_address.clone(),
+        };
+        let config = sample_node_config(
+            1,
+            local_address,
+            vec![peer.clone()],
+            "certified-sync-request-no-legacy-followup",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let shared_root = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner
+                .accept_block(shared_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: 2,
+                payload: ProtocolMessage::CertifiedSyncRequest(ChunkedSyncRequest {
+                    requester_id: 2,
+                    known_qc_hash: Some(shared_root.block_hash),
+                    known_qc_height: shared_root.header.block_number,
+                    known_qc_anchors: vec![SyncQcAnchor {
+                        block_hash: shared_root.block_hash,
+                        block_number: shared_root.header.block_number,
+                    }],
+                    from_height: shared_root.header.block_number,
+                    want_certified_only: true,
+                }),
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        let mut saw_certified_response = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, recv_protocol_message(&mut peer_events)).await {
+                Ok(ProtocolMessage::CertifiedSyncResponse(_)) => {
+                    saw_certified_response = true;
+                }
+                Ok(ProtocolMessage::SyncBlocks { .. }) => {
+                    panic!("unexpected legacy sync blocks after certified sync response");
+                }
+                Ok(
+                    ProtocolMessage::ProposalVote(_)
+                    | ProtocolMessage::QuorumCertificate(_)
+                    | ProtocolMessage::SyncStatus { .. }
+                    | ProtocolMessage::SyncRequest { .. }
+                    | ProtocolMessage::SyncResponse { .. }
+                    | ProtocolMessage::HeartbeatPulse(_)
+                    | ProtocolMessage::ReceiptFetch { .. },
+                ) => {}
+                Err(_) => break,
+                Ok(other) => panic!("unexpected message after certified sync request: {other:?}"),
+            }
+        }
+
+        assert!(saw_certified_response);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15213,6 +15301,95 @@ mod tests {
 
         assert_eq!(peer2_sync_requests, 0);
         assert_eq!(peer3_sync_requests, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_repair_failure_switches_same_qc_peer_to_certified_sync() {
+        let genesis = sample_genesis();
+        let peer_address = reserve_local_address();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            vec![PeerConfig {
+                validator_id: 2,
+                address: peer_address.clone(),
+            }],
+            "sync-repair-certified-fallback",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let (_, _, _, mut peer_events) =
+            spawn_test_network(2, peer_address, Vec::new(), &genesis).await;
+        let shared_root = first_valid_block(&genesis);
+
+        assert_eq!(
+            runner
+                .accept_block(shared_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+
+        runner.record_peer_sync_status(
+            2,
+            2,
+            canonical_hash(&"peer-divergent-tip"),
+            Some(shared_root.block_hash),
+            shared_root.header.block_number,
+            vec![SyncQcAnchor {
+                block_hash: shared_root.block_hash,
+                block_number: shared_root.header.block_number,
+            }],
+        );
+        assert!(matches!(
+            runner.preferred_v2_sync_mode_for_peer(2),
+            V2SyncMode::Legacy
+        ));
+
+        runner.record_sync_repair_failure(2);
+        assert!(matches!(
+            runner.preferred_v2_sync_mode_for_peer(2),
+            V2SyncMode::Certified
+        ));
+
+        runner.request_sync_from(2).unwrap();
+
+        loop {
+            match recv_protocol_message(&mut peer_events).await {
+                ProtocolMessage::CertifiedSyncRequest(request) => {
+                    assert_eq!(request.requester_id, 1);
+                    assert_eq!(request.known_qc_hash, Some(shared_root.block_hash));
+                    assert_eq!(request.known_qc_height, shared_root.header.block_number);
+                    break;
+                }
+                ProtocolMessage::ProposalVote(_)
+                | ProtocolMessage::QuorumCertificate(_)
+                | ProtocolMessage::SyncStatus { .. }
+                | ProtocolMessage::SyncBlocks { .. }
+                | ProtocolMessage::SyncResponse { .. }
+                | ProtocolMessage::SyncRequest { .. }
+                | ProtocolMessage::HeartbeatPulse(_)
+                | ProtocolMessage::ReceiptFetch { .. } => {}
+                other => panic!("expected certified sync fallback, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
