@@ -1209,6 +1209,7 @@ pub enum ProtocolMessage {
         validator_id: ValidatorId,
         height: u64,
         tip_hash: HashBytes,
+        tip_last_slot: u64,
         highest_qc_hash: Option<HashBytes>,
         highest_qc_height: u64,
         recent_qc_anchors: Vec<SyncQcAnchor>,
