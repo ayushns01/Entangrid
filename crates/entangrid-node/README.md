@@ -191,18 +191,18 @@ The recent validation-focused improvement in this crate was about correctness un
 - spam-prone peer traffic now hits a per-peer rate limiter before expensive receipt and sync handling runs
 - startup replay now tolerates a truncated trailing JSONL entry, which protects restart/reporting paths from an interrupted final append
 - the active matrix focus on `main` is the V2 `4/5/6/7/8` healthy and degraded bursty sweep, using `codex/consensus-v1` as the benchmark/control line
-- larger-topology peers now reconverge structurally in repeated healthy `6/7/8` runs, which cuts down the old ordering blocker substantially
+- the latest rigorous matrix on the active branch is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still failing
 - certified sync now refuses stale certified responses that would otherwise pull a node backward after it already advanced
 - restarted nodes now seed `last_processed_slot` from real time and stored state so they do not replay historical proposer slots on startup
 - restarted nodes can wait behind a startup sync barrier instead of immediately proposing while peers are known ahead
 - certified sync responses now carry responder tip metadata so a catching-up node can follow certified repair with suffix sync instead of stalling at the certified frontier
 - startup-barrier sync serving is now capped to the certified frontier instead of exporting a stale uncertified suffix
 - live slots now proactively request catch-up while peers are known ahead instead of waiting only for the periodic sync tick
-- the next node-runtime milestone is proving the final healthy/degraded/stale matrix and freezing the acceptance gates
+- the next node-runtime milestone is closing the last pre-QC bursty `6`-validator convergence gap and then freezing the acceptance gates
 
 So the next node-runtime milestone is:
 
-- full-matrix proof on current `main`
+- finishing the last two failing bursty `6`-validator scenarios on current `main`
 - simulator acceptance gates that fail loudly on any regression
 
 But it is still intentionally early-stage.

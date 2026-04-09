@@ -1151,9 +1151,39 @@ impl NodeRunner {
                     self.update_metrics(|metrics| {
                         metrics.sync_requests_throttled += 1;
                     });
+                    let local_sync_view = self.local_sync_view();
+                    let served = self.last_sync_request_served.get(&requester_id).copied();
+                    let served_local_qc = served
+                        .and_then(|entry| entry.served_local_highest_qc_hash)
+                        .map(|hash| format!("{:02x?}", &hash[..4]))
+                        .unwrap_or_else(|| "none".to_string());
+                    let served_known_tip = served
+                        .map(|entry| format!("{:02x?}", &entry.known_tip_hash[..4]))
+                        .unwrap_or_else(|| "none".to_string());
+                    let served_local_tip = served
+                        .map(|entry| format!("{:02x?}", &entry.served_local_tip_hash[..4]))
+                        .unwrap_or_else(|| "none".to_string());
+                    let local_qc_hash = local_sync_view
+                        .highest_qc_hash
+                        .map(|hash| format!("{:02x?}", &hash[..4]))
+                        .unwrap_or_else(|| "none".to_string());
                     self.log_event(
                         "sync-request-throttled",
-                        format!("from {requester_id} height {known_height}"),
+                        format!(
+                            "from {requester_id} height {known_height} tip {:02x?} local_height {} local_tip {:02x?} local_qc {} local_qc_hash {} served_at {:?} served_known_height {:?} served_known_tip {} served_local_height {:?} served_local_tip {} served_local_qc {:?} served_local_qc_hash {}",
+                            &known_tip_hash[..4],
+                            local_sync_view.height,
+                            &local_sync_view.tip_hash[..4],
+                            local_sync_view.highest_qc_height,
+                            local_qc_hash,
+                            served.map(|entry| entry.served_at_unix_millis),
+                            served.map(|entry| entry.known_height),
+                            served_known_tip,
+                            served.map(|entry| entry.served_local_height),
+                            served_local_tip,
+                            served.map(|entry| entry.served_local_highest_qc_height),
+                            served_local_qc,
+                        ),
                     )?;
                     return Ok(());
                 }
@@ -1182,7 +1212,7 @@ impl NodeRunner {
                     Vec::new(),
                 );
                 let local_snapshot = self.ledger.snapshot().clone();
-                if should_adopt_snapshot(&local_snapshot, &chain.snapshot) {
+                if self.should_adopt_chain_snapshot(&local_snapshot, &chain) {
                     match self.apply_chain_snapshot(chain) {
                         Ok(()) => {
                             self.try_promote_orphans().await?;
@@ -1211,7 +1241,8 @@ impl NodeRunner {
                             )?;
                         }
                     }
-                } else if should_adopt_snapshot(&chain.snapshot, &local_snapshot) {
+                } else if self.should_push_local_snapshot_after_sync_response(&local_snapshot, &chain)
+                {
                     if let Err(error) = self.push_best_sync_to(
                         responder_id,
                         chain.snapshot.height,
@@ -1241,6 +1272,10 @@ impl NodeRunner {
                 if !self.should_adopt_chain_segment(&local_snapshot, &chain) {
                     return Ok(());
                 }
+                let chain_base_height = chain.base_height;
+                let chain_base_tip_hash = chain.base_tip_hash;
+                let chain_target_height = chain.target_snapshot.height;
+                let chain_target_tip_hash = chain.target_snapshot.tip_hash;
                 match self.apply_chain_segment(chain) {
                     Ok(()) => {
                         self.try_promote_orphans().await?;
@@ -1264,9 +1299,24 @@ impl NodeRunner {
                     }
                     Err(error) => {
                         self.record_sync_repair_failure(responder_id);
+                        let local_sync_view = self.local_sync_view();
+                        let local_qc_hash = local_sync_view
+                            .highest_qc_hash
+                            .map(|hash| format!("{:02x?}", &hash[..4]))
+                            .unwrap_or_else(|| "none".to_string());
                         self.log_event(
                             "sync-blocks-rejected",
-                            format!("from {responder_id} detail {error}"),
+                            format!(
+                                "from {responder_id} detail {error} base {} base_tip {:02x?} target {} target_tip {:02x?} local_height {} local_tip {:02x?} local_qc {} local_qc_hash {}",
+                                chain_base_height,
+                                &chain_base_tip_hash[..4],
+                                chain_target_height,
+                                &chain_target_tip_hash[..4],
+                                local_snapshot.height,
+                                &local_snapshot.tip_hash[..4],
+                                local_sync_view.highest_qc_height,
+                                local_qc_hash,
+                            ),
                         )?;
                         if let Err(request_error) = self.request_sync_from(responder_id) {
                             self.log_event(
@@ -2277,6 +2327,25 @@ impl NodeRunner {
         }
     }
 
+    fn proposal_vote_branches_are_compatible(
+        &self,
+        existing_hash: HashBytes,
+        candidate_hash: HashBytes,
+    ) -> bool {
+        if existing_hash == candidate_hash {
+            return true;
+        }
+        let candidate_extends_existing = self
+            .build_chain_to_tip(candidate_hash)
+            .map(|chain| chain.iter().any(|block| block.block_hash == existing_hash))
+            .unwrap_or(true);
+        let existing_extends_candidate = self
+            .build_chain_to_tip(existing_hash)
+            .map(|chain| chain.iter().any(|block| block.block_hash == candidate_hash))
+            .unwrap_or(true);
+        candidate_extends_existing || existing_extends_candidate
+    }
+
     fn resolve_conflicting_proposal_vote(&mut self, vote: &ProposalVote) -> Result<()> {
         let mut conflicts = Vec::new();
         for existing_votes in self
@@ -2288,13 +2357,14 @@ impl NodeRunner {
                 if existing.block_hash == vote.block_hash {
                     continue;
                 }
-                if existing.block_number != vote.block_number
-                    && !(existing.epoch == vote.epoch && existing.slot == vote.slot)
-                {
-                    continue;
-                }
                 if self.can_replace_conflicting_proposal_vote(existing, vote) {
                     conflicts.push(existing.clone());
+                    continue;
+                }
+                if existing.block_number != vote.block_number
+                    && !(existing.epoch == vote.epoch && existing.slot == vote.slot)
+                    && self.proposal_vote_branches_are_compatible(existing.block_hash, vote.block_hash)
+                {
                     continue;
                 }
                 return Err(anyhow!("conflicting proposal vote"));
@@ -2666,11 +2736,39 @@ impl NodeRunner {
             .unwrap_or(0)
     }
 
+    fn branch_weighted_vote_support(
+        &self,
+        chain: &[Block],
+        extra_tip_vote_for: Option<HashBytes>,
+    ) -> u64 {
+        chain
+            .iter()
+            .map(|block| {
+                let existing = self
+                    .proposal_votes
+                    .get(&block.block_hash)
+                    .map(|votes| votes.len())
+                    .unwrap_or(0);
+                let receives_extra_local_vote = extra_tip_vote_for == Some(block.block_hash)
+                    && !self
+                        .proposal_votes
+                        .get(&block.block_hash)
+                        .map(|votes| votes.contains_key(&self.config.validator_id))
+                        .unwrap_or(false);
+                let vote_count = existing + usize::from(receives_extra_local_vote);
+                block
+                    .header
+                    .block_number
+                    .saturating_mul(vote_count as u64)
+            })
+            .sum()
+    }
+
     fn branch_quality_with_extra_tip_vote(
         &self,
         chain: &[Block],
         extra_tip_vote_for: Option<HashBytes>,
-    ) -> (u64, u64, u64, u64, HashBytes) {
+    ) -> (u64, u64, u64, u64, u64, HashBytes) {
         let latest_certified_height = self.latest_certified_height(chain);
         let tip = chain.last();
         let tip_vote_count = tip
@@ -2689,23 +2787,14 @@ impl NodeRunner {
                 existing + usize::from(receives_extra_local_vote)
             })
             .unwrap_or(0);
-        if latest_certified_height > 0 {
-            (
-                latest_certified_height,
-                tip.map(|block| block.header.block_number).unwrap_or(0),
-                tip_vote_count as u64,
-                tip.map(|block| block.header.slot).unwrap_or(0),
-                tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
-            )
-        } else {
-            (
-                latest_certified_height,
-                tip.map(|block| block.header.block_number).unwrap_or(0),
-                tip_vote_count as u64,
-                tip.map(|block| block.header.slot).unwrap_or(0),
-                tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
-            )
-        }
+        (
+            latest_certified_height,
+            self.branch_weighted_vote_support(chain, extra_tip_vote_for),
+            tip.map(|block| block.header.block_number).unwrap_or(0),
+            tip_vote_count as u64,
+            tip.map(|block| block.header.slot).unwrap_or(0),
+            tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
+        )
     }
 
     fn adopt_canonical_chain(
@@ -3008,6 +3097,30 @@ impl NodeRunner {
             && chain.base_tip_hash == local_qc.block_hash
             && chain.target_snapshot.height > local_qc.block_number
             && snapshot_preference(&chain.target_snapshot) != snapshot_preference(local_snapshot)
+    }
+
+    fn should_adopt_chain_snapshot(
+        &self,
+        local_snapshot: &StateSnapshot,
+        chain: &ChainSnapshot,
+    ) -> bool {
+        if !self.config.feature_flags.consensus_v2 || self.highest_local_qc().is_some() {
+            return should_adopt_snapshot(local_snapshot, &chain.snapshot);
+        }
+        snapshot_branch_quality(&chain.blocks, &chain.proposal_votes)
+            > self.branch_quality_with_extra_tip_vote(&self.blocks, None)
+    }
+
+    fn should_push_local_snapshot_after_sync_response(
+        &self,
+        local_snapshot: &StateSnapshot,
+        chain: &ChainSnapshot,
+    ) -> bool {
+        if !self.config.feature_flags.consensus_v2 || self.highest_local_qc().is_some() {
+            return should_adopt_snapshot(&chain.snapshot, local_snapshot);
+        }
+        self.branch_quality_with_extra_tip_vote(&self.blocks, None)
+            > snapshot_branch_quality(&chain.blocks, &chain.proposal_votes)
     }
 
     fn import_certified_sync_response(
@@ -5571,6 +5684,46 @@ fn should_adopt_snapshot(local: &StateSnapshot, remote: &StateSnapshot) -> bool 
     snapshot_preference(remote) > snapshot_preference(local)
 }
 
+fn snapshot_branch_quality(
+    chain: &[Block],
+    proposal_votes: &[ProposalVote],
+) -> (u64, u64, u64, u64, u64, HashBytes) {
+    let mut vote_sets = BTreeMap::<HashBytes, BTreeSet<ValidatorId>>::new();
+    for vote in proposal_votes {
+        vote_sets
+            .entry(vote.block_hash)
+            .or_default()
+            .insert(vote.validator_id);
+    }
+    let weighted_vote_support = chain
+        .iter()
+        .map(|block| {
+            let vote_count = vote_sets
+                .get(&block.block_hash)
+                .map(|validators| validators.len() as u64)
+                .unwrap_or(0);
+            block.header.block_number.saturating_mul(vote_count)
+        })
+        .sum();
+    let tip = chain.last();
+    let tip_vote_count = tip
+        .map(|block| {
+            vote_sets
+                .get(&block.block_hash)
+                .map(|validators| validators.len() as u64)
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    (
+        0,
+        weighted_vote_support,
+        tip.map(|block| block.header.block_number).unwrap_or(0),
+        tip_vote_count,
+        tip.map(|block| block.header.slot).unwrap_or(0),
+        tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
+    )
+}
+
 fn should_adopt_certified_snapshot(
     local: &StateSnapshot,
     local_highest_qc_height: u64,
@@ -5771,9 +5924,9 @@ mod tests {
 
     use super::*;
 
-    fn sample_genesis() -> GenesisConfig {
+    fn sample_genesis_with_validator_count(validator_count: ValidatorId) -> GenesisConfig {
         let mut balances = BTreeMap::new();
-        for validator_id in 1..=4 {
+        for validator_id in 1..=validator_count {
             balances.insert(validator_account(validator_id), 1_000);
         }
         GenesisConfig {
@@ -5784,7 +5937,7 @@ mod tests {
             slots_per_epoch: 5,
             max_txs_per_block: 16,
             witness_count: 2,
-            validators: (1..=4)
+            validators: (1..=validator_count)
                 .map(|validator_id| ValidatorConfig {
                     validator_id,
                     stake: 100,
@@ -5796,6 +5949,10 @@ mod tests {
                 .collect(),
             initial_balances: balances,
         }
+    }
+
+    fn sample_genesis() -> GenesisConfig {
+        sample_genesis_with_validator_count(4)
     }
 
     #[cfg(not(feature = "pq-ml-dsa"))]
@@ -9138,6 +9295,277 @@ mod tests {
 
         assert_eq!(runner.ledger.snapshot().tip_hash, longer_tip.block_hash);
         assert_eq!(runner.ledger.snapshot().height, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn taller_weak_uncertified_branch_does_not_displace_stronger_vote_supported_branch_before_qc(
+    ) {
+        let genesis = sample_genesis_with_validator_count(6);
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-stronger-branch");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(current_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+
+        for validator_id in [2, 3, 4] {
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &current_root,
+                    ))
+                    .unwrap()
+            );
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &current_tip,
+                    ))
+                    .unwrap()
+            );
+        }
+        assert!(
+            !runner
+                .quorum_certificates
+                .contains_key(&current_root.block_hash)
+        );
+        assert!(
+            !runner
+                .quorum_certificates
+                .contains_key(&current_tip.block_hash)
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+
+        let competing_root = valid_empty_block_on_parent(
+            &genesis,
+            empty_hash(),
+            1,
+            2,
+            current_tip.header.slot + 1,
+        );
+        let competing_mid = valid_empty_block_on_parent(
+            &genesis,
+            competing_root.block_hash,
+            2,
+            3,
+            competing_root.header.slot + 1,
+        );
+        let competing_tip = valid_empty_block_on_parent(
+            &genesis,
+            competing_mid.block_hash,
+            3,
+            5,
+            competing_mid.header.slot + 1,
+        );
+
+        runner.accept_block(competing_root.clone(), false).await.unwrap();
+        runner.accept_block(competing_mid.clone(), false).await.unwrap();
+        runner.accept_block(competing_tip.clone(), false).await.unwrap();
+
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn validator_cannot_vote_on_taller_non_extending_branch_before_qc() {
+        let genesis = sample_genesis();
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-no-branch-flip");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(current_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+
+        let competing_root = valid_empty_block_on_parent(
+            &genesis,
+            empty_hash(),
+            1,
+            2,
+            current_tip.header.slot + 1,
+        );
+        let competing_mid = valid_empty_block_on_parent(
+            &genesis,
+            competing_root.block_hash,
+            2,
+            3,
+            competing_root.header.slot + 1,
+        );
+        let competing_tip = valid_empty_block_on_parent(
+            &genesis,
+            competing_mid.block_hash,
+            3,
+            4,
+            competing_mid.header.slot + 1,
+        );
+
+        runner.accept_block(competing_root.clone(), false).await.unwrap();
+        runner.accept_block(competing_mid.clone(), false).await.unwrap();
+        runner.accept_block(competing_tip.clone(), false).await.unwrap();
+
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn taller_weaker_full_snapshot_does_not_replace_stronger_local_branch_before_qc() {
+        let genesis = sample_genesis_with_validator_count(6);
+        let config =
+            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-sync-no-rollback");
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(current_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        for validator_id in [2, 3, 4] {
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &current_root,
+                    ))
+                    .unwrap()
+            );
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &current_tip,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        let remote_root = valid_empty_block_on_parent(
+            &genesis,
+            empty_hash(),
+            1,
+            2,
+            current_tip.header.slot + 1,
+        );
+        let remote_mid = valid_empty_block_on_parent(
+            &genesis,
+            remote_root.block_hash,
+            2,
+            3,
+            remote_root.header.slot + 1,
+        );
+        let remote_tip = valid_empty_block_on_parent(
+            &genesis,
+            remote_mid.block_hash,
+            3,
+            5,
+            remote_mid.header.slot + 1,
+        );
+        let remote_snapshot = LedgerState::replay_blocks(
+            &genesis,
+            &[remote_root.clone(), remote_mid.clone(), remote_tip.clone()],
+            runner.crypto.as_ref(),
+        )
+        .unwrap()
+        .snapshot()
+        .clone();
+
+        runner
+            .handle_network_event(NetworkEvent::Received {
+                from_validator_id: 2,
+                payload: ProtocolMessage::SyncResponse {
+                    responder_id: 2,
+                    chain: ChainSnapshot {
+                        snapshot: remote_snapshot,
+                        blocks: vec![remote_root, remote_mid, remote_tip],
+                        receipts: Vec::new(),
+                        proposal_votes: Vec::new(),
+                    },
+                },
+                bytes: 0,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]

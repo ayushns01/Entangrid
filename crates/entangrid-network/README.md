@@ -97,7 +97,7 @@ Today this is a clean localnet transport layer, not a production peer-to-peer st
 
 It does not yet provide:
 
-- real PQ transport security
+- production-grade PQ transport hardening
 - backpressure-aware gossip
 - peer reputation
 - discovery
@@ -109,7 +109,7 @@ Current main-branch focus:
 
 - keep the transport simple and observable while `consensus_v2` is stabilized on `main`
 - support the active V2 evidence and ordering messages cleanly
-- defer real PQ transport and larger-topology networking work until the single-machine V2 matrix is green
+- keep the current hybrid session and encrypted framing path stable while the last bursty `6`-validator consensus gap is closed
 
 ## Why this crate matters
 
@@ -128,7 +128,7 @@ This crate should become a more serious communication layer over time.
 
 Future direction:
 
-- replace dev session derivation with real PQ-secure session setup
+- harden the current experimental hybrid session setup into a production-strength PQ-secure transport path
 - improve sync and broadcast efficiency
 - add better retry and buffering behavior
 - prepare for more realistic peer topologies and partial connectivity

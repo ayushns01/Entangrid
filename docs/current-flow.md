@@ -6,7 +6,7 @@ Important note:
 
 - `main` now carries both the baseline receipt-driven flow and the newer `consensus_v2` path
 - this document mainly explains the baseline/default flow, with V2 callouts where the behavior changes
-- the V2 path is the active development focus, but it is still not the final certified-sync / PQ-ready architecture
+- the V2 path is the active development focus, and the PQ-enabled branch already exists, but the last bursty `6`-validator convergence proof is still open
 
 ## 1. A Local Network Is Created
 
@@ -245,7 +245,7 @@ This is why bursty runs can temporarily split the network into short competing b
 
 The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
 
-Certified sync and QC-dominant branch choice are now active on `main`, so healthy bursty `6/7/8` runs can reconverge structurally on one tip. Restarted stale nodes now also recover cleanly enough to rejoin the final tip without late full-snapshot rescue; the next job is proving that across the full matrix, not inventing another recovery mechanism.
+Certified sync and QC-dominant branch choice are now active on `main`, and restarted stale nodes now recover much more cleanly than before. The remaining live problem is earlier in the lifecycle: bursty `6`-validator runs can still split across uncertified branches before a stable QC anchor forms.
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 

@@ -1,166 +1,87 @@
 # Entangrid Consensus V2 Status Update
 
-This document is a status update for the active `consensus_v2` redesign work. It complements the implementation plan in [2026-03-25-entangrid-consensus-v2.md](2026-03-25-entangrid-consensus-v2.md).
+This document is a status update for the active `consensus_v2` work as of April 9, 2026. It complements the implementation plan in [2026-03-25-entangrid-consensus-v2.md](2026-03-25-entangrid-consensus-v2.md).
 
 Important note:
 
-- this work now exists on `main` as the active protocol line
+- the active proof work is now happening on the PQ-enabled `stage-1/pq-integration` line
 - the older V1 benchmark line is preserved on `codex/consensus-v1`
-- `codex/consensus-v2` remains the staging branch for continued V2 work
-- this is still a progress snapshot, not a claim that V2 is finished
+- this is still a progress snapshot, not a claim that V2 is fully finished
 
-## What Was Implemented
+## What Is Implemented
 
-The active V2 code on `main` now includes real protocol groundwork beyond the original plan document.
+The active line now contains the major V2 protocol slices together with Stage 1 PQ integration:
 
-### 1. Shared V2 protocol objects and config
+- `consensus_v2` protocol objects and runtime handling for `ProposalVote`, `QuorumCertificate`, `ServiceAttestation`, and `ServiceAggregate`
+- certified sync activation and QC-aware recovery
+- proposer gating from prior-epoch service aggregates instead of raw local receipt views
+- strict hybrid signature enforcement for validator startup identities, transactions, blocks, proposal votes, relay receipts, and service attestations
+- hybrid session establishment plus encrypted post-handshake framing on the transport path
+- strict hybrid localnet bootstrap through `entangrid-sim`
 
-Implemented in the active V2 code:
+The project is no longer waiting to "start PQ later." The PQ-capable consensus line already exists.
 
-- `consensus_v2` feature flag
-- `ProposalVote`
-- `QuorumCertificate`
-- `ServiceAttestation`
-- `ServiceAggregate`
-- certified sync placeholder types
+## Latest Consensus Hardening
 
-The redesign is no longer only theoretical. `main` now has concrete transportable objects for certificate-backed ordering and committee-attested service evidence.
+The most recent convergence work on this branch added:
 
-### 2. Committee-attested service evidence
+- richer `sync-request-throttled` and `sync-blocks-rejected` diagnostics
+- stronger pre-QC branch comparison using accumulated vote support
+- stricter rejection of local later-height votes on incompatible non-extending branches before QC
+- refusal to adopt taller but weaker full snapshots before a local QC exists
+- targeted regressions for those pre-QC cases in `entangrid-node`
 
-The V2 service plane now:
-
-- uses the subject validator's actual assigned witnesses as the committee
-- scores only witness-observable obligations
-- stores and imports service attestations and aggregates in the node runtime
-- computes local proposer eligibility from prior-epoch aggregates instead of the legacy local receipt-only score path when `consensus_v2` is enabled
-
-### 3. Better evidence timing and repair
-
-Recent V2 work also improved how service evidence is produced:
-
-- lagged service attestation emission to avoid publishing too early
-- preserved the last known score when no newer valid aggregate is available
-- allowed improved service attestations and aggregates to replace earlier weaker versions
-- added recent-epoch backfill so late-arriving receipts can refresh earlier weak evidence
-
-This was important because earlier V2 runs were freezing zeroed evidence too early in bursty larger-validator scenarios.
-
-### 4. QC ordering and certified sync activation
-
-The active V2 code now also has:
-
-- `ProposalVote` verification
-- vote storage
-- QC assembly at supermajority threshold
-- local vote emission for accepted V2 blocks
-- limited vote discipline for replayable competing orphan branches
-- a lock rule that prevents voting for a competing branch that ignores the highest QC already known on the current canonical chain
-- certified sync requests and responses
-- recent-QC anchor exchange in sync status and sync repair requests
-- highest-shared-QC certified suffix repair in live runs
-
-This is the beginning of certificate-backed ordering and repair, but not the finished fork-choice system yet.
+Those changes improved the shape of the remaining failures, but did not eliminate them.
 
 ## What Was Verified
 
-The following package test suite passed on the active V2 code:
+Recent focused verification on the active line includes:
 
 ```bash
-cargo test -p entangrid-types -p entangrid-consensus -p entangrid-node -p entangrid-sim
+cargo test -p entangrid-node stronger_vote_supported_branch_before_qc -- --nocapture
+cargo test -p entangrid-node validator_cannot_vote_on_taller_non_extending_branch_before_qc -- --nocapture
+cargo test -p entangrid-node later_slot_vote_from_same_validator_replaces_earlier_under_certified_head -- --nocapture
+cargo test -p entangrid-node taller_weaker_full_snapshot_does_not_replace_stronger_local_branch_before_qc -- --nocapture
 ```
 
-Passing counts in the latest verified run:
+Latest rigorous matrix:
 
-- `entangrid-types`: `4/4`
-- `entangrid-consensus`: `9/9`
-- `entangrid-node`: `51/51`
-- `entangrid-sim`: `13/13`
+- [rigorous-matrix-1775726814105.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775726814105.md)
 
-So the active V2 code has strong unit/integration coverage for:
+Current matrix result:
 
-- V2 service evidence validation
-- V2 score refresh behavior
-- QC vote import and QC assembly
-- competing-branch vote constraints
-- attestation and aggregate replacement behavior
+- `12/14` scenarios pass
+- `policy-threshold-055` and the other `4`-validator policy variants pass
+- both abuse scenarios pass
+- the only remaining failures are `baseline-6-bursty` and `gated-6-bursty`
 
-## What Improved In Live Testing
+## What The Remaining Failure Means
 
-Comparative bursty testing now shows two different truths at once:
+The current blocker is not "certified sync does not exist," "service evidence is broken," or "stale restart is still failing."
 
-- certified sync activation is now real in live runs
-- larger-validator convergence is now much healthier structurally
+The latest evidence points to a narrower problem:
 
-Most importantly:
+- under bursty `6`-validator load, nodes still fragment across uncertified branches before any stable QC anchor forms
+- recent pre-QC fixes improved branch preference and prevented some avoidable branch flips
+- even so, the live matrix still ends with forked tips in the two bursty `6`-validator scenarios
 
-- `v2` can now punish degraded validators in the smaller benchmark topologies instead of leaving them at `1.000`
-- `degraded/4` and `degraded/5` on `v2` already produce real gating while keeping honest validators at `1.0`
-- healthy `6`-validator runs keep honest service scores high much more often than the older V2 service-collapse cases
-
-Latest repeated healthy `6/7/8` bursty validation on `main` showed:
-
-- `6`: `same_chain = 6/6`, height `32`, `certified_sync_served > 0`, `full_sync_applied = 0`
-- `7`: `same_chain = 7/7`, height `19`, `certified_sync_served > 0`, `full_sync_applied = 0`
-- `8`: `same_chain = 8/8`, height `10`, `certified_sync_served > 0`, `full_sync_applied = 0`
-
-The latest node-runtime hardening behind those results was a stale certified-sync guard:
-
-- certified-sync responses are now ignored when they would downgrade a node that already holds a newer certified tip
-- that closes the last oscillation we were still seeing in the 8-validator healthy shutdown path
-
-That means both Issue 1 and Issue 2 have been cut down substantially:
-
-- certified sync is active in live recovery when needed, and its availability remains live in repeated healthy runs
-- QC-dominant branch choice plus the pending-certified-child lane now keep healthy `6/7/8` runs on one tip
-
-## What Was Closed Next
-
-The stale-node restart recovery edge is now substantially closed on `main`.
-
-The runtime moved past the earlier broad Issue 3 story:
-
-- persistent per-peer outbound lanes and multi-frame inbound sessions fixed the transport bottleneck that was starving service evidence
-- healthy larger-validator bursty runs now converge structurally without the old service-score collapse
-- degraded larger-validator runs now punish the target much more reliably while keeping honest validators healthy
-
-The final restart-focused fixes landed around three recovery rules:
-
-- restarted nodes no longer replay historical proposer slots after coming back
-- restarted nodes can hold proposals behind a startup sync barrier while peers are still ahead
-- startup-barrier sync serving is capped to the certified frontier instead of exporting a stale uncertified suffix
-- live slots now proactively request catch-up while peers are known ahead instead of only waiting for the 5-second sync maintenance timer
-
-In the latest stale `8` rerun:
-
-- all `8/8` validators shut down on the same tip
-- validator `8` recovered with `certified_sync_applied = 1`
-- validator `8` recovered with `full_sync_applied = 0`
-- the old stale-restart gap is no longer the active blocker
-
-So the remaining problem is no longer "make certified sync exist," "make healthy `6/7/8` converge," or "make a restarted stale node finish the last suffix catch-up." The next task is to prove that all of those hold together across the full matrix.
+So the active gap is a pre-QC convergence problem, not the earlier broad V2 stabilization story.
 
 ## What This Means
 
-The redesign direction still looks correct, but `main` is not ready for PQ integration yet.
-
 The honest status is:
 
-- V2 service evidence is substantially better than the legacy model
-- degraded punishment is now materially better across the live matrix than the older service-collapse phase
-- Issue 1 certified-sync activation is effectively closed
-- Issue 2 QC-backed canonical branch selection is effectively closed for the healthy `6/7/8` structural runs we just repeated
-- Issue 3 service evidence and gating behavior are materially improved
-- Issue 4 stale-node restart recovery is now fixed enough to move on
-- the remaining pre-PQ blocker is full-matrix proof and acceptance-gate tightening
+- the V2 direction is still correct
+- PQ Stage 1 integration is already present on the active line
+- the branch is not yet ready for final consensus signoff because the last two bursty `6`-validator scenarios still fail
 
 ## Next Work
 
 The next implementation priorities are:
 
-1. rerun healthy and degraded V2 `4/5/6/7/8` bursty verification plus stale-restart stress against the V1 benchmark line
-2. turn that matrix into hard acceptance gates in the simulator
-3. only after that move to PQ-safe signature/session integration
+1. add a stronger pre-QC convergence anchor so bursty `6`-validator runs stop splitting before the first QC
+2. rerun the rigorous matrix until `baseline-6-bursty` and `gated-6-bursty` pass
+3. freeze that matrix result as the acceptance gate for the Stage 1 merge path
 
 ## Recommended Reading Order
 

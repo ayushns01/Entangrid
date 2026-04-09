@@ -53,7 +53,7 @@ The current recommended prototype gating profile emitted by default is:
 - `service_score_window_epochs = 4`
 - weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the next pre-PQ problem is no longer basic structural reconvergence or restart recovery. It is proving the full matrix and then turning it into a hard acceptance gate.
+That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the remaining problem is no longer basic structural reconvergence or restart recovery. It is closing the last bursty `6`-validator convergence gap and then turning that matrix into a hard acceptance gate.
 
 Current branch focus:
 
@@ -179,7 +179,7 @@ Recent improvement:
 - this makes it easier to keep the first few epochs as warmup before proposer gating is enforced
 - this also makes it possible to tune how strict gating should be without recompiling the node
 - this also makes it easier to trade off score stability, responsiveness, and penalty harshness in local experiments
-- the latest matrix review currently keeps the shared defaults at that same profile, so fresh localnet experiments start from the same policy we are using as the pre-PQ baseline
+- the latest matrix review currently keeps the shared defaults at that same profile, so fresh localnet experiments start from the same policy we are using as the current acceptance baseline
 - branch-comparison helpers now also exist so the simulator can mark `v1 degraded/4` and `v1 degraded/5` as benchmark cases when comparing V2 against the older line
 
 ## What it is today

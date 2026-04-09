@@ -163,7 +163,7 @@ Important current limit:
 - service-evidence gating from prior-epoch aggregates is live, and the node/runtime path now has certified sync plus QC-dominant branch choice
 - service evidence and degraded punishment are materially better after the recent transport/session hardening on `main`
 - the earlier stale-node restart recovery limit is now materially closed on `main`
-- the next runtime step is proving the full matrix and freezing the simulator acceptance gates before PQ integration
+- PQ Stage 1 integration now exists on the active branch; the next runtime step is closing the last bursty `6`-validator convergence gap and freezing the simulator acceptance gates
 - the active redesign and stabilization work live in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## Why this crate matters

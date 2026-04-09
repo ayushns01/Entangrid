@@ -143,7 +143,7 @@ Current V2 detail on `main`:
 - QC-backed canonical branch selection is now active behind `consensus_v2`
 - restart-time proposal suppression and startup sync barriers are now active behind `consensus_v2`
 - the earlier stale-node suffix catch-up gap is now materially closed on `main`
-- the remaining consensus/runtime work is turning the healthy/degraded/stale matrix into a hard acceptance gate before PQ work
+- the remaining consensus/runtime work is closing the last bursty `6`-validator convergence gap and then turning the matrix into a hard acceptance gate
 
 ### 7. Storage Layer
 

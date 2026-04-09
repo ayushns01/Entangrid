@@ -128,7 +128,8 @@ Important:
   - deterministic transport remains the default path when `pq-ml-kem` is off
   - transactions, relay receipts, and service attestations now join blocks and proposal votes under the strict hybrid-enforcement slice
   - service aggregates inherit that enforcement transitively through validated embedded service attestations, which closes Stage 1K
-  - Stage 1 is now feature-complete for the first mergeable PQ milestone; rekeying/session rotation and stronger traffic-shaping remain explicitly deferred to a later hardening milestone
+  - Stage 1 cryptography and transport integration are now in place for the first mergeable PQ milestone; rekeying/session rotation and stronger traffic-shaping remain explicitly deferred to a later hardening milestone
+  - the remaining blocker on the active PQ-enabled line is the last `6`-validator bursty consensus proof, not missing PQ signing or transport work
 - the current Stage 1 merge-readiness summary and verified command set live in [docs/pq-stage-1-status.md](docs/pq-stage-1-status.md)
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
@@ -155,9 +156,9 @@ Current V2 shape:
 
 The main remaining V2 blockers are now:
 
-- proving the final healthy and degraded `4/5/6/7/8` bursty matrix on current `main`
-- tightening the simulator acceptance gates so regressions fail loudly
-- real PQ integration only after the full matrix is green
+- closing the remaining `baseline-6-bursty` and `gated-6-bursty` failures on the latest rigorous matrix
+- freezing that matrix as the simulator acceptance gate so regressions fail loudly
+- only then claiming final consensus signoff for the PQ-enabled branch
 
 ## Current Recommended Prototype Policy
 
@@ -181,21 +182,21 @@ Important:
 
 - the harsh 4-validator Entangrid scenarios and abuse scenarios are currently in a much better place than before
 - the current active correctness gate is still the single-machine healthy and degraded bursty matrix across `4/5/6/7/8`
-- because of that, this policy should be treated as the current pre-PQ baseline, not as a final all-topology signoff
+- because of that, this policy should be treated as the current acceptance baseline, not as a final all-topology signoff
 
 ## Active Redesign Direction
 
 The current prototype proved the core Entangrid idea is implementable, and `main` now carries the first real V2 stabilization slices, but the scaling work is not finished yet:
 
 - the baseline local-receipt path is still too topology-sensitive at larger validator counts
-- healthy `6/7/8` bursty runs now repeatedly shut down on one tip with QC-dominant branch choice active
+- the latest rigorous matrix on the active branch is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still failing
 - certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
 - V2 service evidence and degraded punishment are materially better after the transport/session hardening on `main`
-- stale-restart recovery is now fixed enough that a restarted validator can catch up without falling back to full snapshot sync
-- the next step is to prove the full healthy/degraded matrix on current `main`, not to keep redesigning recovery again
+- stale-restart recovery is no longer the primary blocker
+- the next step is to close the last pre-QC bursty convergence gap, not to reopen the broader recovery or PQ integration work
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
-Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.
+Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as PQ-integrated but not yet fully consensus-proven.
 
 ## Quickstart
 

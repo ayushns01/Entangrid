@@ -17,7 +17,7 @@ Current status note:
 - the baseline receipt-driven path still exists for comparison when `consensus_v2` is disabled and is preserved on `codex/consensus-v1`
 - committee-attested service evidence, confirmed prior-epoch gating, certified sync, and QC-dominant branch choice are live on `main`
 - restart-time slot suppression, startup sync barriers, and QC-aware certified-sync adoption are now also live on `main`
-- stale-node restart recovery is now fixed enough on `main`, and the next step is proving the final matrix before PQ integration
+- stale-node restart recovery is no longer the primary blocker on `main`
 - on `stage-1/pq-integration`, hybrid-signature enforcement is now available behind `require_hybrid_validator_signatures` for validator startup, transactions, blocks, proposal votes, relay receipts, and service attestations
 - service aggregates remain unsigned, but they now inherit strict hybrid enforcement transitively through validated embedded service attestations, which closes Stage 1K
 - Stage 1F plus Stage 1H add a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
@@ -32,7 +32,7 @@ On the active `consensus_v2` path on `main`, the protocol direction is tightenin
 - certified sync now rejects stale certified responses that would otherwise downgrade a newer local certified tip
 - certified sync responses now also advertise the responder's current tip metadata so the requester can follow a certified catch-up with suffix repair
 - stale restarted nodes now suppress historical replay, hold proposals behind the startup barrier, advertise the certified frontier during recovery, and proactively request catch-up while peers remain ahead
-- the next blocker is no longer restart recovery itself, but proving the full matrix and freezing the acceptance gates before PQ work
+- the current remaining blocker is pre-QC convergence in the bursty `6`-validator baseline and gated scenarios, then freezing that matrix as the acceptance gate
 
 ## Protocol Goals
 
@@ -197,7 +197,7 @@ Current V2 note:
 
 - the service side of this rule is live on `main` behind `consensus_v2`
 - the ordering side now includes proposal votes, quorum certificates, certified sync, and QC-dominant branch selection
-- the remaining pre-PQ gap is reliable service scoring and gating behavior at larger validator counts
+- the remaining live gap is reliable pre-QC convergence at bursty `6`-validator scale before the first stable QC forms
 
 Current PQ Stage 1E note on `stage-1/pq-integration`:
 

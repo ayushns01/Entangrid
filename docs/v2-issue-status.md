@@ -1,259 +1,99 @@
 # Entangrid V2 Issue Status
 
-Status date: 2026-03-30
+Status date: 2026-04-09
 
-This note summarizes the current status of the four V2 consensus issues that have driven the recent stabilization work.
-
-It answers three questions for each issue:
-
-- what the issue is
-- what has been fixed
-- what is still not fixed
+This note summarizes where the original four V2 stabilization issues stand now and separates them from the current remaining blocker on the PQ-enabled consensus line.
 
 ## Current Verdict
 
-- Issue 1: mostly solved
-- Issue 2: solved enough
-- Issue 3: solved at the default protocol profile, but not fully robust across all policy variants
-- Issue 4: still open
+- Issue 1: solved enough
+- Issue 2: solved enough once QC-backed state exists
+- Issue 3: solved enough at the default profile and the currently covered policy variants
+- Issue 4: solved enough
+- Current remaining blocker: pre-QC convergence in bursty `6`-validator baseline and gated runs
 
 ## Verification Basis
 
-The current status is based on:
+This status is based on:
 
-- full code verification:
-  - `cargo test -p entangrid-types -p entangrid-consensus -p entangrid-network -p entangrid-node -p entangrid-sim`
-- rigorous live matrix:
-  - [rigorous-matrix-1774892617700.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1774892617700.md)
-- fresh stale-restart `8` live reruns:
-  - [stale8-certified-tail-fix-1774903000](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-certified-tail-fix-1774903000)
-  - [stale8-followup-fix-1774903300](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-followup-fix-1774903300)
+- the latest rigorous live matrix:
+  - [rigorous-matrix-1775726814105.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775726814105.md)
+- recent targeted node regressions in `entangrid-node` covering:
+  - stronger pre-QC branch preference
+  - vote rejection on non-extending incompatible uncertified branches
+  - refusal to adopt taller but weaker full snapshots before QC
 
 ## Issue 1: Certified Sync Activation
 
-### What It Is
+Issue 1 was about making certified sync real in live runs instead of dead code.
 
-Issue 1 is the problem of making V2 certified recovery actually activate in live runs.
+Current status:
 
-The intended design is:
+- certified sync is active in the runtime
+- the recovery machinery is no longer limited to blind snapshot fallback
+- this is no longer the main blocker in the live matrix
 
-- nodes recover from the highest shared QC / certified anchor
-- recovery is proof-driven
-- legacy full snapshot sync is fallback, not the main path
-
-### What Was Wrong
-
-Earlier V2 runs showed:
-
-- `certified_sync_applied = 0`
-- `certified_sync_served = 0`
-- legacy sync dominating recovery
-
-That meant the protocol had certified-sync code, but live nodes were not really using it.
-
-### What Was Fixed
-
-The main fixes were:
-
-- peer QC anchor history instead of a single QC hint
-- highest-shared-QC selection for recovery
-- QC-aware sync mode selection
-- proactive certified push
-- anchored suffix tail attached to V2 recovery paths
-- follow-up sync requests chained after successful recovery applies
-
-### What Is Fixed Now
-
-Issue 1 is now materially better:
-
-- certified sync is real and covered by tests
-- V2 recovery is no longer dead code
-- the node-level recovery machinery is much closer to the intended architecture
-
-### What Is Still Not Fully Fixed
-
-Issue 1 is not perfectly clean in every live replay:
-
-- stale-restart recovery does not always finish through certified sync alone
-- some runs finish catch-up through incremental or snapshot follow-up instead
-
-So Issue 1 is best described as **mostly solved**, not perfectly complete.
+Issue 1 should now be treated as **solved enough** for the current stage.
 
 ## Issue 2: Canonical Branch Selection
 
-### What It Is
+Issue 2 was about making QC-backed branch choice dominate instead of letting local uncertified noise keep replacing the tip.
 
-Issue 2 is the ordering and fork-choice problem.
+Current status:
 
-The intended design is:
+- QC-backed branch choice is materially stronger than before
+- stale certified responses no longer roll back a newer local certified tip
+- the remaining live failures happen before a stable QC anchor forms, so they are not the same old post-QC fork-choice bug
 
-- once QC-backed state exists, it should dominate canonical branch choice
-- uncertified siblings should not keep replacing each other based on local noise
-
-### What Was Wrong
-
-Earlier V2 runs showed:
-
-- poor `same_chain_count`
-- too many distinct tips
-- branch drift after the first QC
-
-The old path was still too heuristic and too local.
-
-### What Was Fixed
-
-The main fixes were:
-
-- separate true orphans from pending certified children
-- buffer votes for unknown blocks
-- tighten same-height vote discipline
-- prune stale losing-branch votes when stronger certified state arrives
-- make QC-backed branch choice dominate
-- reject stale certified sync responses that would move a node backward
-
-### What Is Fixed Now
-
-Issue 2 is in good shape:
-
-- healthy and degraded default runs converge structurally
-- the rigorous matrix passes the baseline and gated structural scenarios
-- branch selection is no longer the main live blocker
-
-### What Is Still Not Fully Fixed
-
-There is no major remaining live failure that still points at the old Issue 2 root cause.
-
-So Issue 2 should be treated as **solved enough** for the current V2 stage.
+Issue 2 should now be treated as **solved enough**, with the important caveat that pre-QC convergence is still incomplete.
 
 ## Issue 3: Service Evidence And Proposer Gating
 
-### What It Is
+Issue 3 was about whether service evidence and gating actually punish degraded validators without dragging honest validators down.
 
-Issue 3 is the service-evidence and proposer-gating problem.
+Current status in the latest matrix:
 
-The intended design is:
+- default gated scenarios pass
+- the policy variants that were previously fragile now pass in the latest `12/14` run
+- the remaining failures are structural fork/sync failures in `6`-validator bursty runs, not service-score collapse
 
-- degraded validators lose score
-- degraded validators get gated
-- honest validators stay above threshold
-
-### What Was Wrong
-
-Earlier V2 service behavior had several failures:
-
-- evidence formation was weak or fragmented
-- aggregate import was not converging cleanly
-- freshness of score view and freshness of gating did not line up
-- transport/session behavior undermined the evidence path
-
-### What Was Fixed
-
-The main fixes were:
-
-- aggregate merge behavior improved
-- score freshness and gating freshness were aligned
-- deterministic service aggregators were introduced
-- observer surface was improved for V2 localnet correctness
-- transport/session handling was improved
-- weighted recent confirmed evidence was used for gating instead of a single latest aggregate
-
-### What Is Fixed Now
-
-At the default protocol profile, Issue 3 is in a good place:
-
-- default degraded scenarios punish the target validator
-- honest validators usually stay above threshold
-- default gated scenarios in the rigorous matrix pass
-
-Examples from the current rigorous matrix:
-
-- `gated-drop95`: pass, lowest score `v3 = 0.265`, gating `1`
-- `gated-outbound-disabled`: pass, lowest score `v3 = 0.000`, gating `3`
-- `policy-window-8`: pass, lowest score `v3 = 0.190`, gating `4`
-
-### What Is Still Not Fully Fixed
-
-Issue 3 is still policy-fragile in the rigorous matrix:
-
-- `policy-threshold-055`: fail
-- `policy-window-1`: fail
-
-That means:
-
-- the default V2 policy is behaving acceptably
-- but the service/gating model is not yet robust across more aggressive threshold and window variants
-
-So Issue 3 should be treated as **solved at the default profile, but not fully robust**.
+Issue 3 should now be treated as **solved enough** for the current default profile and covered matrix variants.
 
 ## Issue 4: Stale-Restart Recovery
 
-### What It Is
+Issue 4 was the stale-restart catch-up gap.
 
-Issue 4 is the stale-restart recovery edge case.
+Current status:
 
-The intended design is:
+- stale-restart recovery is no longer the active blocker
+- the protocol focus has moved away from restart repair and onto pre-QC multi-branch convergence
 
-- if one node goes down and rejoins late
-- it should catch up fully
-- it should not finish one or more blocks behind the cluster
+Issue 4 should now be treated as **solved enough** for the current stage.
 
-### What Was Wrong
+## Current Remaining Blocker: Pre-QC Bursty Convergence
 
-Earlier stale-restart runs showed:
+The active blocker is now outside the original four-issue framing.
 
-- restarted node catches up partway
-- restarted node reaches the certified frontier
-- restarted node often stops short of the final tip before shutdown
+Latest live result:
 
-This was the last major live recovery gap.
+- overall matrix: `12/14`
+- failing scenarios:
+  - `baseline-6-bursty`
+  - `gated-6-bursty`
 
-### What Was Fixed
+What is happening:
 
-Recent Issue 4 work included:
-
-- startup barrier improvements
-- suppression of historical proposer replay after restart
-- smarter recovery throttling
-- QC-aware responder sync paths
-- anchored suffix tail attached to certified recovery
-- follow-up sync after successful certified, incremental, and snapshot repair
-
-### What Is Fixed Now
-
-Issue 4 is much better than before:
-
-- stale node no longer collapses badly
-- stale node often applies many incremental repairs
-- stale node no longer shows the earlier large recovery failures
-- the recovery path is far more efficient and much less noisy
-
-### What Is Still Not Fixed
-
-Repeated stale-restart `8` runs still finish one block short.
-
-Fresh examples:
-
-- [node-1/state_snapshot.json](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-certified-tail-fix-1774903000/node-1/state_snapshot.json): height `24`
-- [node-8/state_snapshot.json](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-certified-tail-fix-1774903000/node-8/state_snapshot.json): height `23`
-
-- [node-1/state_snapshot.json](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-followup-fix-1774903300/node-1/state_snapshot.json): height `26`
-- [node-8/state_snapshot.json](/Users/ayushns01/Desktop/Repositories/Entangrid/var/stale8-followup-fix-1774903300/node-8/state_snapshot.json): height `25`
-
-So Issue 4 is **still open**.
+- under bursty `6`-validator load, nodes still split across uncertified branches before a stable QC anchor forms
+- recent fixes improved branch scoring, vote discipline, and snapshot preference before QC
+- those fixes were directionally correct, but not enough to make the last two scenarios converge
 
 ## Bottom Line
 
-- Issue 1 is mostly solved
-- Issue 2 is solved enough
-- Issue 3 is good at the default profile but still policy-fragile
-- Issue 4 is still the main remaining live blocker
+The original four V2 issues are no longer the right way to describe the active risk.
 
-## Practical Meaning
+The honest current state is:
 
-The current V2 state is:
-
-- structurally much stronger than before
-- good enough on healthy and default degraded behavior to justify continued V2 focus
-- not yet at the point where stale-restart recovery can be called fully complete
-
-The next protocol focus should remain on the last-mile stale-restart recovery gap rather than reopening the earlier broad Issue 1, 2, or 3 work.
+- certified sync is live
+- service evidence and gating are in much better shape
+- stale restart is no longer the main blocker
+- the remaining work is the final pre-QC convergence proof in the two `6`-validator bursty scenarios

@@ -139,7 +139,7 @@ Current main-branch focus:
 
 - stabilize the V2 protocol path on `main` first
 - keep the crypto boundary clean while consensus, ordering, and sync are still changing
-- only move to real PQ integration after the single-machine V2 matrix is green
+- finish the remaining bursty `6`-validator consensus proof while keeping the current PQ boundary stable
 
 Current PQ branch focus:
 
@@ -149,6 +149,7 @@ Current PQ branch focus:
   - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
   - add a feature-gated hybrid ML-KEM session handshake behind `pq-ml-kem`
 - that branch now covers signing/authentication, strict hybrid enforcement across transactions and consensus-relevant validator evidence, hybrid session establishment, encrypted framing, and transport-local TTL turnover
+- the remaining blocker on that line is not missing PQ crypto plumbing; it is the last bursty `6`-validator consensus proof
 - session rotation and richer transport hardening are explicitly deferred to the post-Stage-1 hardening milestone
 
 ## Why this crate matters
