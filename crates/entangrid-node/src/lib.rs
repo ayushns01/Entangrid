@@ -240,6 +240,13 @@ struct NodeRunner {
     peer_message_windows: BTreeMap<ValidatorId, PeerMessageWindow>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchRelation {
+    SameChain,
+    Incompatible,
+    Unknown,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ServedSyncRequest {
     served_at_unix_millis: u64,
@@ -1241,7 +1248,8 @@ impl NodeRunner {
                             )?;
                         }
                     }
-                } else if self.should_push_local_snapshot_after_sync_response(&local_snapshot, &chain)
+                } else if self
+                    .should_push_local_snapshot_after_sync_response(&local_snapshot, &chain)
                 {
                     if let Err(error) = self.push_best_sync_to(
                         responder_id,
@@ -1366,14 +1374,49 @@ impl NodeRunner {
                             self.announce_certified_progress()?;
                         }
                         Ok(CertifiedSyncImportOutcome::Ignored(reason)) => {
-                            if reason.prefers_same_peer_legacy_followup() {
-                                let responder_id = from_validator_id;
-                                if let Err(error) = self.request_legacy_sync_from(responder_id) {
-                                    self.log_event(
-                                        "sync-request-failed",
-                                        format!("to {responder_id} detail {error}"),
-                                    )?;
+                            let responder_id = from_validator_id;
+                            let followup_result = match reason {
+                                CertifiedSyncIgnoreReason::Unavailable => {
+                                    if self.startup_sync_barrier {
+                                        self.request_followup_legacy_sync_from(responder_id)
+                                            .map(|_| true)
+                                    } else {
+                                        self.request_best_available_sync_from_ahead_peers_excluding(
+                                            Some(responder_id),
+                                        )
+                                        .and_then(
+                                            |requested| {
+                                                if requested {
+                                                    Ok(true)
+                                                } else {
+                                                    self.request_followup_legacy_sync_from(
+                                                        responder_id,
+                                                    )
+                                                    .map(|_| true)
+                                                }
+                                            },
+                                        )
+                                    }
                                 }
+                                CertifiedSyncIgnoreReason::SharedQcMismatch => self
+                                    .request_followup_legacy_sync_from(responder_id)
+                                    .map(|_| true),
+                                CertifiedSyncIgnoreReason::StaleSnapshot
+                                    if self
+                                        .preferred_pending_child_for_certified_head()
+                                        .is_some() =>
+                                {
+                                    self.request_followup_legacy_sync_from(responder_id)
+                                        .map(|_| true)
+                                }
+                                CertifiedSyncIgnoreReason::EmptyPayload
+                                | CertifiedSyncIgnoreReason::StaleSnapshot => Ok(false),
+                            };
+                            if let Err(error) = followup_result {
+                                self.log_event(
+                                    "sync-request-failed",
+                                    format!("to {responder_id} detail {error}"),
+                                )?;
                             }
                         }
                         Err(error) => {
@@ -1727,6 +1770,7 @@ impl NodeRunner {
         self.validate_hybrid_block_policy(&block)?;
 
         if block.header.parent_hash != self.ledger.snapshot().tip_hash {
+            let direct_certified_child = self.is_direct_child_of_current_certified_head(&block);
             if !self
                 .orphan_blocks
                 .iter()
@@ -1745,6 +1789,12 @@ impl NodeRunner {
                 )?;
             }
             self.import_buffered_proposal_votes_for_block(&block)?;
+            if direct_certified_child {
+                let _ = self.maybe_adopt_better_uncertified_child_for_certified_head()?;
+                if self.ledger.snapshot().tip_hash == block.block_hash {
+                    return Ok(BlockAcceptance::Accepted);
+                }
+            }
             self.maybe_broadcast_vote_for_competing_block(&block)?;
             let _ = self.maybe_finalize_quorum_certificate(block.block_hash)?;
             let adopted = self.maybe_adopt_preferred_competing_branch(&block)?
@@ -1794,14 +1844,53 @@ impl NodeRunner {
         if self.certified_head_only_active()
             && !self.quorum_certificates.contains_key(&block.block_hash)
         {
-            if !self
-                .pending_certified_children
+            let Some((certified_head_hash, certified_head_height)) = self.current_certified_head()
+            else {
+                self.persist_metrics()?;
+                return Ok(BlockAcceptance::Orphan);
+            };
+            let is_direct_child = block.header.parent_hash == certified_head_hash
+                && block.header.block_number == certified_head_height + 1;
+            if is_direct_child {
+                if !self
+                    .pending_certified_children
+                    .iter()
+                    .any(|pending| pending.block_hash == block.block_hash)
+                {
+                    self.pending_certified_children.push(block.clone());
+                    self.log_event(
+                        "certified-head-pending",
+                        format!(
+                            "height {} slot {} parent {:02x?}",
+                            block.header.block_number,
+                            block.header.slot,
+                            &block.header.parent_hash[..4]
+                        ),
+                    )?;
+                }
+                if !self.recovery_sync_only_active() {
+                    self.import_buffered_proposal_votes_for_block(&block)?;
+                    let should_support_block = self
+                        .preferred_pending_child_for_certified_head()
+                        .map(|pending| pending.block_hash == block.block_hash)
+                        .unwrap_or(false);
+                    if should_support_block {
+                        self.maybe_broadcast_local_proposal_vote(&block)?;
+                    }
+                    let _ = self.maybe_finalize_quorum_certificate(block.block_hash)?;
+                }
+                let _ = self.maybe_adopt_better_uncertified_child_for_certified_head()?;
+                if self.ledger.snapshot().tip_hash == block.block_hash {
+                    return Ok(BlockAcceptance::Accepted);
+                }
+            } else if !self
+                .orphan_blocks
                 .iter()
-                .any(|pending| pending.block_hash == block.block_hash)
+                .any(|orphan| orphan.block_hash == block.block_hash)
             {
-                self.pending_certified_children.push(block.clone());
+                self.orphan_blocks.push(block.clone());
                 self.log_event(
-                    "certified-head-pending",
+                    "certified-head-descendant-buffered",
                     format!(
                         "height {} slot {} parent {:02x?}",
                         block.header.block_number,
@@ -1809,20 +1898,6 @@ impl NodeRunner {
                         &block.header.parent_hash[..4]
                     ),
                 )?;
-            }
-            if !self.recovery_sync_only_active() {
-                self.import_buffered_proposal_votes_for_block(&block)?;
-                let should_support_block = self
-                    .preferred_pending_child_for_certified_head()
-                    .map(|pending| pending.block_hash == block.block_hash)
-                    .unwrap_or(false);
-                if should_support_block {
-                    self.maybe_broadcast_local_proposal_vote(&block)?;
-                }
-                let _ = self.maybe_finalize_quorum_certificate(block.block_hash)?;
-            }
-            if self.ledger.snapshot().tip_hash == block.block_hash {
-                return Ok(BlockAcceptance::Accepted);
             }
             self.persist_metrics()?;
             return Ok(BlockAcceptance::Orphan);
@@ -1984,8 +2059,29 @@ impl NodeRunner {
             .map(|block| block.block_hash)
     }
 
+    fn current_certified_head(&self) -> Option<(HashBytes, u64)> {
+        let hash = self.highest_locked_qc_hash()?;
+        let height = self
+            .quorum_certificates
+            .get(&hash)
+            .map(|qc| qc.block_number)
+            .or_else(|| {
+                self.known_block(hash)
+                    .map(|block| block.header.block_number)
+            })?;
+        Some((hash, height))
+    }
+
     fn certified_head_only_active(&self) -> bool {
         self.config.feature_flags.consensus_v2 && self.highest_locked_qc_hash().is_some()
+    }
+
+    fn is_direct_child_of_current_certified_head(&self, block: &Block) -> bool {
+        self.current_certified_head()
+            .is_some_and(|(certified_head_hash, certified_head_height)| {
+                block.header.parent_hash == certified_head_hash
+                    && block.header.block_number == certified_head_height + 1
+            })
     }
 
     fn recovery_sync_only_active(&self) -> bool {
@@ -1998,20 +2094,21 @@ impl NodeRunner {
     }
 
     fn is_pending_certified_head_block(&self, block: &Block) -> bool {
-        self.certified_head_only_active()
-            && block.header.parent_hash == self.ledger.snapshot().tip_hash
-            && self
-                .pending_certified_children
-                .iter()
-                .any(|pending| pending.block_hash == block.block_hash)
+        self.current_certified_head()
+            .is_some_and(|(certified_head_hash, certified_head_height)| {
+                block.header.parent_hash == certified_head_hash
+                    && block.header.block_number == certified_head_height + 1
+                    && self
+                        .pending_certified_children
+                        .iter()
+                        .any(|pending| pending.block_hash == block.block_hash)
+            })
     }
 
     fn preferred_pending_child_for_certified_head(&self) -> Option<Block> {
-        if !self.certified_head_only_active() {
-            return None;
-        }
-        let parent_hash = self.ledger.snapshot().tip_hash;
-        let block_number = self.ledger.block_height() + 1;
+        let (parent_hash, block_number) = self
+            .current_certified_head()
+            .map(|(hash, height)| (hash, height + 1))?;
         self.pending_certified_children
             .iter()
             .filter(|block| {
@@ -2026,11 +2123,121 @@ impl NodeRunner {
             .cloned()
     }
 
+    fn best_known_uncertified_child_for_certified_head(&self) -> Option<Block> {
+        let (parent_hash, block_number) = self
+            .current_certified_head()
+            .map(|(hash, height)| (hash, height + 1))?;
+        self.blocks
+            .iter()
+            .chain(self.pending_certified_children.iter())
+            .chain(self.orphan_blocks.iter())
+            .filter(|block| {
+                !self.quorum_certificates.contains_key(&block.block_hash)
+                    && block.header.parent_hash == parent_hash
+                    && block.header.block_number == block_number
+            })
+            .max_by(|left, right| {
+                left.header
+                    .slot
+                    .cmp(&right.header.slot)
+                    .then_with(|| left.block_hash.cmp(&right.block_hash))
+            })
+            .cloned()
+    }
+
+    fn known_uncertified_children_for_certified_head(&self) -> Vec<Block> {
+        let Some((parent_hash, block_number)) = self
+            .current_certified_head()
+            .map(|(hash, height)| (hash, height + 1))
+        else {
+            return Vec::new();
+        };
+        self.blocks
+            .iter()
+            .chain(self.pending_certified_children.iter())
+            .chain(self.orphan_blocks.iter())
+            .filter(|block| {
+                !self.quorum_certificates.contains_key(&block.block_hash)
+                    && block.header.parent_hash == parent_hash
+                    && block.header.block_number == block_number
+            })
+            .fold(Vec::new(), |mut unique, block| {
+                if !unique
+                    .iter()
+                    .any(|existing: &Block| existing.block_hash == block.block_hash)
+                {
+                    unique.push(block.clone());
+                }
+                unique
+            })
+    }
+
+    fn current_uncertified_child_for_certified_head(&self) -> Option<Block> {
+        let (certified_head_hash, _) = self.current_certified_head()?;
+        let current_tip = self.blocks.last()?;
+        if current_tip.block_hash == certified_head_hash {
+            return None;
+        }
+        let chain = self.build_chain_to_tip(current_tip.block_hash)?;
+        let certified_head_index = chain
+            .iter()
+            .position(|block| block.block_hash == certified_head_hash)?;
+        chain.get(certified_head_index + 1).cloned()
+    }
+
+    fn maybe_adopt_better_uncertified_child_for_certified_head(&mut self) -> Result<bool> {
+        let current_child = self.current_uncertified_child_for_certified_head();
+        let known_children = self.known_uncertified_children_for_certified_head();
+        if known_children.is_empty() {
+            return Ok(false);
+        }
+        let Some(best_child) = self.best_known_uncertified_child_for_certified_head() else {
+            return Ok(false);
+        };
+        match current_child {
+            Some(current_child)
+                if best_child.block_hash == current_child.block_hash
+                    || best_child.header.slot <= current_child.header.slot =>
+            {
+                return Ok(false);
+            }
+            None if known_children.len() < 2 => {
+                return Ok(false);
+            }
+            None => {}
+            Some(_) => {}
+        }
+        let Some(best_chain) = self.build_chain_to_tip(best_child.block_hash) else {
+            return Ok(false);
+        };
+        let reason = if current_child.is_some() {
+            "certified-child-replaced"
+        } else {
+            "certified-child-adopted"
+        };
+        self.adopt_canonical_chain(best_chain, reason)?;
+        self.maybe_broadcast_local_proposal_vote(&best_child)?;
+        Ok(true)
+    }
+
     fn maybe_broadcast_local_proposal_vote(&mut self, block: &Block) -> Result<()> {
         if !self.config.feature_flags.consensus_v2 {
             return Ok(());
         }
         let vote = self.build_local_proposal_vote(block)?;
+        if self.local_vote_would_scatter_before_qc(&vote) {
+            self.log_event(
+                "proposal-vote-skipped",
+                format!(
+                    "block {:02x?} height {} slot {} validator {} detail pre-qc local vote would scatter across unresolved branches",
+                    &block.block_hash[..4],
+                    block.header.block_number,
+                    block.header.slot,
+                    self.config.validator_id,
+                ),
+            )?;
+            return Ok(());
+        }
         let imported = match self.import_proposal_vote(vote.clone()) {
             Ok(imported) => imported,
             Err(error) if error.to_string().contains("conflicting proposal vote") => {
@@ -2147,6 +2354,7 @@ impl NodeRunner {
             .append_json_line(&self.storage.quorum_certificates_path, &qc)?;
         self.prune_votes_not_extending_certified_block(qc.block_hash, qc.block_number);
         self.maybe_adopt_certified_branch(qc.block_hash)?;
+        let _ = self.maybe_adopt_better_uncertified_child_for_certified_head()?;
         self.log_event(
             "qc-imported",
             format!(
@@ -2291,25 +2499,62 @@ impl NodeRunner {
         existing: &ProposalVote,
         candidate: &ProposalVote,
     ) -> bool {
+        if self.highest_local_qc().is_none() {
+            return self.can_replace_pre_qc_conflicting_vote(existing, candidate);
+        }
         if !self.certified_head_only_active() || existing.block_number != candidate.block_number {
             return false;
         }
         if self.quorum_certificates.contains_key(&existing.block_hash) {
             return false;
         }
-        let certified_head_hash = self.ledger.snapshot().tip_hash;
+        let Some((certified_head_hash, certified_head_height)) = self.current_certified_head()
+        else {
+            return false;
+        };
         let Some(existing_block) = self.known_block(existing.block_hash) else {
             return false;
         };
         let Some(candidate_block) = self.known_block(candidate.block_hash) else {
             return false;
         };
+        if existing.block_number != certified_head_height + 1 {
+            return false;
+        }
         if existing_block.header.parent_hash != certified_head_hash
             || candidate_block.header.parent_hash != certified_head_hash
         {
             return false;
         }
         candidate_block.header.slot > existing_block.header.slot
+    }
+
+    fn can_replace_pre_qc_conflicting_vote(
+        &self,
+        existing: &ProposalVote,
+        candidate: &ProposalVote,
+    ) -> bool {
+        if existing.block_hash == candidate.block_hash {
+            return false;
+        }
+        if self.blocks.last().map(|block| block.block_hash) != Some(candidate.block_hash) {
+            return false;
+        }
+        let candidate_chain = self.build_chain_to_tip(candidate.block_hash);
+        let existing_chain = self.build_chain_to_tip(existing.block_hash);
+        match (existing_chain, candidate_chain) {
+            (Some(existing_chain), Some(candidate_chain)) => {
+                if !matches!(
+                    self.branch_relation(existing.block_hash, candidate.block_hash),
+                    BranchRelation::Incompatible
+                ) {
+                    return false;
+                }
+                self.compare_branch_quality(&candidate_chain, &existing_chain) == Ordering::Greater
+            }
+            (None, Some(_)) => true,
+            _ => false,
+        }
     }
 
     fn remove_proposal_vote_from_maps(&mut self, vote: &ProposalVote) {
@@ -2327,23 +2572,61 @@ impl NodeRunner {
         }
     }
 
+    fn local_vote_would_scatter_before_qc(&self, candidate: &ProposalVote) -> bool {
+        if self.certified_head_only_active() || self.highest_local_qc().is_some() {
+            return false;
+        }
+        self.proposal_votes
+            .values()
+            .chain(self.buffered_proposal_votes.values())
+            .filter_map(|votes| votes.get(&self.config.validator_id))
+            .any(|existing| {
+                existing.block_hash != candidate.block_hash
+                    && match self.branch_relation(existing.block_hash, candidate.block_hash) {
+                        BranchRelation::SameChain => false,
+                        BranchRelation::Incompatible => {
+                            !self.can_replace_conflicting_proposal_vote(existing, candidate)
+                        }
+                        BranchRelation::Unknown => {
+                            !self.can_replace_conflicting_proposal_vote(existing, candidate)
+                        }
+                    }
+            })
+    }
+
+    fn branch_relation(&self, left_hash: HashBytes, right_hash: HashBytes) -> BranchRelation {
+        if left_hash == right_hash {
+            return BranchRelation::SameChain;
+        }
+        let left_chain = self.build_chain_to_tip(left_hash);
+        let right_chain = self.build_chain_to_tip(right_hash);
+        match (left_chain, right_chain) {
+            (Some(left_chain), Some(right_chain)) => {
+                let right_extends_left = right_chain
+                    .iter()
+                    .any(|block| block.block_hash == left_hash);
+                let left_extends_right = left_chain
+                    .iter()
+                    .any(|block| block.block_hash == right_hash);
+                if right_extends_left || left_extends_right {
+                    BranchRelation::SameChain
+                } else {
+                    BranchRelation::Incompatible
+                }
+            }
+            _ => BranchRelation::Unknown,
+        }
+    }
+
     fn proposal_vote_branches_are_compatible(
         &self,
         existing_hash: HashBytes,
         candidate_hash: HashBytes,
     ) -> bool {
-        if existing_hash == candidate_hash {
-            return true;
-        }
-        let candidate_extends_existing = self
-            .build_chain_to_tip(candidate_hash)
-            .map(|chain| chain.iter().any(|block| block.block_hash == existing_hash))
-            .unwrap_or(true);
-        let existing_extends_candidate = self
-            .build_chain_to_tip(existing_hash)
-            .map(|chain| chain.iter().any(|block| block.block_hash == candidate_hash))
-            .unwrap_or(true);
-        candidate_extends_existing || existing_extends_candidate
+        matches!(
+            self.branch_relation(existing_hash, candidate_hash),
+            BranchRelation::SameChain | BranchRelation::Unknown
+        )
     }
 
     fn resolve_conflicting_proposal_vote(&mut self, vote: &ProposalVote) -> Result<()> {
@@ -2363,7 +2646,8 @@ impl NodeRunner {
                 }
                 if existing.block_number != vote.block_number
                     && !(existing.epoch == vote.epoch && existing.slot == vote.slot)
-                    && self.proposal_vote_branches_are_compatible(existing.block_hash, vote.block_hash)
+                    && self
+                        .proposal_vote_branches_are_compatible(existing.block_hash, vote.block_hash)
                 {
                     continue;
                 }
@@ -2458,6 +2742,7 @@ impl NodeRunner {
             return Ok(None);
         };
         self.maybe_adopt_certified_branch(qc.block_hash)?;
+        let _ = self.maybe_adopt_better_uncertified_child_for_certified_head()?;
         if !already_had_qc {
             self.network.broadcast(
                 &self.config.peers,
@@ -2575,6 +2860,14 @@ impl NodeRunner {
         if candidate_chain.is_empty() {
             return Ok(false);
         }
+        if self.blocks.last().map(|block| block.block_hash) != Some(candidate_tip_hash)
+            && self
+                .blocks
+                .iter()
+                .any(|block| block.block_hash == candidate_tip_hash)
+        {
+            return Ok(false);
+        }
         if self.compare_branch_quality(&candidate_chain, &self.blocks) != Ordering::Greater {
             return Ok(false);
         }
@@ -2604,6 +2897,7 @@ impl NodeRunner {
             return Ok(false);
         }
         self.adopt_canonical_chain(candidate_chain, "vote-supported-branch-adopted")?;
+        self.maybe_broadcast_local_vote_for_current_pre_qc_tip()?;
         Ok(true)
     }
 
@@ -2633,7 +2927,18 @@ impl NodeRunner {
             return Ok(false);
         }
         self.adopt_canonical_chain(candidate_chain, "preferred-branch-adopted")?;
+        self.maybe_broadcast_local_vote_for_current_pre_qc_tip()?;
         Ok(true)
+    }
+
+    fn maybe_broadcast_local_vote_for_current_pre_qc_tip(&mut self) -> Result<()> {
+        if !self.config.feature_flags.consensus_v2 || self.highest_local_qc().is_some() {
+            return Ok(());
+        }
+        let Some(tip) = self.blocks.last().cloned() else {
+            return Ok(());
+        };
+        self.maybe_broadcast_local_proposal_vote(&tip)
     }
 
     fn build_chain_to_tip(&self, tip_hash: HashBytes) -> Option<Vec<Block>> {
@@ -2756,10 +3061,7 @@ impl NodeRunner {
                         .map(|votes| votes.contains_key(&self.config.validator_id))
                         .unwrap_or(false);
                 let vote_count = existing + usize::from(receives_extra_local_vote);
-                block
-                    .header
-                    .block_number
-                    .saturating_mul(vote_count as u64)
+                block.header.block_number.saturating_mul(vote_count as u64)
             })
             .sum()
     }
@@ -2771,6 +3073,9 @@ impl NodeRunner {
     ) -> (u64, u64, u64, u64, u64, HashBytes) {
         let latest_certified_height = self.latest_certified_height(chain);
         let tip = chain.last();
+        let tip_height = tip.map(|block| block.header.block_number).unwrap_or(0);
+        let tip_slot = tip.map(|block| block.header.slot).unwrap_or(0);
+        let tip_hash = tip.map(|block| block.block_hash).unwrap_or_else(empty_hash);
         let tip_vote_count = tip
             .map(|block| {
                 let existing = self
@@ -2787,13 +3092,21 @@ impl NodeRunner {
                 existing + usize::from(receives_extra_local_vote)
             })
             .unwrap_or(0);
+        if latest_certified_height == 0 {
+            return pre_qc_tip_support_quality(
+                tip_vote_count as u64,
+                tip_height,
+                tip_slot,
+                tip_hash,
+            );
+        }
         (
             latest_certified_height,
             self.branch_weighted_vote_support(chain, extra_tip_vote_for),
-            tip.map(|block| block.header.block_number).unwrap_or(0),
+            tip_height,
             tip_vote_count as u64,
-            tip.map(|block| block.header.slot).unwrap_or(0),
-            tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
+            tip_slot,
+            tip_hash,
         )
     }
 
@@ -3176,6 +3489,35 @@ impl NodeRunner {
                     return Ok(CertifiedSyncImportOutcome::Ignored(
                         CertifiedSyncIgnoreReason::SharedQcMismatch,
                     ));
+                }
+
+                let mut headers = headers;
+                let mut blocks = blocks;
+                let mut qcs = qcs;
+                if shared_qc_height > 0
+                    && blocks
+                        .first()
+                        .is_some_and(|block| block.block_hash == shared_qc_hash)
+                {
+                    headers.remove(0);
+                    blocks.remove(0);
+                    qcs.remove(0);
+                    if blocks.is_empty() {
+                        self.record_peer_sync_status(
+                            responder_id,
+                            responder_height,
+                            responder_tip_hash,
+                            Some(shared_qc_hash),
+                            shared_qc_height,
+                            vec![SyncQcAnchor {
+                                block_hash: shared_qc_hash,
+                                block_number: shared_qc_height,
+                            }],
+                        );
+                        return Ok(CertifiedSyncImportOutcome::Ignored(
+                            CertifiedSyncIgnoreReason::StaleSnapshot,
+                        ));
+                    }
                 }
 
                 let prefix_len = shared_qc_height as usize;
@@ -3737,7 +4079,8 @@ impl NodeRunner {
             .copied()
             .unwrap_or(0)
             > 0
-            && peer_has_distinct_or_higher_certified_frontier
+            && (peer_has_distinct_or_higher_certified_frontier
+                || self.peer_shares_local_certified_frontier_with_divergent_suffix(validator_id))
         {
             return V2SyncMode::Certified;
         }
@@ -3780,6 +4123,12 @@ impl NodeRunner {
         status.highest_qc_height > local_qc_height
             || (status.highest_qc_height == local_qc_height
                 && status.highest_qc_hash != local_qc_hash)
+            || (local_qc_height > 0
+                && status.highest_qc_height == local_qc_height
+                && status.highest_qc_hash == local_qc_hash
+                && status.height == local_sync_view.height
+                && status.tip_hash != local_sync_view.tip_hash
+                && status.tip_last_slot == 0)
             || peer_sync_status_preference(status) > local_sync_view_preference(&local_sync_view)
     }
 
@@ -3810,6 +4159,18 @@ impl NodeRunner {
                 requester_id: self.config.validator_id,
                 known_height,
                 known_tip_hash,
+            },
+        )
+    }
+
+    fn request_followup_legacy_sync_from(&self, validator_id: ValidatorId) -> Result<()> {
+        let local_sync_view = self.local_sync_view();
+        self.network.send_control_to(
+            self.find_peer(validator_id)?,
+            ProtocolMessage::SyncRequest {
+                requester_id: self.config.validator_id,
+                known_height: local_sync_view.height,
+                known_tip_hash: local_sync_view.tip_hash,
             },
         )
     }
@@ -5611,15 +5972,6 @@ enum CertifiedSyncIgnoreReason {
     StaleSnapshot,
 }
 
-impl CertifiedSyncIgnoreReason {
-    fn prefers_same_peer_legacy_followup(self) -> bool {
-        matches!(
-            self,
-            CertifiedSyncIgnoreReason::Unavailable | CertifiedSyncIgnoreReason::SharedQcMismatch
-        )
-    }
-}
-
 fn merge_sync_qc_anchors(
     existing: &[SyncQcAnchor],
     incoming: &[SyncQcAnchor],
@@ -5684,6 +6036,23 @@ fn should_adopt_snapshot(local: &StateSnapshot, remote: &StateSnapshot) -> bool 
     snapshot_preference(remote) > snapshot_preference(local)
 }
 
+fn pre_qc_tip_support_quality(
+    tip_vote_count: u64,
+    tip_height: u64,
+    tip_slot: u64,
+    tip_hash: HashBytes,
+) -> (u64, u64, u64, u64, u64, HashBytes) {
+    let weighted_tip_support = tip_vote_count.saturating_mul(tip_height);
+    (
+        0,
+        weighted_tip_support,
+        tip_height,
+        tip_vote_count,
+        tip_slot,
+        tip_hash,
+    )
+}
+
 fn snapshot_branch_quality(
     chain: &[Block],
     proposal_votes: &[ProposalVote],
@@ -5695,16 +6064,6 @@ fn snapshot_branch_quality(
             .or_default()
             .insert(vote.validator_id);
     }
-    let weighted_vote_support = chain
-        .iter()
-        .map(|block| {
-            let vote_count = vote_sets
-                .get(&block.block_hash)
-                .map(|validators| validators.len() as u64)
-                .unwrap_or(0);
-            block.header.block_number.saturating_mul(vote_count)
-        })
-        .sum();
     let tip = chain.last();
     let tip_vote_count = tip
         .map(|block| {
@@ -5714,11 +6073,9 @@ fn snapshot_branch_quality(
                 .unwrap_or(0)
         })
         .unwrap_or(0);
-    (
-        0,
-        weighted_vote_support,
-        tip.map(|block| block.header.block_number).unwrap_or(0),
+    pre_qc_tip_support_quality(
         tip_vote_count,
+        tip.map(|block| block.header.block_number).unwrap_or(0),
         tip.map(|block| block.header.slot).unwrap_or(0),
         tip.map(|block| block.block_hash).unwrap_or_else(empty_hash),
     )
@@ -8243,6 +8600,7 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
         assert!(
             runner
                 .proposal_votes
@@ -8258,6 +8616,7 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
         assert!(
             runner
                 .proposal_votes
@@ -8374,8 +8733,9 @@ mod tests {
                 .accept_block(later_child.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Orphan
+            BlockAcceptance::Accepted
         );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
         assert!(
             runner
                 .proposal_votes
@@ -8390,6 +8750,527 @@ mod tests {
                 .and_then(|votes| votes.get(&1))
                 .is_none()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_slot_child_replaces_current_tip_under_certified_head() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "same-height-tip-later-replacement",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let current_child = build_child(2, certified_root.header.slot + 1);
+        runner
+            .adopt_canonical_chain(
+                vec![certified_root.clone(), current_child.clone()],
+                "test-current-certified-child",
+            )
+            .unwrap();
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_child.block_hash);
+
+        let later_child = build_child(4, current_child.header.slot + 1);
+        assert!(later_child.header.slot > current_child.header.slot);
+
+        assert_eq!(
+            runner
+                .accept_block(later_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_slot_child_adopts_from_certified_head_when_multiple_siblings_are_known() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "certified-head-multi-sibling-adoption",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let earlier_child = build_child(2, certified_root.header.slot + 1);
+        assert_eq!(
+            runner
+                .accept_block(earlier_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+
+        let later_child = build_child(4, earlier_child.header.slot + 1);
+        assert!(later_child.header.slot > earlier_child.header.slot);
+        assert_eq!(
+            runner
+                .accept_block(later_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_slot_child_adopts_when_certified_head_is_off_current_branch() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "off-branch-certified-head-adoption",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let competing_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 4, certified_root.header.slot + 1);
+        runner
+            .adopt_canonical_chain(vec![competing_root], "test-off-branch-current-tip")
+            .unwrap();
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let later_child = build_child(4, certified_root.header.slot + 3);
+        let earlier_child = build_child(2, certified_root.header.slot + 1);
+        assert!(earlier_child.header.slot < later_child.header.slot);
+
+        assert_eq!(
+            runner
+                .accept_block(later_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(earlier_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_slot_child_replaces_extended_tip_under_certified_head() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "extended-certified-child-replacement",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |parent_hash: HashBytes,
+                           block_number: u64,
+                           proposer_id: ValidatorId,
+                           min_slot: u64,
+                           state_root: HashBytes| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number,
+                parent_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root,
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let current_child = build_child(
+            certified_root.block_hash,
+            2,
+            2,
+            certified_root.header.slot + 1,
+            root_ledger.state_root(),
+        );
+        let mut child_ledger = root_ledger.clone();
+        child_ledger.apply_block(&current_child, &crypto).unwrap();
+        let current_grandchild = build_child(
+            current_child.block_hash,
+            3,
+            2,
+            current_child.header.slot + 1,
+            child_ledger.state_root(),
+        );
+        runner
+            .adopt_canonical_chain(
+                vec![
+                    certified_root.clone(),
+                    current_child.clone(),
+                    current_grandchild.clone(),
+                ],
+                "test-extended-certified-child",
+            )
+            .unwrap();
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_grandchild.block_hash);
+
+        let later_child = build_child(
+            certified_root.block_hash,
+            2,
+            4,
+            current_grandchild.header.slot + 1,
+            root_ledger.state_root(),
+        );
+        assert!(later_child.header.slot > current_child.header.slot);
+
+        assert_eq!(
+            runner
+                .accept_block(later_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certified_head_reimport_does_not_rollback_uncertified_child() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "certified-head-no-rollback",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let earlier_child = build_child(2, certified_root.header.slot + 1);
+        let later_child = build_child(4, earlier_child.header.slot + 1);
+        assert_eq!(
+            runner
+                .accept_block(earlier_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert_eq!(
+            runner
+                .accept_block(later_child.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
+
+        assert!(!runner
+            .maybe_adopt_certified_branch(certified_root.block_hash)
+            .unwrap());
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8589,8 +9470,9 @@ mod tests {
                 .accept_block(later_child.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Orphan
+            BlockAcceptance::Accepted
         );
+        assert_eq!(runner.ledger.snapshot().tip_hash, later_child.block_hash);
 
         assert!(
             runner
@@ -8623,6 +9505,249 @@ mod tests {
                 .get(&earlier_child.block_hash)
                 .and_then(|votes| votes.get(&4))
                 .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_slot_vote_replaces_earlier_when_local_tip_already_extended_certified_head() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "extended-certified-head-vote-replacement",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .quorum_certificates
+                .contains_key(&certified_root.block_hash)
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let build_child = |proposer_id: ValidatorId, min_slot: u64| {
+            let slot = (min_slot..(min_slot + 50))
+                .find(|slot| consensus.proposer_for_slot(*slot) == proposer_id)
+                .unwrap();
+            let epoch = consensus.epoch_for_slot(slot);
+            let transactions = Vec::new();
+            let commitment: Option<TopologyCommitment> = None;
+            let header = BlockHeader {
+                block_number: 2,
+                parent_hash: certified_root.block_hash,
+                slot,
+                epoch,
+                proposer_id,
+                timestamp_unix_millis: now_unix_millis(),
+                state_root: root_ledger.state_root(),
+                transactions_root: canonical_hash(&transactions),
+                topology_root: empty_hash(),
+            };
+            let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+            Block {
+                header,
+                transactions,
+                commitment,
+                commitment_receipts: Vec::new(),
+                signature: crypto.sign(proposer_id, &block_hash).unwrap(),
+                block_hash,
+            }
+        };
+
+        let earlier_child = build_child(2, certified_root.header.slot + 1);
+        let later_child = build_child(3, earlier_child.header.slot + 1);
+
+        let mut child_ledger = root_ledger.clone();
+        child_ledger.apply_block(&earlier_child, &crypto).unwrap();
+        runner.ledger = child_ledger;
+        runner.blocks.push(earlier_child.clone());
+        runner.orphan_blocks.push(later_child.clone());
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &earlier_child
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &later_child
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&later_child.block_hash)
+                .and_then(|votes| votes.get(&4))
+                .is_some()
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&earlier_child.block_hash)
+                .and_then(|votes| votes.get(&4))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn descendant_of_uncertified_certified_head_child_stays_orphan() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "certified-head-descendant-buffering",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let certified_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(certified_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &certified_root
+                ))
+                .unwrap()
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&certified_root, &crypto).unwrap();
+        let child_slot = ((certified_root.header.slot + 1)..(certified_root.header.slot + 51))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 2)
+            .unwrap();
+        let child_epoch = consensus.epoch_for_slot(child_slot);
+        let child_transactions = Vec::new();
+        let child_commitment: Option<TopologyCommitment> = None;
+        let child_header = BlockHeader {
+            block_number: 2,
+            parent_hash: certified_root.block_hash,
+            slot: child_slot,
+            epoch: child_epoch,
+            proposer_id: 2,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: root_ledger.state_root(),
+            transactions_root: canonical_hash(&child_transactions),
+            topology_root: empty_hash(),
+        };
+        let child_hash =
+            canonical_hash(&(child_header.clone(), &child_transactions, &child_commitment));
+        let child = Block {
+            header: child_header,
+            transactions: child_transactions,
+            commitment: child_commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(2, &child_hash).unwrap(),
+            block_hash: child_hash,
+        };
+
+        let mut child_ledger = root_ledger.clone();
+        child_ledger.apply_block(&child, &crypto).unwrap();
+        runner.ledger = child_ledger;
+        runner.blocks.push(child.clone());
+
+        let grandchild_slot = ((child.header.slot + 1)..(child.header.slot + 51))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 3)
+            .unwrap();
+        let grandchild_epoch = consensus.epoch_for_slot(grandchild_slot);
+        let grandchild_transactions = Vec::new();
+        let grandchild_commitment: Option<TopologyCommitment> = None;
+        let grandchild_header = BlockHeader {
+            block_number: 3,
+            parent_hash: child.block_hash,
+            slot: grandchild_slot,
+            epoch: grandchild_epoch,
+            proposer_id: 3,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: runner.ledger.state_root(),
+            transactions_root: canonical_hash(&grandchild_transactions),
+            topology_root: empty_hash(),
+        };
+        let grandchild_hash = canonical_hash(&(
+            grandchild_header.clone(),
+            &grandchild_transactions,
+            &grandchild_commitment,
+        ));
+        let grandchild = Block {
+            header: grandchild_header,
+            transactions: grandchild_transactions,
+            commitment: grandchild_commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(3, &grandchild_hash).unwrap(),
+            block_hash: grandchild_hash,
+        };
+
+        assert_eq!(
+            runner
+                .accept_block(grandchild.clone(), false)
+                .await
+                .unwrap(),
+            BlockAcceptance::Orphan
+        );
+        assert!(runner.pending_certified_children.is_empty());
+        assert_eq!(
+            runner
+                .orphan_blocks
+                .iter()
+                .map(|block| block.block_hash)
+                .collect::<Vec<_>>(),
+            vec![grandchild.block_hash]
         );
     }
 
@@ -8729,18 +9854,18 @@ mod tests {
                 .accept_block(competing_tip.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Orphan
+            BlockAcceptance::Accepted
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
         assert_eq!(
             runner.blocks.last().unwrap().block_hash,
-            certified_root.block_hash
+            competing_tip.block_hash
         );
         assert!(
             runner
-                .pending_certified_children
+                .orphan_blocks
                 .iter()
-                .any(|block| block.block_hash == competing_tip.block_hash)
+                .any(|block| block.block_hash == current_tip.block_hash)
         );
     }
 
@@ -8832,7 +9957,7 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
 
         assert!(
             runner
@@ -8843,7 +9968,7 @@ mod tests {
                 ))
                 .unwrap()
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, certified_root.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
 
         assert!(
             runner
@@ -8872,7 +9997,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn taller_uncertified_suffix_on_same_certified_head_can_replace_current_tip() {
+    async fn vote_supported_uncertified_suffix_on_same_certified_head_stays_buffered_until_child_qc(
+    ) {
         let genesis = sample_genesis();
         let config = sample_node_config(
             1,
@@ -8969,7 +10095,7 @@ mod tests {
                 .accept_block(competing_child.clone(), false)
                 .await
                 .unwrap(),
-            BlockAcceptance::Orphan
+            BlockAcceptance::Accepted
         );
         assert_eq!(
             runner
@@ -8978,7 +10104,7 @@ mod tests {
                 .unwrap(),
             BlockAcceptance::Orphan
         );
-        assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_child.block_hash);
 
         for validator_id in [2, 3] {
             assert!(
@@ -8992,7 +10118,18 @@ mod tests {
             );
         }
 
-        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_child.block_hash);
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .is_some_and(|votes| votes.len() == 2)
+        );
+        assert!(
+            !runner
+                .quorum_certificates
+                .contains_key(&competing_tip.block_hash)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9161,7 +10298,7 @@ mod tests {
                 .proposal_votes
                 .get(&competing_tip.block_hash)
                 .map(|votes| votes.len()),
-            Some(3)
+            Some(4)
         );
     }
 
@@ -9208,7 +10345,7 @@ mod tests {
                 .proposal_votes
                 .get(&competing_tip.block_hash)
                 .map(|votes| votes.len()),
-            Some(2)
+            Some(3)
         );
         assert_eq!(
             runner.blocks.last().map(|block| block.block_hash),
@@ -9298,11 +10435,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn taller_weak_uncertified_branch_does_not_displace_stronger_vote_supported_branch_before_qc(
-    ) {
+    async fn taller_weak_uncertified_branch_does_not_displace_stronger_vote_supported_branch_before_qc()
+     {
         let genesis = sample_genesis_with_validator_count(6);
-        let config =
-            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-stronger-branch");
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-stronger-branch",
+        );
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
         let current_tip = valid_empty_block_on_parent(
@@ -9360,13 +10501,8 @@ mod tests {
         );
         assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
 
-        let competing_root = valid_empty_block_on_parent(
-            &genesis,
-            empty_hash(),
-            1,
-            2,
-            current_tip.header.slot + 1,
-        );
+        let competing_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
         let competing_mid = valid_empty_block_on_parent(
             &genesis,
             competing_root.block_hash,
@@ -9382,9 +10518,18 @@ mod tests {
             competing_mid.header.slot + 1,
         );
 
-        runner.accept_block(competing_root.clone(), false).await.unwrap();
-        runner.accept_block(competing_mid.clone(), false).await.unwrap();
-        runner.accept_block(competing_tip.clone(), false).await.unwrap();
+        runner
+            .accept_block(competing_root.clone(), false)
+            .await
+            .unwrap();
+        runner
+            .accept_block(competing_mid.clone(), false)
+            .await
+            .unwrap();
+        runner
+            .accept_block(competing_tip.clone(), false)
+            .await
+            .unwrap();
 
         assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
         assert!(
@@ -9399,8 +10544,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn validator_cannot_vote_on_taller_non_extending_branch_before_qc() {
         let genesis = sample_genesis();
-        let config =
-            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-no-branch-flip");
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-no-branch-flip",
+        );
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
         let current_tip = valid_empty_block_on_parent(
@@ -9433,13 +10582,8 @@ mod tests {
                 .is_some()
         );
 
-        let competing_root = valid_empty_block_on_parent(
-            &genesis,
-            empty_hash(),
-            1,
-            2,
-            current_tip.header.slot + 1,
-        );
+        let competing_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
         let competing_mid = valid_empty_block_on_parent(
             &genesis,
             competing_root.block_hash,
@@ -9455,9 +10599,18 @@ mod tests {
             competing_mid.header.slot + 1,
         );
 
-        runner.accept_block(competing_root.clone(), false).await.unwrap();
-        runner.accept_block(competing_mid.clone(), false).await.unwrap();
-        runner.accept_block(competing_tip.clone(), false).await.unwrap();
+        runner
+            .accept_block(competing_root.clone(), false)
+            .await
+            .unwrap();
+        runner
+            .accept_block(competing_mid.clone(), false)
+            .await
+            .unwrap();
+        runner
+            .accept_block(competing_tip.clone(), false)
+            .await
+            .unwrap();
 
         assert!(
             runner
@@ -9469,10 +10622,385 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn unknown_ancestry_blocks_second_local_vote_before_qc() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-unknown-ancestry",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(current_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+
+        let disconnected_tip = valid_empty_block_on_parent(
+            &genesis,
+            canonical_hash(&"missing-parent"),
+            3,
+            2,
+            current_tip.header.slot + 1,
+        );
+        runner.orphan_blocks.push(disconnected_tip.clone());
+
+        runner
+            .maybe_broadcast_local_proposal_vote(&disconnected_tip)
+            .unwrap();
+
+        assert!(
+            runner
+                .proposal_votes
+                .get(&disconnected_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_validator_moves_vote_to_adopted_stronger_pre_qc_branch() {
+        let genesis = sample_genesis_with_validator_count(6);
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-local-vote-migration",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_mid = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+        let current_upper = valid_empty_block_on_parent(
+            &genesis,
+            current_mid.block_hash,
+            3,
+            1,
+            current_mid.header.slot + 1,
+        );
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_upper.block_hash,
+            4,
+            1,
+            current_upper.header.slot + 1,
+        );
+
+        for block in [
+            current_root.clone(),
+            current_mid.clone(),
+            current_upper.clone(),
+            current_tip.clone(),
+        ] {
+            assert_eq!(
+                runner.accept_block(block, true).await.unwrap(),
+                BlockAcceptance::Accepted
+            );
+        }
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+
+        let competing_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
+        let competing_mid = valid_empty_block_on_parent(
+            &genesis,
+            competing_root.block_hash,
+            2,
+            3,
+            competing_root.header.slot + 1,
+        );
+        let competing_tip = valid_empty_block_on_parent(
+            &genesis,
+            competing_mid.block_hash,
+            3,
+            4,
+            competing_mid.header.slot + 1,
+        );
+
+        for block in [
+            competing_root.clone(),
+            competing_mid.clone(),
+            competing_tip.clone(),
+        ] {
+            assert_eq!(
+                runner.accept_block(block, false).await.unwrap(),
+                BlockAcceptance::Orphan
+            );
+        }
+
+        for validator_id in [2, 3, 5] {
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &competing_tip,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_vote_replaces_orphaned_pre_qc_vote_for_current_tip() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-orphaned-vote-replacement",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner
+                .accept_block(current_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner
+                .accept_block(current_tip.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+
+        runner.proposal_votes.clear();
+        runner.buffered_proposal_votes.clear();
+
+        let disconnected_tip = valid_empty_block_on_parent(
+            &genesis,
+            canonical_hash(&"missing-parent"),
+            3,
+            2,
+            current_tip.header.slot + 1,
+        );
+        runner
+            .import_proposal_vote(signed_proposal_vote(
+                runner.crypto.as_ref(),
+                runner.config.validator_id,
+                &disconnected_tip,
+            ))
+            .unwrap();
+        assert!(
+            runner
+                .buffered_proposal_votes
+                .get(&disconnected_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+
+        runner
+            .maybe_broadcast_local_proposal_vote(&current_tip)
+            .unwrap();
+
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_some()
+        );
+        assert!(
+            runner
+                .buffered_proposal_votes
+                .get(&disconnected_tip.block_hash)
+                .and_then(|votes| votes.get(&runner.config.validator_id))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stronger_pre_qc_branch_vote_replaces_same_validator_vote_on_losing_branch() {
+        let genesis = sample_genesis_with_validator_count(6);
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-remote-vote-replacement",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let current_mid = valid_empty_block_on_parent(
+            &genesis,
+            current_root.block_hash,
+            2,
+            1,
+            current_root.header.slot + 1,
+        );
+        let current_upper = valid_empty_block_on_parent(
+            &genesis,
+            current_mid.block_hash,
+            3,
+            1,
+            current_mid.header.slot + 1,
+        );
+        let current_tip = valid_empty_block_on_parent(
+            &genesis,
+            current_upper.block_hash,
+            4,
+            1,
+            current_upper.header.slot + 1,
+        );
+
+        for block in [
+            current_root.clone(),
+            current_mid.clone(),
+            current_upper.clone(),
+            current_tip.clone(),
+        ] {
+            assert_eq!(
+                runner.accept_block(block, true).await.unwrap(),
+                BlockAcceptance::Accepted
+            );
+        }
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &current_tip,
+                ))
+                .unwrap()
+        );
+
+        let competing_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
+        let competing_mid = valid_empty_block_on_parent(
+            &genesis,
+            competing_root.block_hash,
+            2,
+            3,
+            competing_root.header.slot + 1,
+        );
+        let competing_tip = valid_empty_block_on_parent(
+            &genesis,
+            competing_mid.block_hash,
+            3,
+            4,
+            competing_mid.header.slot + 1,
+        );
+
+        for block in [
+            competing_root.clone(),
+            competing_mid.clone(),
+            competing_tip.clone(),
+        ] {
+            assert_eq!(
+                runner.accept_block(block, false).await.unwrap(),
+                BlockAcceptance::Orphan
+            );
+        }
+
+        for validator_id in [3, 4, 5] {
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &competing_tip,
+                    ))
+                    .unwrap()
+            );
+        }
+        assert_eq!(runner.ledger.snapshot().tip_hash, competing_tip.block_hash);
+
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &competing_tip,
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&competing_tip.block_hash)
+                .and_then(|votes| votes.get(&2))
+                .is_some()
+        );
+        assert!(
+            runner
+                .proposal_votes
+                .get(&current_tip.block_hash)
+                .and_then(|votes| votes.get(&2))
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn taller_weaker_full_snapshot_does_not_replace_stronger_local_branch_before_qc() {
         let genesis = sample_genesis_with_validator_count(6);
-        let config =
-            sample_node_config(1, reserve_local_address(), Vec::new(), "preqc-sync-no-rollback");
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-sync-no-rollback",
+        );
         let mut runner = build_test_runner(1, config, genesis.clone()).await;
         let current_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
         let current_tip = valid_empty_block_on_parent(
@@ -9518,13 +11046,8 @@ mod tests {
             );
         }
 
-        let remote_root = valid_empty_block_on_parent(
-            &genesis,
-            empty_hash(),
-            1,
-            2,
-            current_tip.header.slot + 1,
-        );
+        let remote_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, current_tip.header.slot + 1);
         let remote_mid = valid_empty_block_on_parent(
             &genesis,
             remote_root.block_hash,
@@ -9566,6 +11089,103 @@ mod tests {
             .unwrap();
 
         assert_eq!(runner.ledger.snapshot().tip_hash, current_tip.block_hash);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_qc_snapshot_quality_matches_branch_quality_ordering() {
+        let genesis = sample_genesis_with_validator_count(6);
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "preqc-shared-quality-ordering",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let local_root = valid_empty_block_on_parent(&genesis, empty_hash(), 1, 1, 0);
+        let local_tip = valid_empty_block_on_parent(
+            &genesis,
+            local_root.block_hash,
+            2,
+            1,
+            local_root.header.slot + 1,
+        );
+
+        assert_eq!(
+            runner.accept_block(local_root.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert_eq!(
+            runner.accept_block(local_tip.clone(), true).await.unwrap(),
+            BlockAcceptance::Accepted
+        );
+        for validator_id in [2, 3] {
+            assert!(
+                runner
+                    .import_proposal_vote(signed_proposal_vote(
+                        runner.crypto.as_ref(),
+                        validator_id,
+                        &local_tip,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        let remote_root =
+            valid_empty_block_on_parent(&genesis, empty_hash(), 1, 2, local_tip.header.slot + 1);
+        let remote_mid = valid_empty_block_on_parent(
+            &genesis,
+            remote_root.block_hash,
+            2,
+            3,
+            remote_root.header.slot + 1,
+        );
+        let remote_upper = valid_empty_block_on_parent(
+            &genesis,
+            remote_mid.block_hash,
+            3,
+            4,
+            remote_mid.header.slot + 1,
+        );
+        let remote_tip = valid_empty_block_on_parent(
+            &genesis,
+            remote_upper.block_hash,
+            4,
+            5,
+            remote_upper.header.slot + 1,
+        );
+
+        for block in [
+            remote_root.clone(),
+            remote_mid.clone(),
+            remote_upper.clone(),
+            remote_tip.clone(),
+        ] {
+            assert_eq!(
+                runner.accept_block(block, false).await.unwrap(),
+                BlockAcceptance::Orphan
+            );
+        }
+
+        let remote_votes = vec![
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &remote_root),
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &remote_mid),
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &remote_upper),
+            signed_proposal_vote(runner.crypto.as_ref(), 4, &remote_tip),
+        ];
+        for vote in &remote_votes {
+            assert!(runner.import_proposal_vote(vote.clone()).unwrap());
+        }
+
+        let local_chain = vec![local_root, local_tip];
+        let remote_chain = vec![remote_root, remote_mid, remote_upper, remote_tip];
+        assert_eq!(
+            runner.compare_branch_quality(&remote_chain, &local_chain),
+            Ordering::Less
+        );
+        assert!(
+            snapshot_branch_quality(&remote_chain, &remote_votes)
+                < runner.branch_quality_with_extra_tip_vote(&local_chain, None)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13748,6 +15368,108 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn peer_with_same_qc_and_different_tip_is_ahead() {
+        let genesis = sample_genesis();
+        let config = sample_node_config(
+            1,
+            reserve_local_address(),
+            Vec::new(),
+            "peer-tip-divergence-ahead",
+        );
+        let mut runner = build_test_runner(1, config, genesis.clone()).await;
+        let shared_root = first_valid_block(&genesis);
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let consensus = ConsensusEngine::new(genesis.clone());
+
+        assert_eq!(
+            runner
+                .accept_block(shared_root.clone(), true)
+                .await
+                .unwrap(),
+            BlockAcceptance::Accepted
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    2,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    3,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+        assert!(
+            runner
+                .import_proposal_vote(signed_proposal_vote(
+                    runner.crypto.as_ref(),
+                    4,
+                    &shared_root
+                ))
+                .unwrap()
+        );
+
+        let mut root_ledger = LedgerState::from_genesis(&genesis);
+        root_ledger.apply_block(&shared_root, &crypto).unwrap();
+        let local_slot = ((shared_root.header.slot + 1)..(shared_root.header.slot + 100))
+            .find(|slot| consensus.proposer_for_slot(*slot) == 2)
+            .unwrap();
+        let local_epoch = consensus.epoch_for_slot(local_slot);
+        let local_transactions = Vec::new();
+        let local_commitment: Option<TopologyCommitment> = None;
+        let local_header = BlockHeader {
+            block_number: 2,
+            parent_hash: shared_root.block_hash,
+            slot: local_slot,
+            epoch: local_epoch,
+            proposer_id: 2,
+            timestamp_unix_millis: now_unix_millis(),
+            state_root: root_ledger.state_root(),
+            transactions_root: canonical_hash(&local_transactions),
+            topology_root: empty_hash(),
+        };
+        let local_hash =
+            canonical_hash(&(local_header.clone(), &local_transactions, &local_commitment));
+        let local_child = Block {
+            header: local_header,
+            transactions: local_transactions,
+            commitment: local_commitment,
+            commitment_receipts: Vec::new(),
+            signature: crypto.sign(2, &local_hash).unwrap(),
+            block_hash: local_hash,
+        };
+        runner.ledger = LedgerState::replay_blocks(
+            &genesis,
+            &[shared_root.clone(), local_child.clone()],
+            &crypto,
+        )
+        .unwrap();
+        runner.blocks = vec![shared_root.clone(), local_child];
+        runner.rebuild_seen_sets();
+
+        runner.record_peer_sync_status(
+            2,
+            2,
+            canonical_hash(&"peer-divergent-tip"),
+            Some(shared_root.block_hash),
+            shared_root.header.block_number,
+            vec![SyncQcAnchor {
+                block_hash: shared_root.block_hash,
+                block_number: shared_root.header.block_number,
+            }],
+        );
+
+        assert!(runner.peer_status_is_ahead(2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn pending_certified_child_from_peer_triggers_followup_best_available_sync_request() {
         let genesis = sample_genesis();
         let local_address = reserve_local_address();
@@ -16849,7 +18571,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn sync_repair_failure_keeps_same_qc_peer_on_legacy_sync() {
+    async fn sync_repair_failure_promotes_same_qc_peer_to_certified_sync() {
         let genesis = sample_genesis();
         let peer_address = reserve_local_address();
         let config = sample_node_config(
@@ -16960,21 +18682,20 @@ mod tests {
         runner.record_sync_repair_failure(2);
         assert!(matches!(
             runner.preferred_v2_sync_mode_for_peer(2),
-            V2SyncMode::Legacy
+            V2SyncMode::Certified
         ));
 
         runner.request_sync_from(2).unwrap();
 
         loop {
             match recv_protocol_message(&mut peer_events).await {
-                ProtocolMessage::SyncRequest {
-                    requester_id,
-                    known_height,
-                    known_tip_hash,
-                } => {
-                    assert_eq!(requester_id, 1);
-                    assert_eq!(known_height, shared_root.header.block_number);
-                    assert_eq!(known_tip_hash, shared_root.block_hash);
+                ProtocolMessage::CertifiedSyncRequest(request) => {
+                    assert_eq!(request.requester_id, 1);
+                    assert_eq!(
+                        request.known_qc_hash,
+                        Some(shared_root.block_hash)
+                    );
+                    assert_eq!(request.known_qc_height, shared_root.header.block_number);
                     break;
                 }
                 ProtocolMessage::ProposalVote(_)
@@ -16982,10 +18703,10 @@ mod tests {
                 | ProtocolMessage::SyncStatus { .. }
                 | ProtocolMessage::SyncBlocks { .. }
                 | ProtocolMessage::SyncResponse { .. }
-                | ProtocolMessage::CertifiedSyncRequest(_)
+                | ProtocolMessage::SyncRequest { .. }
                 | ProtocolMessage::HeartbeatPulse(_)
                 | ProtocolMessage::ReceiptFetch { .. } => {}
-                other => panic!("expected legacy sync request, got {other:?}"),
+                other => panic!("expected certified sync request, got {other:?}"),
             }
         }
     }
