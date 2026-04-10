@@ -47,6 +47,7 @@ It also now contains the first crypto-agility primitives for the PQ work:
   - optional `signing_key_path`
   - `session_backend`
   - optional `session_key_path`
+  - optional `session_ttl_millis`
 - `ValidatorConfig` now carries both:
   - signing-facing `public_identity`
   - optional transport-facing `session_public_identity`

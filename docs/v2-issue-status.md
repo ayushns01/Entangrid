@@ -1,27 +1,29 @@
 # Entangrid V2 Issue Status
 
-Status date: 2026-04-09
+Status date: 2026-04-11
 
-This note summarizes where the original four V2 stabilization issues stand now and separates them from the current remaining blocker on the PQ-enabled consensus line.
+This note summarizes where the original four V2 stabilization issues stand now and separates them from the current remaining blockers on the PQ-enabled consensus line.
 
 ## Current Verdict
 
 - Issue 1: solved enough
 - Issue 2: solved enough once QC-backed state exists
 - Issue 3: solved enough at the default profile and the currently covered policy variants
-- Issue 4: solved enough
-- Current remaining blocker: pre-QC convergence in bursty `6`-validator baseline and gated runs
+- Issue 4: materially improved, but one recovery-shaped failure still survives in `gated-6-bursty`
+- Current remaining blockers: `baseline-6-bursty` and `gated-6-bursty`
 
 ## Verification Basis
 
 This status is based on:
 
-- the latest rigorous live matrix:
-  - [rigorous-matrix-1775726814105.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775726814105.md)
+- the latest rigorous live matrix slices:
+  - [rigorous-matrix-1775849508249.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775849508249.md)
+  - [rigorous-matrix-1775847670247.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775847670247.md)
 - recent targeted node regressions in `entangrid-node` covering:
   - stronger pre-QC branch preference
   - vote rejection on non-extending incompatible uncertified branches
   - refusal to adopt taller but weaker full snapshots before QC
+  - sync, gating, hybrid-enforcement, and quorum-certificate focused suites under `pq-ml-dsa,pq-ml-kem`
 
 ## Issue 1: Certified Sync Activation
 
@@ -66,13 +68,13 @@ Issue 4 was the stale-restart catch-up gap.
 Current status:
 
 - stale-restart recovery is no longer the active blocker
-- the protocol focus has moved away from restart repair and onto pre-QC multi-branch convergence
+- the protocol focus has mostly moved away from restart repair and onto bursty convergence, but one follower-recovery failure shape still survives in `gated-6-bursty`
 
-Issue 4 should now be treated as **solved enough** for the current stage.
+Issue 4 should now be treated as **materially improved but not completely closed** for the current stage.
 
-## Current Remaining Blocker: Pre-QC Bursty Convergence
+## Current Remaining Blockers
 
-The active blocker is now outside the original four-issue framing.
+The active blockers are now narrower than the original four-issue framing, but they are still real merge blockers.
 
 Latest live result:
 
@@ -83,8 +85,9 @@ Latest live result:
 
 What is happening:
 
-- under bursty `6`-validator load, nodes still split across uncertified branches before a stable QC anchor forms
-- recent fixes improved branch scoring, vote discipline, and snapshot preference before QC
+- in `baseline-6-bursty`, all validators can reach the same height while still splitting across multiple uncertified tips before the first stable QC anchor forms
+- in `gated-6-bursty`, most validators converge but one follower can still remain stranded above the certified head and fail to rejoin the converged suffix
+- recent fixes improved branch scoring, vote discipline, snapshot preference, and same-frontier repair escalation
 - those fixes were directionally correct, but not enough to make the last two scenarios converge
 
 ## Bottom Line
@@ -95,5 +98,5 @@ The honest current state is:
 
 - certified sync is live
 - service evidence and gating are in much better shape
-- stale restart is no longer the main blocker
-- the remaining work is the final pre-QC convergence proof in the two `6`-validator bursty scenarios
+- stale restart is no longer the broad matrix-wide blocker
+- the remaining work is the final bursty convergence proof in the two `6`-validator scenarios

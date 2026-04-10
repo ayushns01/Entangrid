@@ -124,6 +124,12 @@ Current `consensus_v2` additions on `main`:
 - proposal votes and quorum certificates are live in the runtime
 - equal-QC uncertified sibling branches no longer replace the current canonical tip just because they gained extra local vote support
 
+Current Stage 1 PQ additions on `stage-1/pq-integration`:
+
+- strict hybrid validator-identity enforcement is available behind `require_hybrid_validator_signatures`
+- blocks, proposal votes, transactions, relay receipts, and service attestations can all be enforced as hybrid-signed validator artifacts
+- the runtime can use hybrid per-stream session establishment, encrypted post-handshake frame bodies, and transport-local session TTL turnover when built with `pq-ml-dsa pq-ml-kem`
+
 That means the node can now explain service gating in a much more concrete way:
 
 - what the score was
@@ -146,6 +152,7 @@ It already does a lot:
 - receipt generation and storage
 - file-backed persistence
 - service-gating prototype behavior
+- hybrid validator-signature enforcement and hybrid transport lanes when the Stage 1 PQ features are enabled
 
 The recent gating-focused improvement in this crate was mostly about observability and control:
 
@@ -176,8 +183,8 @@ Important current limit:
 - healthy bursty `6/7/8` runs now repeatedly shut down structurally on one tip
 - stale certified-sync responses are now skipped instead of re-adopting an older certified suffix
 - restarted nodes now suppress historical proposer-slot replay and can hold proposals behind a startup sync barrier while peers are still ahead
-- stale-node restart recovery is now fixed enough on `main`, not the active runtime blocker anymore
-- the active redesign and stabilization work are documented in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
+- stale-node restart recovery is no longer the broad matrix-wide blocker, but one stuck-follower recovery case still remains in `gated-6-bursty`
+- the current living status is documented in [../../docs/pq-stage-1-status.md](../../docs/pq-stage-1-status.md), [../../docs/v2-issue-status.md](../../docs/v2-issue-status.md), and [../../docs/consensus-current-issue.md](../../docs/consensus-current-issue.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking and stale restart recovery:
 
@@ -198,7 +205,7 @@ The recent validation-focused improvement in this crate was about correctness un
 - certified sync responses now carry responder tip metadata so a catching-up node can follow certified repair with suffix sync instead of stalling at the certified frontier
 - startup-barrier sync serving is now capped to the certified frontier instead of exporting a stale uncertified suffix
 - live slots now proactively request catch-up while peers are known ahead instead of waiting only for the periodic sync tick
-- the next node-runtime milestone is closing the last pre-QC bursty `6`-validator convergence gap and then freezing the acceptance gates
+- the next node-runtime milestone is closing the remaining bursty `6`-validator pair and then freezing the acceptance gates
 
 So the next node-runtime milestone is:
 
@@ -212,7 +219,7 @@ Missing pieces include:
 - RPC or HTTP API
 - production-grade sync
 - advanced finality/fork handling
-- real PQ crypto backend integration
+- production-grade PQ backend hardening and key-management tooling
 - production storage engine
 - validator operations tooling
 

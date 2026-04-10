@@ -10,7 +10,7 @@ Current main-branch focus:
 
 - test the active `consensus_v2` line on one-machine `4/5/6/7/8` bursty matrices
 - treat `codex/consensus-v1` as the benchmark/control line
-- delay PQ integration until the V2 convergence and gating story is strong enough
+- keep Stage 1 PQ integration in scope, but gate final merge on the same convergence and recovery matrix
 
 ## Protected Properties
 
@@ -127,7 +127,9 @@ An attacker forces expensive signature verification or handshake storms.
 
 Mitigations:
 
+- fixed maximum inbound frame sizes
 - rate limits per peer
+- capped concurrent inbound sessions
 - bounded receipts per window
 - separate control plane from bulk data paths
 - benchmark signature verification cost early
@@ -164,7 +166,7 @@ Mitigations:
 - a very harsh relay threshold could make consensus brittle
 - a very soft relay threshold could make entanglement meaningless
 - multi-hop witness corridors may be much harder to validate efficiently than pairwise receipts
-- larger-validator V2 service scoring and gating are still not strong enough yet even though certified sync and QC-dominant branch recovery are now live
+- bursty `6`-validator convergence is still not fully proven on the active Stage 1 line even though certified sync and QC-aware branch choice are live
 
 ## What Must Be Tested Early
 

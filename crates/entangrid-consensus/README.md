@@ -62,6 +62,7 @@ Current `consensus_v2` detail on `main`:
 
 - the V2 service committee for a validator now uses that validator's actual assigned witnesses
 - this removes the earlier mismatch where a derived observer set could be asked to score work it never directly observed
+- the proposal-vote, quorum-certificate, and certified-sync runtime path now consumes these same deterministic timing and scoring rules through `entangrid-node`
 
 ### Relay scoring
 
@@ -145,16 +146,15 @@ Important detail:
 
 ## What this consensus is today
 
-This is a **baseline deterministic proposer schedule**, not a full finality protocol.
+This crate is the deterministic policy and scoring engine for the chain.
 
 That means:
 
-- no BFT voting yet
-- no sophisticated fork choice yet
-- no validator-set changes yet
-- no slashing/reward settlement yet
+- slot timing, proposer selection, witness assignment, and relay-score rules live here
+- proposal votes, quorum certificates, certified sync, and branch adoption are now live in the node runtime on top of these shared rules
+- validator-set changes and slashing/reward settlement do not exist yet
 
-So think of it as the current policy engine for the chain, not the finished production consensus design.
+So think of it as the current rule layer for Entangrid consensus, not a standalone finality engine by itself.
 
 Important current limit:
 
@@ -162,9 +162,9 @@ Important current limit:
 - `main` now carries the active V2 scoring work behind `consensus_v2`
 - service-evidence gating from prior-epoch aggregates is live, and the node/runtime path now has certified sync plus QC-dominant branch choice
 - service evidence and degraded punishment are materially better after the recent transport/session hardening on `main`
-- the earlier stale-node restart recovery limit is now materially closed on `main`
-- PQ Stage 1 integration now exists on the active branch; the next runtime step is closing the last bursty `6`-validator convergence gap and freezing the simulator acceptance gates
-- the active redesign and stabilization work live in [../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](../../docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [../../docs/superpowers/plans/entangrid-consensus-v2-status.md](../../docs/superpowers/plans/entangrid-consensus-v2-status.md), and [../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](../../docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
+- the broad stale-node restart recovery gap is no longer the main blocker on the active line
+- PQ Stage 1 integration now exists on the active branch; the next runtime step is closing `baseline-6-bursty` and `gated-6-bursty`, then freezing the simulator acceptance gates
+- the current living status is summarized in [../../docs/pq-stage-1-status.md](../../docs/pq-stage-1-status.md), [../../docs/v2-issue-status.md](../../docs/v2-issue-status.md), and [../../docs/consensus-current-issue.md](../../docs/consensus-current-issue.md)
 
 ## Why this crate matters
 

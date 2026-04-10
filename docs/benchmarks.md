@@ -11,7 +11,7 @@ The purpose is to learn:
 - whether witness entanglement improves or harms liveness
 - how the protocol reacts under churn, congestion, and partial isolation
 
-Current benchmark gate on `main`:
+Current verification and benchmark gate on the active line:
 
 - healthy and degraded bursty localnets across `4/5/6/7/8` validators
 - `consensus_v2` is the implementation target
@@ -20,8 +20,8 @@ Current benchmark gate on `main`:
 - Issue 2 healthy branch convergence is now expected to finish on one tip in repeated `6/7/8` runs
 - Issue 3 service evidence and degraded punishment are expected to stay healthy enough that honest validators avoid collapse while the degraded target is still penalized
 - stale-node restart recovery is now expected to converge cleanly enough that a restarted node catches up without late full snapshots
-- the next benchmark gate is proving healthy, degraded, and stale-restart cases together on current `main`
-- PQ integration stays out of scope until the V2 matrix is green
+- the next benchmark gate is proving healthy, degraded, and stale-restart cases together on the active branch, then freezing those expectations into the simulator gate
+- PQ measurement work is now in scope on `stage-1/pq-integration`, but final merge gating still depends on closing the remaining live consensus failures
 
 Current PQ measurement work on `stage-1/pq-integration`:
 
@@ -84,7 +84,7 @@ Purpose:
 Conditions:
 
 - frequent session setup
-- frequent rekeys
+- repeated reconnects or TTL-driven hybrid session turnover
 - many signed receipts
 
 Purpose:

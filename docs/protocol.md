@@ -22,6 +22,7 @@ Current status note:
 - service aggregates remain unsigned, but they now inherit strict hybrid enforcement transitively through validated embedded service attestations, which closes Stage 1K
 - Stage 1F plus Stage 1H add a strict hybrid localnet bootstrap mode via `init-localnet --hybrid-enforcement`; it requires `pq-ml-dsa pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
 - that Stage 1F mode is an operational/bootstrap slice, not the full hybrid performance matrix
+- the latest verified active-branch matrix is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still open; the living status is tracked in [pq-stage-1-status.md](pq-stage-1-status.md) and [v2-issue-status.md](v2-issue-status.md)
 
 On the active `consensus_v2` path on `main`, the protocol direction is tightening further:
 
@@ -32,7 +33,7 @@ On the active `consensus_v2` path on `main`, the protocol direction is tightenin
 - certified sync now rejects stale certified responses that would otherwise downgrade a newer local certified tip
 - certified sync responses now also advertise the responder's current tip metadata so the requester can follow a certified catch-up with suffix repair
 - stale restarted nodes now suppress historical replay, hold proposals behind the startup barrier, advertise the certified frontier during recovery, and proactively request catch-up while peers remain ahead
-- the current remaining blocker is pre-QC convergence in the bursty `6`-validator baseline and gated scenarios, then freezing that matrix as the acceptance gate
+- the current remaining blockers are `baseline-6-bursty` pre-QC convergence and `gated-6-bursty` stuck-follower recovery, then freezing that matrix as the acceptance gate
 
 ## Protocol Goals
 
@@ -79,7 +80,7 @@ Assignment rules should favor:
 
 ### 3. Session Establishment
 
-Assigned peers open authenticated post-quantum sessions.
+Assigned peers open authenticated sessions.
 
 The intended shape is:
 
@@ -91,6 +92,11 @@ The intended shape is:
 The shared secret is used only to derive transport keys.
 
 It is not used directly as consensus randomness.
+
+Current runtime note:
+
+- deterministic session establishment remains the default path when `pq-ml-kem` is disabled
+- when the hybrid session backend is active, each stream performs a mutually signed handshake and every later frame body is encrypted and authenticated automatically
 
 ### 4. Relay Window
 
@@ -197,7 +203,7 @@ Current V2 note:
 
 - the service side of this rule is live on `main` behind `consensus_v2`
 - the ordering side now includes proposal votes, quorum certificates, certified sync, and QC-dominant branch selection
-- the remaining live gap is reliable pre-QC convergence at bursty `6`-validator scale before the first stable QC forms
+- the remaining live gap is reliable bursty `6`-validator convergence: pre-QC multi-tip collapse in baseline runs and one stuck-follower recovery case in gated runs
 
 Current PQ Stage 1E note on `stage-1/pq-integration`:
 

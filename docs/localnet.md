@@ -11,6 +11,7 @@ Current status note:
 - the active protocol work now happens on `main`
 - the baseline V1 path is preserved on `codex/consensus-v1` as a benchmark line
 - the current correctness gate is the single-machine healthy and degraded bursty matrix across `4/5/6/7/8` validators with `consensus_v2`
+- the Stage 1 PQ line can also bootstrap strict all-hybrid localnets through `init-localnet --hybrid-enforcement` when built with `pq-ml-dsa pq-ml-kem`
 
 ## Node Layout
 
@@ -41,6 +42,7 @@ Each node directory can hold:
 - database files
 - logs
 - exported metrics
+- optional `ml-dsa-key.json` and `ml-kem-session-key.json` files when strict hybrid bootstrap is enabled
 
 ## Initial Network Topology
 
@@ -136,4 +138,4 @@ Current main-branch focus:
 
 - make the `consensus_v2` matrix go green on one machine first
 - use `codex/consensus-v1` as the benchmark comparison
-- do not move to PQ integration until that happens
+- keep PQ Stage 1 localnet coverage in the same loop, but do not claim final merge readiness until the rigorous matrix is green

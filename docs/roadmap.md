@@ -129,9 +129,16 @@ The current focus on `main` is no longer "invent V2 on a side branch." It is:
 
 - stabilize `consensus_v2` on `main`
 - keep `codex/consensus-v1` as the benchmark/control line
-- finish the remaining bursty `6`-validator baseline and gated convergence proof on the PQ-enabled line
+- finish the remaining `baseline-6-bursty` and `gated-6-bursty` proofs on the PQ-enabled line
 - freeze the rigorous matrix as the acceptance gate once those last two scenarios pass
 - merge the fully proven Stage 1 PQ line after that
+
+Current status snapshot:
+
+- Phases `0` through `2` now exist as real code and living docs in the repository
+- Phases `3` through `5` are implemented in prototype form on the active workspace and simulator
+- Stage 1 PQ signing, transport, and hybrid localnet bootstrap are implemented on `stage-1/pq-integration`
+- the remaining merge gate is not missing PQ plumbing; it is the last two bursty consensus scenarios on the active matrix
 
 ## What Not To Build Too Early
 

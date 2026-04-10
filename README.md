@@ -51,6 +51,9 @@ This repository instead documents a more defensible design:
 - [Roadmap](docs/roadmap.md)
 - [Localnet Plan](docs/localnet.md)
 - [Benchmarking Plan](docs/benchmarks.md)
+- [PQ Stage 1 Status](docs/pq-stage-1-status.md)
+- [V2 Issue Status](docs/v2-issue-status.md)
+- [Current Consensus Issue](docs/consensus-current-issue.md)
 - [Consensus V2 Redesign Plan](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
 - [Consensus V2 Status Update](docs/superpowers/plans/entangrid-consensus-v2-status.md)
 - [Consensus V2 Stabilization Plan](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
@@ -76,17 +79,17 @@ The first milestone should stay intentionally small:
 - internet-scale peer discovery
 - production hardening
 
-## Proposed Workspace Shape
+## Workspace Layout
 
-When implementation starts, this repository should become a Cargo workspace with crates similar to:
+The repository is now a real Cargo workspace with these primary crates:
 
-- `crypto`
-- `types`
-- `network`
-- `ledger`
-- `consensus`
-- `node`
-- `sim`
+- [`crates/entangrid-crypto`](crates/entangrid-crypto/README.md): crypto backends, typed signatures, and hybrid session primitives
+- [`crates/entangrid-types`](crates/entangrid-types/README.md): shared protocol, config, sync, and metrics types
+- [`crates/entangrid-network`](crates/entangrid-network/README.md): static-peer transport, signed envelopes, and hybrid session framing
+- [`crates/entangrid-ledger`](crates/entangrid-ledger/README.md): deterministic account-based execution and replay
+- [`crates/entangrid-consensus`](crates/entangrid-consensus/README.md): slot timing, proposer selection, witness assignment, and service scoring rules
+- [`crates/entangrid-node`](crates/entangrid-node/README.md): validator runtime, sync, voting, and persistence
+- [`crates/entangrid-sim`](crates/entangrid-sim/README.md): localnet generation, workload injection, and matrix reporting
 
 ## Current Implementation Status
 
@@ -105,13 +108,13 @@ The repository now includes a working Rust workspace with:
 
 Important:
 
-- the current backend is a deterministic development backend, not a production-strength post-quantum implementation
-- production-strength PQ rollout still remains a later milestone behind the stable crypto interfaces already in place
+- the default localnet backend is still deterministic development crypto
+- the project now also has an experimental PQ Stage 1 path behind `pq-ml-dsa` and `pq-ml-kem`, but it is not yet a production-hardened cryptography release
 - `stage-1/pq-integration` is now the active branch for Stage 1 PQ work:
   - typed signatures and typed public identities are in
   - node-local signing backend selection is in
   - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
-  - first-class hybrid signature and identity containers are now in for transactions, blocks, and proposal votes
+  - first-class hybrid signature and identity containers are now in for transactions, blocks, proposal votes, relay receipts, and service attestations
   - permissive hybrid verification is in
   - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
   - that mode writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
@@ -129,8 +132,9 @@ Important:
   - transactions, relay receipts, and service attestations now join blocks and proposal votes under the strict hybrid-enforcement slice
   - service aggregates inherit that enforcement transitively through validated embedded service attestations, which closes Stage 1K
   - Stage 1 cryptography and transport integration are now in place for the first mergeable PQ milestone; rekeying/session rotation and stronger traffic-shaping remain explicitly deferred to a later hardening milestone
-  - the remaining blocker on the active PQ-enabled line is the last `6`-validator bursty consensus proof, not missing PQ signing or transport work
+  - the remaining blockers on the active PQ-enabled line are `baseline-6-bursty` and `gated-6-bursty`, not missing PQ signing or transport work
 - the current Stage 1 merge-readiness summary and verified command set live in [docs/pq-stage-1-status.md](docs/pq-stage-1-status.md)
+- the current V2 stabilization status and remaining consensus issue are summarized in [docs/v2-issue-status.md](docs/v2-issue-status.md) and [docs/consensus-current-issue.md](docs/consensus-current-issue.md)
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back
@@ -192,8 +196,8 @@ The current prototype proved the core Entangrid idea is implementable, and `main
 - the latest rigorous matrix on the active branch is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still failing
 - certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
 - V2 service evidence and degraded punishment are materially better after the transport/session hardening on `main`
-- stale-restart recovery is no longer the primary blocker
-- the next step is to close the last pre-QC bursty convergence gap, not to reopen the broader recovery or PQ integration work
+- stale-restart recovery is no longer the broad matrix-wide blocker, but one stuck-follower recovery case still survives inside `gated-6-bursty`
+- the next step is to close the remaining bursty `6`-validator pair: pre-QC multi-tip convergence in `baseline-6-bursty` and follower recovery in `gated-6-bursty`
 
 That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
 Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as PQ-integrated but not yet fully consensus-proven.

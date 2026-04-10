@@ -45,6 +45,7 @@ It also:
 - can set how many epochs are included in the rolling service-score window
 - can set the service-score weight profile, including how strongly penalties affect the final score
 - can mark one validator as degraded
+- can enable strict hybrid bootstrap with `--hybrid-enforcement` when built with `pq-ml-dsa pq-ml-kem`
 
 The current recommended prototype gating profile emitted by default is:
 
@@ -53,13 +54,14 @@ The current recommended prototype gating profile emitted by default is:
 - `service_score_window_epochs = 4`
 - weights `[0.25 uptime, 0.50 delivery, 0.25 diversity, 1.00 penalty]`
 
-That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the remaining problem is no longer basic structural reconvergence or restart recovery. It is closing the last bursty `6`-validator convergence gap and then turning that matrix into a hard acceptance gate.
+That default is still the best current 4-validator baseline, but the live matrix now keeps healthy and degraded larger-validator cases in the suite because the remaining problem is no longer basic structural reconvergence or restart recovery. It is closing `baseline-6-bursty` and `gated-6-bursty`, then turning that matrix into a hard acceptance gate.
 
 Current branch focus:
 
 - `main` is now the active V2-focused line
 - `codex/consensus-v1` is kept as the benchmark/control line
 - `consensus_v2` is still opt-in through config so the simulator can compare baseline and V2 behavior on the same codebase
+- the Stage 1 PQ line can now generate strict all-hybrid localnets with matching ML-DSA and ML-KEM key material per node
 
 ### `up`
 
@@ -158,6 +160,7 @@ Recent improvement:
 - the matrix can now generate protocol-level abuse traffic itself, so we can regression-test the new per-peer rate limits and inbound listener caps without needing manual socket scripts
 - the matrix now also exposes non-target below-threshold counts and non-target gating rejections, so threshold/window sweeps tell us whether a policy is only punishing the degraded validator or harming honest ones too
 - the matrix now also keeps larger-validator healthy and degraded bursty cases in the suite, which helps us catch both reconvergence regressions and the newer stale-restart recovery edge cases instead of only proving the 4-validator path
+- the latest verified branch state is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still failing
 
 ### Fault and degradation controls
 

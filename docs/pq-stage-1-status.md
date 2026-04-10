@@ -1,6 +1,6 @@
 # PQ Stage 1 Status
 
-This document records the current state of `stage-1/pq-integration` as of April 9, 2026.
+This document records the current state of `stage-1/pq-integration` as of April 11, 2026.
 
 ## Stage 1 Scope
 
@@ -48,15 +48,24 @@ cargo test -p entangrid-sim --features "pq-ml-dsa pq-ml-kem"
 cargo test -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" hybrid_enforcement_localnet_boot_smoke_test -- --ignored
 ```
 
+Recent targeted node coverage on this same line also passed for:
+
+- `sync_`: `58/58`
+- `gating`: `3/3`
+- `hybrid_enforcement_`: `24/24`
+- `quorum_certificate`: `3/3`
+- `proposal_votes_build_qc_at_supermajority_threshold`: `1/1`
+
 Recent consensus-hardening work on this same line also added and passed focused node regressions for:
 
 - stronger pre-QC branch preference before any QC exists
 - rejecting non-extending local proposal votes on incompatible uncertified branches
 - refusing taller but weaker full snapshots before QC
 
-The latest rigorous live matrix on the current branch is:
+The latest rigorous live matrix coverage on the current branch is split across:
 
-- [rigorous-matrix-1775726814105.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775726814105.md)
+- baseline slice: [rigorous-matrix-1775849508249.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775849508249.md)
+- non-baseline slice: [rigorous-matrix-1775847670247.md](/Users/ayushns01/Desktop/Repositories/Entangrid/test-results/rigorous-matrix-1775847670247.md)
 
 Current result:
 
@@ -66,9 +75,10 @@ Current result:
 
 ## What Is Still Open Before Final Signoff
 
-The remaining blocker is a consensus proof gap, not a cryptography gap:
+The remaining blockers are consensus proof gaps, not cryptography gaps:
 
-- bursty `6`-validator baseline and gated runs still fragment before a stable QC anchor forms
+- `baseline-6-bursty` still shows pre-QC multi-tip divergence even when all validators reach the same height
+- `gated-6-bursty` still shows a stuck follower that fails to rejoin the converged suffix above the certified head
 - recent pre-QC hardening improved branch choice, proposal-vote discipline, and snapshot preference, but did not close those last two scenarios
 - because of that, this branch should not yet be presented as fully signed off for final merge
 
@@ -90,5 +100,5 @@ Those belong to a later PQ hardening milestone rather than the first mergeable i
 The honest current position is:
 
 - Stage 1 PQ signing, transport, and hybrid bootstrap integration are implemented
-- the branch still needs the last `6`-validator bursty consensus proof before final merge signoff
+- the branch still needs the last two `6`-validator bursty consensus proofs before final merge signoff
 - once that closes, `stage-1/main` can absorb this work as the Stage 1 PQ milestone

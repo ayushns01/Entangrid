@@ -6,7 +6,7 @@ Important note:
 
 - `main` now carries both the baseline receipt-driven flow and the newer `consensus_v2` path
 - this document mainly explains the baseline/default flow, with V2 callouts where the behavior changes
-- the V2 path is the active development focus, and the PQ-enabled branch already exists, but the last bursty `6`-validator convergence proof is still open
+- the V2 path is the active development focus, and the PQ-enabled branch already exists, but two bursty `6`-validator scenarios are still open on the latest verified matrix
 
 ## 1. A Local Network Is Created
 
@@ -101,6 +101,12 @@ So communication today is:
 - signed messages
 - binary framing
 - static peers
+
+When the hybrid session backend is active on the Stage 1 PQ line, there is one more layer:
+
+- each stream first runs a mutually signed session handshake
+- the outer frame length stays plaintext
+- every later frame body is encrypted and authenticated
 
 ## 5. Time Advances In Slots And Epochs
 
@@ -245,7 +251,10 @@ This is why bursty runs can temporarily split the network into short competing b
 
 The current `main` branch now has proposal votes and quorum certificates behind `consensus_v2`, and equal-QC uncertified siblings are no longer allowed to steal the canonical tip just because they gained extra local votes.
 
-Certified sync and QC-dominant branch choice are now active on `main`, and restarted stale nodes now recover much more cleanly than before. The remaining live problem is earlier in the lifecycle: bursty `6`-validator runs can still split across uncertified branches before a stable QC anchor forms.
+Certified sync and QC-dominant branch choice are now active on `main`, and restarted stale nodes now recover much more cleanly than before. The remaining live problems are narrower:
+
+- `baseline-6-bursty` can still split across uncertified branches before a stable QC anchor forms
+- `gated-6-bursty` can still strand one follower above the certified head after most peers have converged
 
 ## 13. Sync Tries To Repair Stale Or Split Nodes
 
@@ -263,6 +272,10 @@ If a peer is only behind on the same branch:
 If a peer is unknown, diverged, or too far behind:
 
 - full snapshot sync is used
+
+If a peer shares the same certified frontier but keeps failing suffix repair:
+
+- certified sync is supposed to take over and pull the node back onto the converged branch
 
 This is how the network eventually converges back toward one chain.
 
@@ -348,5 +361,4 @@ The active V2 redesign is moving toward:
 - QC-backed ordering
 - certified sync
 
-That future direction is documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md).
-The latest branch-level status update is documented in [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md).
+That future direction and the live branch status are documented in [v2-issue-status.md](v2-issue-status.md), [pq-stage-1-status.md](pq-stage-1-status.md), and [consensus-current-issue.md](consensus-current-issue.md).

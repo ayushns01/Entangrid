@@ -30,7 +30,7 @@ and two concrete backend paths:
 - `MlDsa65Experimental` behind the `pq-ml-dsa` cargo feature
 - a feature-gated hybrid session KEM path behind `pq-ml-kem`
 
-The deterministic backend is still the default development path. The ML-DSA path is experimental for signing/authentication, and the ML-KEM path is experimental for session establishment.
+The deterministic backend is still the default development path. The ML-DSA path is experimental for signing/authentication, and the ML-KEM path is experimental for session establishment and hybrid transport lanes.
 
 Current behavior:
 
@@ -121,7 +121,7 @@ What it does not measure yet:
 
 This crate is **not post-quantum secure yet**.
 
-The current backend is intentionally fake from a security perspective.
+The default backend is intentionally fake from a security perspective, and the experimental ML-DSA / ML-KEM paths are not yet production hardened.
 
 It is good enough for:
 
@@ -139,7 +139,7 @@ Current main-branch focus:
 
 - stabilize the V2 protocol path on `main` first
 - keep the crypto boundary clean while consensus, ordering, and sync are still changing
-- finish the remaining bursty `6`-validator consensus proof while keeping the current PQ boundary stable
+- finish `baseline-6-bursty` and `gated-6-bursty` while keeping the current PQ boundary stable
 
 Current PQ branch focus:
 
@@ -149,8 +149,9 @@ Current PQ branch focus:
   - add an experimental ML-DSA signing backend behind `pq-ml-dsa`
   - add a feature-gated hybrid ML-KEM session handshake behind `pq-ml-kem`
 - that branch now covers signing/authentication, strict hybrid enforcement across transactions and consensus-relevant validator evidence, hybrid session establishment, encrypted framing, and transport-local TTL turnover
-- the remaining blocker on that line is not missing PQ crypto plumbing; it is the last bursty `6`-validator consensus proof
+- the remaining blocker on that line is not missing PQ crypto plumbing; it is the last two bursty `6`-validator consensus scenarios
 - session rotation and richer transport hardening are explicitly deferred to the post-Stage-1 hardening milestone
+- the current branch-level status lives in [../../docs/pq-stage-1-status.md](../../docs/pq-stage-1-status.md)
 
 ## Why this crate matters
 

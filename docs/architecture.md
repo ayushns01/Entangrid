@@ -10,12 +10,10 @@ Current status note:
 
 - `main` now carries the active V2-focused architecture work behind `consensus_v2`
 - the baseline receipt-driven path is still available when `consensus_v2` is disabled and is preserved as the benchmark line on `codex/consensus-v1`
-- committee-attested service evidence, certified sync, and QC-dominant branch choice are now live on `main`
-- healthy `6/7/8` bursty runs now repeatedly shut down structurally on one tip, and certified sync now ignores stale certified suffixes instead of downgrading local state
-- startup replay suppression and a startup sync barrier now prevent restarted nodes from replaying stale proposer slots before they catch up
-- stale-node restart recovery is now fixed enough on `main`: restarted nodes advertise and serve only their certified frontier during recovery, then proactively pull catch-up while peers remain ahead
-- the next runtime step is full-matrix validation and hard acceptance gates, not another recovery redesign
-- the redesign and stabilization work are documented in [superpowers/plans/2026-03-25-entangrid-consensus-v2.md](superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [superpowers/plans/entangrid-consensus-v2-status.md](superpowers/plans/entangrid-consensus-v2-status.md), and [superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
+- committee-attested service evidence, certified sync, startup sync barriers, and QC-dominant branch choice are now live on the active line
+- PQ Stage 1 now also includes hybrid validator identity enforcement, hybrid session establishment, encrypted post-handshake frame bodies, and transport-local session TTL turnover on `stage-1/pq-integration`
+- the latest verified live matrix on the active Stage 1 line is `12/14`, with the remaining failures concentrated in `baseline-6-bursty` and `gated-6-bursty`
+- the living branch status is summarized in [pq-stage-1-status.md](pq-stage-1-status.md), [v2-issue-status.md](v2-issue-status.md), and [consensus-current-issue.md](consensus-current-issue.md)
 
 ## High-Level Components
 
@@ -47,8 +45,8 @@ The crypto layer should expose a narrow interface so the rest of the codebase do
 
 Current PQ Stage 1 detail on `stage-1/pq-integration`:
 
-- signing and verification are being moved to typed signatures with explicit scheme metadata
-- validator config is moving to typed public identities instead of untyped byte blobs
+- signing and verification now use typed signatures with explicit scheme metadata
+- validator config now uses typed public identities instead of untyped byte blobs
 - node config now carries node-local signing backend selection instead of treating signer choice as a consensus feature flag
 - the first real experimental PQ backend is ML-DSA-65 behind the `pq-ml-dsa` cargo feature
 - first-class hybrid signature and identity containers now exist for the core signed objects
@@ -143,7 +141,7 @@ Current V2 detail on `main`:
 - QC-backed canonical branch selection is now active behind `consensus_v2`
 - restart-time proposal suppression and startup sync barriers are now active behind `consensus_v2`
 - the earlier stale-node suffix catch-up gap is now materially closed on `main`
-- the remaining consensus/runtime work is closing the last bursty `6`-validator convergence gap and then turning the matrix into a hard acceptance gate
+- the remaining consensus/runtime work is closing `baseline-6-bursty` and `gated-6-bursty`, then turning the matrix into a hard acceptance gate
 
 ### 7. Storage Layer
 
@@ -172,7 +170,7 @@ The simulator is a first-class part of the architecture, not an afterthought.
 
 1. Validators start from a fixed genesis validator registry.
 2. At epoch start, consensus derives witness assignments from the last finalized randomness seed.
-3. The network layer opens authenticated encrypted sessions to assigned peers.
+3. The network layer opens authenticated sessions to assigned peers, and hybrid lanes encrypt post-handshake frame bodies when that backend is active.
 4. The witness engine creates relay obligations for pulses and real protocol traffic.
 5. Peers issue signed receipts when obligations are fulfilled within allowed windows.
 6. Each validator aggregates receipt hashes into a topology commitment.
@@ -183,7 +181,7 @@ On the current V2 path, steps 6 and 7 are in transition:
 
 - service scores are driven by witness-aligned aggregates when `consensus_v2` is enabled
 - ordering now includes proposal votes, quorum certificates, certified suffix sync, and QC-dominant canonical branch choice
-- the remaining instability is in service evidence and gating at `7/8`, not in whether certified state can dominate local drift
+- the remaining instability is concentrated in the last two bursty `6`-validator scenarios, not in whether the PQ transport or QC-aware state machinery exists
 
 ## Process Model For Localnet
 
