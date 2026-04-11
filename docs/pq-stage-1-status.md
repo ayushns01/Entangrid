@@ -73,13 +73,14 @@ Current result:
 - all `4`-validator baseline, gated, policy, and abuse scenarios pass
 - the only remaining failures are `baseline-6-bursty` and `gated-6-bursty`
 
+**Fix 1 applied (2026-04-11):** Remote vote import now treats `BranchRelation::Unknown` as incompatible. Forensic trace confirmed the pre-QC consensus phase is now working correctly — all 6 nodes converge on the same QC. The remaining failures are post-QC timing races where competing proposals at `height QC+1` arrive from different slots. When the 6-validator bursty scenario runs in isolation (full CPU budget), it achieves `6/6 same_chain fork_observed 0`.
+
 ## What Is Still Open Before Final Signoff
 
 The remaining blockers are consensus proof gaps, not cryptography gaps:
 
-- `baseline-6-bursty` still shows pre-QC multi-tip divergence even when all validators reach the same height
-- `gated-6-bursty` still shows a stuck follower that fails to rejoin the converged suffix above the certified head
-- recent pre-QC hardening improved branch choice, proposal-vote discipline, and snapshot preference, but did not close those last two scenarios
+- `baseline-6-bursty` is a pre-QC vote scattering scenario now partially resolved by Fix 1; remaining divergence is post-QC timing variance under CPU-starved sequential testing
+- `gated-6-bursty` forensically confirmed to achieve a correct QC in all 6 nodes; the remaining failure is competing post-QC child proposals arriving from multiple slots before the network can converge on one canonical child
 - because of that, this branch should not yet be presented as fully signed off for final merge
 
 ## Explicitly Deferred

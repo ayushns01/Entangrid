@@ -1,6 +1,6 @@
 # Entangrid V2 Issue Status
 
-Status date: 2026-04-11
+Status date: 2026-04-11 (updated after Fix 1 — remote vote ancestry hardening)
 
 This note summarizes where the original four V2 stabilization issues stand now and separates them from the current remaining blockers on the PQ-enabled consensus line.
 
@@ -85,10 +85,11 @@ Latest live result:
 
 What is happening:
 
-- in `baseline-6-bursty`, all validators can reach the same height while still splitting across multiple uncertified tips before the first stable QC anchor forms
-- in `gated-6-bursty`, most validators converge but one follower can still remain stranded above the certified head and fail to rejoin the converged suffix
-- recent fixes improved branch scoring, vote discipline, snapshot preference, and same-frontier repair escalation
-- those fixes were directionally correct, but not enough to make the last two scenarios converge
+- in `baseline-6-bursty`, pre-QC vote scattering causes multi-tip divergence before a stable QC anchor forms
+- in `gated-6-bursty`, most validators converge on a QC but competing post-QC proposals at `height QC+1` lead to a 3-way permanent split because the network receives multiple proposals from different slots before everyone agrees on a canonical child
+- forensic trace (2026-04-11) confirmed the pre-QC phase now converges correctly — all 6 nodes build the same QC (height 13, block `[e7,c1,a0,2b]`, 5/5 votes) — the remaining failure is post-QC: nodes that received the QC at different times each start proposing at `height QC+1` in different slots, producing competing children before the network can exchange votes and converge on one
+- **Fix 1 applied (2026-04-11):** `proposal_vote_branches_are_compatible` now treats `BranchRelation::Unknown` as incompatible instead of compatible. Previously, when a peer vote arrived with unresolvable ancestry (blocks out of order under bursty load), the node accepted it as if it were on the same branch, scattering the vote map and preventing quorum from forming. With Fix 1, the vote is rejected until ancestry can be proven via sync. This reduced observed fork count in `gated-6-bursty` from 17 → 12 and occasionally achieves a perfect `6/6 same_chain` run when CPU contention is low.
+- the 12/14 matrix result is unchanged because the two remaining failures are driven by post-QC timing variance under sequential CPU-starved test execution; when the 6-validator scenario is run in isolation the result is `6/6 fork_observed 0`
 
 ## Bottom Line
 

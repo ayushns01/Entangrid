@@ -2623,9 +2623,17 @@ impl NodeRunner {
         existing_hash: HashBytes,
         candidate_hash: HashBytes,
     ) -> bool {
+        // Treat Unknown ancestry as incompatible (safe default).
+        // When blocks arrive out of order under bursty load,
+        // build_chain_to_tip returns None causing branch_relation to return
+        // Unknown. Accepting Unknown here lets conflicting peer votes pollute
+        // the vote map before ancestry is verifiable, directly causing pre-QC
+        // fork fragmentation under bursty 5/6-validator load. A false rejection
+        // (delayed vote) is safe — the vote is re-accepted on re-broadcast once
+        // the block history is available via sync.
         matches!(
             self.branch_relation(existing_hash, candidate_hash),
-            BranchRelation::SameChain | BranchRelation::Unknown
+            BranchRelation::SameChain
         )
     }
 
