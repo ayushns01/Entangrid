@@ -536,9 +536,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use entangrid_types::{
-        GenesisConfig, MessageClass, RelayReceipt, ServiceAggregate, ServiceAttestation,
-        ServiceScoreWeights, ValidatorConfig, aggregate_service_counters, empty_hash,
-        service_attestation_root,
+        GenesisConfig, MessageClass, PublicIdentity, RelayReceipt, ServiceAggregate,
+        ServiceAttestation, ServiceScoreWeights, TypedSignature, ValidatorConfig,
+        aggregate_service_counters, empty_hash, service_attestation_root,
     };
 
     use super::*;
@@ -558,28 +558,32 @@ mod tests {
                     stake: 100,
                     address: "127.0.0.1:3001".into(),
                     dev_secret: "one".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 2,
                     stake: 100,
                     address: "127.0.0.1:3002".into(),
                     dev_secret: "two".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 3,
                     stake: 100,
                     address: "127.0.0.1:3003".into(),
                     dev_secret: "three".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
                 ValidatorConfig {
                     validator_id: 4,
                     stake: 100,
                     address: "127.0.0.1:3004".into(),
                     dev_secret: "four".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 },
             ],
             initial_balances: BTreeMap::new(),
@@ -601,7 +605,8 @@ mod tests {
                     stake: 100,
                     address: format!("127.0.0.1:{}", 3000 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
+                    session_public_identity: None,
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),
@@ -694,7 +699,7 @@ mod tests {
             latency_bucket_ms: 100,
             byte_count_bucket: 1,
             sequence_number: 0,
-            signature: vec![],
+            signature: TypedSignature::default(),
         };
         assert!(engine.validate_receipt_assignment(&receipt).is_ok());
 
@@ -768,7 +773,7 @@ mod tests {
                     failed_sessions: 0,
                     invalid_receipts: 0,
                 },
-                signature: vec![],
+                signature: TypedSignature::default(),
             })
             .collect();
         let aggregate = ServiceAggregate {
@@ -805,7 +810,7 @@ mod tests {
                     failed_sessions: 0,
                     invalid_receipts: 0,
                 },
-                signature: vec![],
+                signature: TypedSignature::default(),
             })
             .collect();
         let aggregate = ServiceAggregate {

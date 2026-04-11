@@ -8,19 +8,38 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
-use entangrid_crypto::{DeterministicCryptoBackend, Signer};
+use entangrid_crypto::deterministic_public_identity;
+use entangrid_crypto::{
+    DeterministicCryptoBackend, FrameDirection, HandshakeProvider, Signer, encrypt_frame_payload,
+};
+#[cfg(feature = "pq-ml-dsa")]
+use entangrid_crypto::{build_crypto_backend, measure_signing_backend};
+#[cfg(feature = "pq-ml-dsa")]
+use entangrid_types::{
+    Block, BlockHeader, ProposalVote, PublicIdentity, PublicIdentityComponent, PublicKeyScheme,
+    TopologyCommitment, TypedSignature, ValidatorId,
+};
 use entangrid_types::{
     FaultProfile, FeatureFlags, GenesisConfig, LocalnetManifest, NodeConfig, NodeMetrics,
-    PeerConfig, ProtocolMessage, ServiceScoreWeights, SignedEnvelope, SignedTransaction,
-    Transaction, ValidatorConfig, canonical_hash, default_service_delivery_weight,
-    default_service_diversity_weight, default_service_gating_start_epoch,
-    default_service_gating_threshold, default_service_penalty_weight,
-    default_service_score_weights, default_service_score_window_epochs,
-    default_service_uptime_weight, empty_hash, now_unix_millis, validator_account,
+    PeerConfig, ProtocolMessage, ServiceScoreWeights, SessionBackendKind, SessionServerHello,
+    SignedEnvelope, SignedTransaction, SigningBackendKind, Transaction, ValidatorConfig,
+    canonical_hash, default_service_delivery_weight, default_service_diversity_weight,
+    default_service_gating_start_epoch, default_service_gating_threshold,
+    default_service_penalty_weight, default_service_score_weights,
+    default_service_score_window_epochs, default_service_uptime_weight, empty_hash,
+    now_unix_millis, validator_account,
 };
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "pq-ml-kem")]
+use entangrid_types::{SessionKeyScheme, SessionPublicIdentity, SessionPublicIdentityComponent};
+#[cfg(feature = "pq-ml-dsa")]
+use ml_dsa::{KeyGen, MlDsa65};
+#[cfg(feature = "pq-ml-kem")]
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+#[cfg(any(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+use rand_core::OsRng;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     process::{Child, Command},
 };
@@ -73,6 +92,8 @@ enum Commands {
         degraded_drop_probability: f64,
         #[arg(long, default_value_t = false)]
         degraded_disable_outbound: bool,
+        #[arg(long, default_value_t = false)]
+        hybrid_enforcement: bool,
     },
     Up {
         #[arg(long, default_value = "var/localnet")]
@@ -97,6 +118,14 @@ enum Commands {
         output_dir: PathBuf,
         #[arg(long, default_value_t = 18)]
         settle_secs: u64,
+    },
+    PqMeasure {
+        #[arg(long, default_value_t = 4)]
+        validators: usize,
+        #[arg(long, default_value_t = 32)]
+        iterations: usize,
+        #[arg(long, default_value = "test-results/pq-ml-dsa-measurements.md")]
+        output_path: PathBuf,
     },
 }
 
@@ -179,6 +208,7 @@ pub async fn cli_main() -> Result<()> {
             degraded_delay_ms,
             degraded_drop_probability,
             degraded_disable_outbound,
+            hybrid_enforcement,
         } => {
             let service_score_window_epochs = service_score_window_epochs.unwrap_or_else(|| {
                 recommended_service_score_window_epochs_for_validators(validators)
@@ -204,6 +234,7 @@ pub async fn cli_main() -> Result<()> {
                 degraded_drop_probability,
                 degraded_disable_outbound,
                 consensus_v2,
+                hybrid_enforcement,
             )
         }
         Commands::Up { base_dir } => up_localnet(&base_dir).await,
@@ -218,7 +249,17 @@ pub async fn cli_main() -> Result<()> {
             output_dir,
             settle_secs,
         } => run_rigorous_matrix(&base_dir, &output_dir, settle_secs).await,
+        Commands::PqMeasure {
+            validators,
+            iterations,
+            output_path,
+        } => run_pq_measurement(&output_path, validators, iterations),
     }
+}
+
+#[cfg(test)]
+fn default_pq_measurement_output_path() -> String {
+    "test-results/pq-ml-dsa-measurements.md".into()
 }
 
 pub fn init_localnet(
@@ -237,9 +278,30 @@ pub fn init_localnet(
     degraded_drop_probability: f64,
     degraded_disable_outbound: bool,
     consensus_v2: bool,
+    hybrid_enforcement: bool,
 ) -> Result<()> {
+    struct LocalnetValidatorMaterial {
+        validator: ValidatorConfig,
+        signing_backend: SigningBackendKind,
+        signing_key_path: Option<String>,
+        session_backend: SessionBackendKind,
+        session_key_path: Option<String>,
+    }
+
     if validators < 4 {
         return Err(anyhow!("at least 4 validators are recommended"));
+    }
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    if hybrid_enforcement {
+        return Err(anyhow!(
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        ));
+    }
+    #[cfg(all(feature = "pq-ml-dsa", not(feature = "pq-ml-kem")))]
+    if hybrid_enforcement {
+        return Err(anyhow!(
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        ));
     }
     if let Some(degraded_validator) = degraded_validator {
         if degraded_validator == 0 || degraded_validator > validators as u64 {
@@ -248,24 +310,73 @@ pub fn init_localnet(
             ));
         }
     }
+    let consensus_v2 = consensus_v2 || hybrid_enforcement;
     fs::create_dir_all(base_dir)?;
     let genesis_path = base_dir.join("genesis.toml");
     let manifest_path = manifest_path(base_dir);
 
-    let mut validator_configs = Vec::new();
+    let mut validator_materials = Vec::new();
     let mut initial_balances = BTreeMap::new();
     for index in 0..validators {
         let validator_id = (index + 1) as u64;
-        let address = format!("127.0.0.1:{}", 4100 + index);
-        validator_configs.push(ValidatorConfig {
-            validator_id,
-            stake: 100,
-            address: address.clone(),
-            dev_secret: format!("entangrid-dev-secret-{validator_id}"),
-            public_identity: format!("validator-{validator_id}").into_bytes(),
-        });
+        #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+        if hybrid_enforcement {
+            let node_dir = base_dir.join(format!("node-{validator_id}"));
+            let (
+                validator_config,
+                signing_backend,
+                signing_key_path,
+                session_backend,
+                session_key_path,
+            ) = generate_hybrid_validator_material(validator_id, &node_dir)?;
+            validator_materials.push(LocalnetValidatorMaterial {
+                validator: validator_config,
+                signing_backend,
+                signing_key_path: Some(signing_key_path),
+                session_backend,
+                session_key_path: Some(session_key_path),
+            });
+        } else {
+            let address = format!("127.0.0.1:{}", 4100 + index);
+            validator_materials.push(LocalnetValidatorMaterial {
+                validator: ValidatorConfig {
+                    validator_id,
+                    stake: 100,
+                    address: address.clone(),
+                    dev_secret: format!("entangrid-dev-secret-{validator_id}"),
+                    public_identity: deterministic_public_identity(validator_id),
+                    session_public_identity: None,
+                },
+                signing_backend: SigningBackendKind::DevDeterministic,
+                signing_key_path: None,
+                session_backend: SessionBackendKind::DevDeterministic,
+                session_key_path: None,
+            });
+        }
+        #[cfg(not(all(feature = "pq-ml-dsa", feature = "pq-ml-kem")))]
+        {
+            let address = format!("127.0.0.1:{}", 4100 + index);
+            validator_materials.push(LocalnetValidatorMaterial {
+                validator: ValidatorConfig {
+                    validator_id,
+                    stake: 100,
+                    address: address.clone(),
+                    dev_secret: format!("entangrid-dev-secret-{validator_id}"),
+                    public_identity: deterministic_public_identity(validator_id),
+                    session_public_identity: None,
+                },
+                signing_backend: SigningBackendKind::DevDeterministic,
+                signing_key_path: None,
+                session_backend: SessionBackendKind::DevDeterministic,
+                session_key_path: None,
+            });
+        }
         initial_balances.insert(validator_account(validator_id), 1_000_000);
     }
+    let validator_configs = validator_materials
+        .iter()
+        .map(|material| material.validator.clone())
+        .collect::<Vec<_>>();
 
     let genesis = GenesisConfig {
         chain_id: "entangrid-localnet".into(),
@@ -285,7 +396,8 @@ pub fn init_localnet(
     fs::write(&genesis_path, toml::to_string_pretty(&genesis)?)?;
 
     let mut node_configs = Vec::new();
-    for validator in &validator_configs {
+    for material in &validator_materials {
+        let validator = &material.validator;
         let node_dir = base_dir.join(format!("node-{}", validator.validator_id));
         fs::create_dir_all(node_dir.join("inbox"))?;
         fs::create_dir_all(node_dir.join("processed"))?;
@@ -316,6 +428,7 @@ pub fn init_localnet(
                 enable_receipts: true,
                 enable_service_gating,
                 consensus_v2,
+                require_hybrid_validator_signatures: hybrid_enforcement,
                 service_gating_start_epoch,
                 service_gating_threshold,
                 service_score_window_epochs,
@@ -323,6 +436,11 @@ pub fn init_localnet(
             },
             fault_profile,
             sync_on_startup: true,
+            signing_backend: material.signing_backend.clone(),
+            signing_key_path: material.signing_key_path.clone(),
+            session_backend: material.session_backend.clone(),
+            session_key_path: material.session_key_path.clone(),
+            session_ttl_millis: None,
         };
         let config_path = node_dir.join("node.toml");
         fs::write(&config_path, toml::to_string_pretty(&config)?)?;
@@ -338,6 +456,80 @@ pub fn init_localnet(
     Ok(())
 }
 
+#[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+fn generate_hybrid_validator_material(
+    validator_id: ValidatorId,
+    node_dir: &Path,
+) -> Result<(
+    ValidatorConfig,
+    SigningBackendKind,
+    String,
+    SessionBackendKind,
+    String,
+)> {
+    fs::create_dir_all(node_dir)?;
+    let mut rng = OsRng;
+    let keypair = MlDsa65::key_gen(&mut rng);
+    let signing_key = keypair.signing_key().clone();
+    let verifying_key = keypair.verifying_key().clone();
+    let key_path = node_dir.join("ml-dsa-key.json");
+    let key_file = MlDsa65SimKeyFile {
+        signing_key: signing_key.encode().as_slice().to_vec(),
+        verifying_key: verifying_key.encode().as_slice().to_vec(),
+    };
+    fs::write(&key_path, serde_json::to_vec(&key_file)?)?;
+
+    let (decapsulation_key, encapsulation_key) = MlKem768::generate(&mut rng);
+    let session_key_path = node_dir.join("ml-kem-session-key.json");
+    let session_key_file = MlKem768SimSessionKeyFile {
+        decapsulation_key: decapsulation_key.as_bytes().as_slice().to_vec(),
+        encapsulation_key: encapsulation_key.as_bytes().as_slice().to_vec(),
+    };
+    fs::write(&session_key_path, serde_json::to_vec(&session_key_file)?)?;
+
+    let public_identity = PublicIdentity::try_hybrid(vec![
+        PublicIdentityComponent {
+            scheme: PublicKeyScheme::DevDeterministic,
+            bytes: deterministic_public_identity(validator_id)
+                .as_single_bytes()
+                .unwrap()
+                .to_vec(),
+        },
+        PublicIdentityComponent {
+            scheme: PublicKeyScheme::MlDsa,
+            bytes: verifying_key.encode().as_slice().to_vec(),
+        },
+    ])
+    .map_err(|error| anyhow!(error))?;
+
+    let session_public_identity = SessionPublicIdentity::try_hybrid(vec![
+        SessionPublicIdentityComponent {
+            scheme: SessionKeyScheme::DevDeterministic,
+            bytes: format!("session-validator-{validator_id}").into_bytes(),
+        },
+        SessionPublicIdentityComponent {
+            scheme: SessionKeyScheme::MlKem,
+            bytes: session_key_file.encapsulation_key.clone(),
+        },
+    ])
+    .map_err(|error| anyhow!(error))?;
+
+    Ok((
+        ValidatorConfig {
+            validator_id,
+            stake: 100,
+            address: format!("127.0.0.1:{}", 4100 + (validator_id - 1)),
+            dev_secret: format!("entangrid-dev-secret-{validator_id}"),
+            public_identity,
+            session_public_identity: Some(session_public_identity),
+        },
+        SigningBackendKind::HybridDeterministicMlDsaExperimental,
+        key_path.display().to_string(),
+        SessionBackendKind::HybridDeterministicMlKemExperimental,
+        session_key_path.display().to_string(),
+    ))
+}
+
 pub async fn up_localnet(base_dir: &Path) -> Result<()> {
     let mut children = spawn_localnet_children(base_dir).await?;
 
@@ -348,7 +540,8 @@ pub async fn up_localnet(base_dir: &Path) -> Result<()> {
 
 async fn spawn_localnet_children(base_dir: &Path) -> Result<Vec<Child>> {
     let manifest = read_manifest(base_dir)?;
-    ensure_node_binary_built().await?;
+    let require_hybrid_features = localnet_requires_hybrid_enforcement(&manifest)?;
+    ensure_node_binary_built(require_hybrid_features).await?;
     refresh_genesis_time_for_fresh_localnet(&manifest)?;
     let node_binary = node_binary_path()?;
     let mut children: Vec<Child> = Vec::new();
@@ -534,6 +727,7 @@ async fn run_matrix_scenario(
         scenario.degraded_delay_ms,
         scenario.degraded_drop_probability,
         scenario.degraded_disable_outbound,
+        true,
         false,
     )?;
 
@@ -685,6 +879,22 @@ async fn send_protocol_message(
     peer: &PeerConfig,
     payload: ProtocolMessage,
 ) -> Result<()> {
+    let mut stream = TcpStream::connect(&peer.address).await?;
+    let client_hello = crypto.build_client_hello(
+        from_validator_id,
+        peer.validator_id,
+        canonical_hash(&(
+            "entangrid-network-session",
+            from_validator_id,
+            peer.validator_id,
+            now_unix_millis(),
+        )),
+    )?;
+    write_bincode_frame(&mut stream, &client_hello).await?;
+    let server_hello: SessionServerHello = read_bincode_frame(&mut stream).await?;
+    let session =
+        crypto.finalize_client_session(from_validator_id, &client_hello, &server_hello)?;
+
     let message_hash = canonical_hash(&payload);
     let envelope = SignedEnvelope {
         from_validator_id,
@@ -692,12 +902,35 @@ async fn send_protocol_message(
         signature: crypto.sign(from_validator_id, &message_hash)?,
         payload,
     };
-    let bytes = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
-    let mut stream = TcpStream::connect(&peer.address).await?;
+    let payload = bincode::serde::encode_to_vec(&envelope, bincode::config::standard())?;
+    let frame = if session.encrypt_frames {
+        encrypt_frame_payload(&session, FrameDirection::Outbound, 0, &payload)?
+    } else {
+        payload
+    };
+    write_frame(&mut stream, &frame).await?;
+    Ok(())
+}
+
+async fn write_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream.write_u32(bytes.len() as u32).await?;
-    stream.write_all(&bytes).await?;
+    stream.write_all(bytes).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn write_bincode_frame<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
+    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+    write_frame(stream, &bytes).await
+}
+
+async fn read_bincode_frame<T: DeserializeOwned>(stream: &mut TcpStream) -> Result<T> {
+    let frame_len = stream.read_u32().await? as usize;
+    let mut bytes = vec![0; frame_len];
+    stream.read_exact(&mut bytes).await?;
+    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+        .map(|(decoded, _)| decoded)
+        .map_err(|error| anyhow!("failed to decode simulator handshake frame: {error}"))
 }
 
 fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {
@@ -709,6 +942,17 @@ fn read_node_configs(manifest: &LocalnetManifest) -> Result<Vec<NodeConfig>> {
             Ok(toml::from_str(&contents)?)
         })
         .collect()
+}
+
+fn localnet_requires_hybrid_enforcement(manifest: &LocalnetManifest) -> Result<bool> {
+    for config in read_node_configs(manifest)? {
+        if config.feature_flags.require_hybrid_validator_signatures
+            || config.signing_backend == SigningBackendKind::HybridDeterministicMlDsaExperimental
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn wait_for_scenario_expectations(
@@ -1515,6 +1759,30 @@ struct MatrixReport {
     scenarios: Vec<MatrixScenarioResult>,
 }
 
+#[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct PqMeasurementScenario {
+    label: String,
+    deterministic_signature_size_bytes: usize,
+    ml_dsa_signature_size_bytes: usize,
+    deterministic_message_size_bytes: usize,
+    ml_dsa_message_size_bytes: usize,
+    deterministic_median_sign_latency_nanos: u128,
+    ml_dsa_median_sign_latency_nanos: u128,
+    deterministic_median_verify_latency_nanos: u128,
+    ml_dsa_median_verify_latency_nanos: u128,
+}
+
+#[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct PqMeasurementReport {
+    generated_at_unix_millis: u64,
+    validator_count: usize,
+    iterations: usize,
+    output_path: String,
+    scenarios: Vec<PqMeasurementScenario>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct BenchmarkTarget {
     name: String,
@@ -1900,6 +2168,371 @@ impl MatrixReport {
     }
 }
 
+impl PqMeasurementReport {
+    #[cfg_attr(not(any(test, feature = "pq-ml-dsa")), allow(dead_code))]
+    fn render_markdown(&self) -> String {
+        let mut lines = vec![
+            "# Entangrid PQ Signing Measurements".to_string(),
+            String::new(),
+            format!(
+                "Generated at unix millis `{}` with validator count `{}` and iterations `{}`.",
+                self.generated_at_unix_millis, self.validator_count, self.iterations
+            ),
+            String::new(),
+            "| Scenario | Deterministic signature size | ML-DSA signature size | Deterministic message size | ML-DSA message size | Deterministic Median sign latency | ML-DSA Median sign latency | Deterministic Median verify latency | ML-DSA Median verify latency |".to_string(),
+            "|---|---|---|---|---|---|---|---|---|".to_string(),
+        ];
+        for scenario in &self.scenarios {
+            lines.push(format!(
+                "| {} | {} bytes | {} bytes | {} bytes | {} bytes | {} ns | {} ns | {} ns | {} ns |",
+                scenario.label,
+                scenario.deterministic_signature_size_bytes,
+                scenario.ml_dsa_signature_size_bytes,
+                scenario.deterministic_message_size_bytes,
+                scenario.ml_dsa_message_size_bytes,
+                scenario.deterministic_median_sign_latency_nanos,
+                scenario.ml_dsa_median_sign_latency_nanos,
+                scenario.deterministic_median_verify_latency_nanos,
+                scenario.ml_dsa_median_verify_latency_nanos
+            ));
+        }
+        lines.push(String::new());
+        lines.push("## Measurement Notes".to_string());
+        lines.push(String::new());
+        lines.push(
+            "- Public identity and signature sizes come from the real configured signing backends."
+                .to_string(),
+        );
+        lines.push("- Block and proposal-vote message sizes are proxy serialized sizes, not a full live-network benchmark.".to_string());
+        lines.push(
+            "- Median timings are local-machine measurements and should be treated as indicative."
+                .to_string(),
+        );
+        lines.join("\n")
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MlDsa65SimKeyFile {
+    signing_key: Vec<u8>,
+    verifying_key: Vec<u8>,
+}
+
+#[cfg(feature = "pq-ml-kem")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MlKem768SimSessionKeyFile {
+    decapsulation_key: Vec<u8>,
+    encapsulation_key: Vec<u8>,
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_measurement_validators(
+    validator_count: usize,
+    validator_one_identity: PublicIdentity,
+) -> Vec<ValidatorConfig> {
+    (1..=validator_count as u64)
+        .map(|validator_id| ValidatorConfig {
+            validator_id,
+            stake: 100,
+            address: format!("127.0.0.1:{}", 3000 + validator_id),
+            dev_secret: format!("secret-{validator_id}"),
+            public_identity: if validator_id == 1 {
+                validator_one_identity.clone()
+            } else {
+                deterministic_public_identity(validator_id)
+            },
+            session_public_identity: None,
+        })
+        .collect()
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_measurement_genesis(
+    validator_count: usize,
+    validator_one_identity: PublicIdentity,
+) -> GenesisConfig {
+    GenesisConfig {
+        chain_id: "entangrid-pq-measurement".into(),
+        epoch_seed: empty_hash(),
+        genesis_time_unix_millis: 0,
+        slot_duration_millis: 1_000,
+        slots_per_epoch: 6,
+        max_txs_per_block: 16,
+        witness_count: validator_count.saturating_sub(2).max(2),
+        validators: build_measurement_validators(validator_count, validator_one_identity),
+        initial_balances: (1..=validator_count as u64)
+            .map(|validator_id| (validator_account(validator_id), 1_000))
+            .collect(),
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn deterministic_measurement_config() -> NodeConfig {
+    NodeConfig {
+        validator_id: 1,
+        data_dir: "/tmp/pq-measure-deterministic".into(),
+        genesis_path: "/tmp/pq-measure-genesis.toml".into(),
+        listen_address: "127.0.0.1:3001".into(),
+        peers: Vec::new(),
+        log_path: "/tmp/pq-measure-events.log".into(),
+        metrics_path: "/tmp/pq-measure-metrics.json".into(),
+        feature_flags: FeatureFlags::default(),
+        fault_profile: FaultProfile::default(),
+        sync_on_startup: true,
+        signing_backend: SigningBackendKind::DevDeterministic,
+        signing_key_path: None,
+        session_backend: SessionBackendKind::DevDeterministic,
+        session_key_path: None,
+        session_ttl_millis: None,
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn ml_dsa_measurement_setup(validator_count: usize) -> Result<(GenesisConfig, NodeConfig)> {
+    let mut rng = OsRng;
+    let keypair = MlDsa65::key_gen(&mut rng);
+    let signing_key = keypair.signing_key().clone();
+    let verifying_key = keypair.verifying_key().clone();
+    let key_path = std::env::temp_dir().join(format!(
+        "entangrid-pq-measure-{}-{}.key",
+        validator_count,
+        std::process::id()
+    ));
+    let key_file = MlDsa65SimKeyFile {
+        signing_key: signing_key.encode().as_slice().to_vec(),
+        verifying_key: verifying_key.encode().as_slice().to_vec(),
+    };
+    fs::write(&key_path, serde_json::to_vec(&key_file)?)?;
+    let genesis = build_measurement_genesis(
+        validator_count,
+        PublicIdentity::single(
+            PublicKeyScheme::MlDsa,
+            verifying_key.encode().as_slice().to_vec(),
+        ),
+    );
+    let config = NodeConfig {
+        signing_backend: SigningBackendKind::MlDsa65Experimental,
+        signing_key_path: Some(key_path.display().to_string()),
+        session_backend: SessionBackendKind::DevDeterministic,
+        session_key_path: None,
+        session_ttl_millis: None,
+        ..deterministic_measurement_config()
+    };
+    Ok((genesis, config))
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn sample_block(block_hash_parent: [u8; 32], signature: TypedSignature) -> Block {
+    let transactions = Vec::new();
+    let commitment: Option<TopologyCommitment> = None;
+    let header = BlockHeader {
+        block_number: 2,
+        parent_hash: block_hash_parent,
+        slot: 2,
+        epoch: 0,
+        proposer_id: 1,
+        timestamp_unix_millis: 1_000,
+        state_root: canonical_hash(&"state-root"),
+        transactions_root: canonical_hash(&transactions),
+        topology_root: commitment
+            .as_ref()
+            .map(canonical_hash)
+            .unwrap_or_else(empty_hash),
+    };
+    let block_hash = canonical_hash(&(header.clone(), &transactions, &commitment));
+    Block {
+        header,
+        transactions,
+        commitment,
+        commitment_receipts: Vec::new(),
+        signature,
+        block_hash,
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn unsigned_proposal_vote() -> ProposalVote {
+    ProposalVote {
+        validator_id: 1,
+        block_hash: canonical_hash(&"proposal-vote-block"),
+        block_number: 2,
+        epoch: 0,
+        slot: 2,
+        signature: TypedSignature::default(),
+    }
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn proposal_vote_signing_hash(vote: &ProposalVote) -> [u8; 32] {
+    let mut unsigned = vote.clone();
+    unsigned.signature = TypedSignature::default();
+    canonical_hash(&unsigned)
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn sample_block_signing_hash() -> [u8; 32] {
+    let transactions = Vec::<SignedTransaction>::new();
+    let commitment: Option<TopologyCommitment> = None;
+    let header = BlockHeader {
+        block_number: 2,
+        parent_hash: empty_hash(),
+        slot: 2,
+        epoch: 0,
+        proposer_id: 1,
+        timestamp_unix_millis: 1_000,
+        state_root: canonical_hash(&"state-root"),
+        transactions_root: canonical_hash(&transactions),
+        topology_root: commitment
+            .as_ref()
+            .map(canonical_hash)
+            .unwrap_or_else(empty_hash),
+    };
+    canonical_hash(&(header, &transactions, &commitment))
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn signed_block_size(
+    genesis: &GenesisConfig,
+    config: &NodeConfig,
+    validator_id: ValidatorId,
+) -> Result<usize> {
+    let crypto = build_crypto_backend(genesis, config)?;
+    let block_hash = sample_block_signing_hash();
+    let signature = crypto.sign(validator_id, &block_hash)?;
+    Ok(bincode::serde::encode_to_vec(
+        sample_block(empty_hash(), signature),
+        bincode::config::standard(),
+    )?
+    .len())
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn signed_vote_size(
+    genesis: &GenesisConfig,
+    config: &NodeConfig,
+    validator_id: ValidatorId,
+) -> Result<usize> {
+    let crypto = build_crypto_backend(genesis, config)?;
+    let mut vote = unsigned_proposal_vote();
+    let vote_hash = proposal_vote_signing_hash(&vote);
+    vote.signature = crypto.sign(validator_id, &vote_hash)?;
+    Ok(bincode::serde::encode_to_vec(vote, bincode::config::standard())?.len())
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn build_pq_measurement_report(
+    validator_count: usize,
+    iterations: usize,
+    output_path: &Path,
+) -> Result<PqMeasurementReport> {
+    let deterministic_genesis =
+        build_measurement_genesis(validator_count, deterministic_public_identity(1));
+    let deterministic_config = deterministic_measurement_config();
+    let (ml_dsa_genesis, ml_dsa_config) = ml_dsa_measurement_setup(validator_count)?;
+
+    let block_hash = sample_block_signing_hash();
+    let vote_hash = proposal_vote_signing_hash(&unsigned_proposal_vote());
+
+    let deterministic_block = measure_signing_backend(
+        "deterministic",
+        &deterministic_genesis,
+        &deterministic_config,
+        1,
+        &block_hash,
+        iterations,
+    )?;
+    let ml_dsa_block = measure_signing_backend(
+        "ml-dsa",
+        &ml_dsa_genesis,
+        &ml_dsa_config,
+        1,
+        &block_hash,
+        iterations,
+    )?;
+    let deterministic_vote = measure_signing_backend(
+        "deterministic",
+        &deterministic_genesis,
+        &deterministic_config,
+        1,
+        &vote_hash,
+        iterations,
+    )?;
+    let ml_dsa_vote = measure_signing_backend(
+        "ml-dsa",
+        &ml_dsa_genesis,
+        &ml_dsa_config,
+        1,
+        &vote_hash,
+        iterations,
+    )?;
+
+    Ok(PqMeasurementReport {
+        generated_at_unix_millis: now_unix_millis(),
+        validator_count,
+        iterations,
+        output_path: output_path.to_string_lossy().to_string(),
+        scenarios: vec![
+            PqMeasurementScenario {
+                label: "block".into(),
+                deterministic_signature_size_bytes: deterministic_block.signature_size_bytes,
+                ml_dsa_signature_size_bytes: ml_dsa_block.signature_size_bytes,
+                deterministic_message_size_bytes: signed_block_size(
+                    &deterministic_genesis,
+                    &deterministic_config,
+                    1,
+                )?,
+                ml_dsa_message_size_bytes: signed_block_size(&ml_dsa_genesis, &ml_dsa_config, 1)?,
+                deterministic_median_sign_latency_nanos: deterministic_block
+                    .median_sign_latency_nanos,
+                ml_dsa_median_sign_latency_nanos: ml_dsa_block.median_sign_latency_nanos,
+                deterministic_median_verify_latency_nanos: deterministic_block
+                    .median_verify_latency_nanos,
+                ml_dsa_median_verify_latency_nanos: ml_dsa_block.median_verify_latency_nanos,
+            },
+            PqMeasurementScenario {
+                label: "proposal_vote".into(),
+                deterministic_signature_size_bytes: deterministic_vote.signature_size_bytes,
+                ml_dsa_signature_size_bytes: ml_dsa_vote.signature_size_bytes,
+                deterministic_message_size_bytes: signed_vote_size(
+                    &deterministic_genesis,
+                    &deterministic_config,
+                    1,
+                )?,
+                ml_dsa_message_size_bytes: signed_vote_size(&ml_dsa_genesis, &ml_dsa_config, 1)?,
+                deterministic_median_sign_latency_nanos: deterministic_vote
+                    .median_sign_latency_nanos,
+                ml_dsa_median_sign_latency_nanos: ml_dsa_vote.median_sign_latency_nanos,
+                deterministic_median_verify_latency_nanos: deterministic_vote
+                    .median_verify_latency_nanos,
+                ml_dsa_median_verify_latency_nanos: ml_dsa_vote.median_verify_latency_nanos,
+            },
+        ],
+    })
+}
+
+#[cfg(feature = "pq-ml-dsa")]
+fn run_pq_measurement(output_path: &Path, validator_count: usize, iterations: usize) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let report = build_pq_measurement_report(validator_count, iterations, output_path)?;
+    fs::write(output_path, report.render_markdown())?;
+    println!("{}", output_path.display());
+    Ok(())
+}
+
+#[cfg(not(feature = "pq-ml-dsa"))]
+fn run_pq_measurement(
+    _output_path: &Path,
+    _validator_count: usize,
+    _iterations: usize,
+) -> Result<()> {
+    Err(anyhow!(
+        "pq-measure requires entangrid-sim to be built with pq-ml-dsa"
+    ))
+}
+
 fn build_localnet_report(base_dir: &Path, manifest: &LocalnetManifest) -> Result<LocalnetReport> {
     let mut validators = Vec::new();
     let mut total_blocks_proposed = 0;
@@ -2123,32 +2756,64 @@ where
     Ok(values)
 }
 
-fn node_binary_path() -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()?;
-    let parent = current_exe
+fn node_binary_candidate_paths(sim_exe: &Path) -> Result<Vec<PathBuf>> {
+    let parent = sim_exe
         .parent()
         .ok_or_else(|| anyhow!("sim executable has no parent directory"))?;
-    let mut candidate = parent.join("entangrid-node");
+    let mut candidates = vec![parent.join("entangrid-node")];
+    if parent.file_name().is_some_and(|name| name == "deps") {
+        if let Some(debug_dir) = parent.parent() {
+            candidates.push(debug_dir.join("entangrid-node"));
+        }
+    }
     if cfg!(windows) {
-        candidate.set_extension("exe");
+        for candidate in &mut candidates {
+            candidate.set_extension("exe");
+        }
     }
-    if !candidate.exists() {
-        return Err(anyhow!(
-            "expected node binary at {}, build the workspace first",
-            candidate.display()
-        ));
-    }
-    Ok(candidate)
+    Ok(candidates)
 }
 
-async fn ensure_node_binary_built() -> Result<()> {
-    let status = Command::new("cargo")
-        .arg("build")
-        .arg("--bin")
-        .arg("entangrid-node")
-        .current_dir(workspace_root()?)
-        .status()
-        .await?;
+fn node_binary_path() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe()?;
+    let candidates = node_binary_candidate_paths(&current_exe)?;
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
+    }
+
+    let preferred = candidates
+        .last()
+        .or_else(|| candidates.first())
+        .ok_or_else(|| anyhow!("could not compute node binary path candidates"))?;
+    Err(anyhow!(
+        "expected node binary at {}, build the workspace first",
+        preferred.display()
+    ))
+}
+
+async fn ensure_node_binary_built(require_hybrid_features: bool) -> Result<()> {
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    if require_hybrid_features {
+        return Err(anyhow!(
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        ));
+    }
+    #[cfg(all(feature = "pq-ml-dsa", not(feature = "pq-ml-kem")))]
+    if require_hybrid_features {
+        return Err(anyhow!(
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        ));
+    }
+
+    let mut command = Command::new("cargo");
+    command.arg("build").arg("--bin").arg("entangrid-node");
+    if require_hybrid_features {
+        command.arg("--features").arg("pq-ml-dsa pq-ml-kem");
+    }
+
+    let status = command.current_dir(workspace_root()?).status().await?;
     if !status.success() {
         return Err(anyhow!("failed to build entangrid-node"));
     }
@@ -2200,6 +2865,97 @@ fn localnet_is_fresh(manifest: &LocalnetManifest) -> Result<bool> {
 mod tests {
     use super::*;
 
+    fn temp_localnet_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("entangrid-sim-{label}-{}", now_unix_millis()))
+    }
+
+    fn rewrite_first_node_config(
+        base_dir: &Path,
+        update: impl FnOnce(&mut NodeConfig),
+    ) -> LocalnetManifest {
+        let manifest = read_manifest(base_dir).unwrap();
+        let first_config_path = PathBuf::from(&manifest.node_configs[0]);
+        let contents = fs::read_to_string(&first_config_path).unwrap();
+        let mut config: NodeConfig = toml::from_str(&contents).unwrap();
+        update(&mut config);
+        fs::write(first_config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
+        manifest
+    }
+
+    #[cfg(not(feature = "pq-ml-dsa"))]
+    fn write_hybrid_requirement_to_first_node(base_dir: &Path) {
+        rewrite_first_node_config(base_dir, |config| {
+            config.feature_flags.require_hybrid_validator_signatures = true;
+            config.signing_backend = SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        });
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn hybrid_boot_smoke_ready_accepts_proposal_vote_activity_without_qc_event() {
+        let unique_dir = temp_localnet_dir("hybrid-smoke-ready-proposal-vote");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        write_structural_node_artifacts(
+            &unique_dir,
+            1,
+            block_chain(1, "hybrid-smoke", 1),
+            &["block-accepted", "proposal-vote-buffered"],
+        );
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        assert!(hybrid_boot_smoke_ready(&manifest).unwrap());
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    fn hybrid_boot_smoke_ready(manifest: &LocalnetManifest) -> Result<bool> {
+        let mut saw_block_progress = false;
+        let mut saw_positive_qc_activity = false;
+
+        for config in read_node_configs(manifest)? {
+            let node_dir = PathBuf::from(&config.data_dir);
+            let blocks: Vec<entangrid_types::Block> =
+                read_json_lines(&node_dir.join("blocks.jsonl"))?;
+            if !blocks.is_empty() {
+                saw_block_progress = true;
+            }
+
+            let events: Vec<entangrid_types::EventLogEntry> =
+                read_json_lines(&node_dir.join("events.log"))?;
+            if events.iter().any(|entry| entry.event == "block-accepted") {
+                saw_block_progress = true;
+            }
+            if events.iter().any(|entry| {
+                matches!(
+                    entry.event.as_str(),
+                    "qc-built" | "qc-imported" | "proposal-vote-buffered" | "proposal-vote-cast"
+                )
+            }) {
+                saw_positive_qc_activity = true;
+            }
+        }
+
+        Ok(saw_block_progress && saw_positive_qc_activity)
+    }
+
     fn block_chain(
         validator_id: u64,
         chain_name: &str,
@@ -2225,7 +2981,10 @@ mod tests {
                 transactions: Vec::new(),
                 commitment: None,
                 commitment_receipts: Vec::new(),
-                signature: vec![validator_id as u8],
+                signature: entangrid_types::TypedSignature::single(
+                    entangrid_types::SignatureScheme::DevDeterministic,
+                    vec![validator_id as u8],
+                ),
                 block_hash,
             });
             parent_hash = block_hash;
@@ -2308,6 +3067,7 @@ mod tests {
             0.0,
             false,
             false,
+            false,
         )
         .unwrap();
         assert!(manifest_path(&unique_dir).exists());
@@ -2329,7 +3089,8 @@ mod tests {
                     stake: 100,
                     address: format!("127.0.0.1:{}", 4100 + validator_id),
                     dev_secret: format!("secret-{validator_id}"),
-                    public_identity: vec![],
+                    public_identity: entangrid_types::PublicIdentity::default(),
+                    session_public_identity: None,
                 })
                 .collect(),
             initial_balances: BTreeMap::new(),
@@ -2362,6 +3123,7 @@ mod tests {
             Some(3),
             0,
             0.75,
+            false,
             false,
             false,
         )
@@ -2402,12 +3164,538 @@ mod tests {
             0.0,
             false,
             true,
+            false,
         )
         .unwrap();
         let node_one_path = unique_dir.join("node-1").join("node.toml");
         let contents = fs::read_to_string(node_one_path).unwrap();
         let node_config: NodeConfig = toml::from_str(&contents).unwrap();
         assert!(node_config.feature_flags.consensus_v2);
+    }
+
+    #[test]
+    fn init_localnet_defaults_nodes_to_deterministic_signing_backend() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-signing-backend-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(
+            node_config.signing_backend,
+            entangrid_types::SigningBackendKind::DevDeterministic
+        );
+        assert_eq!(node_config.signing_key_path, None);
+    }
+
+    #[test]
+    fn init_localnet_cli_can_enable_hybrid_enforcement() {
+        let cli = Cli::try_parse_from(["entangrid-sim", "init-localnet", "--hybrid-enforcement"])
+            .unwrap();
+
+        match cli.command {
+            Commands::InitLocalnet {
+                hybrid_enforcement, ..
+            } => assert!(hybrid_enforcement),
+            _ => panic!("expected init-localnet command"),
+        }
+    }
+
+    #[test]
+    fn init_localnet_cli_defaults_hybrid_enforcement_to_disabled() {
+        let cli = Cli::try_parse_from(["entangrid-sim", "init-localnet"]).unwrap();
+
+        match cli.command {
+            Commands::InitLocalnet {
+                hybrid_enforcement, ..
+            } => assert!(!hybrid_enforcement),
+            _ => panic!("expected init-localnet command"),
+        }
+    }
+
+    #[test]
+    fn node_binary_candidates_fall_back_from_deps_to_debug_dir() {
+        let sim_exe = PathBuf::from("/tmp/entangrid/target/debug/deps/entangrid_sim-test");
+        let candidates = node_binary_candidate_paths(&sim_exe).unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/entangrid/target/debug/deps/entangrid-node"),
+                PathBuf::from("/tmp/entangrid/target/debug/entangrid-node"),
+            ]
+        );
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_false_for_default_localnet() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-default");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        assert!(!localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_true_when_enforcement_flag_is_set_only() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-enforcement-only");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = rewrite_first_node_config(&unique_dir, |config| {
+            config.feature_flags.require_hybrid_validator_signatures = true;
+        });
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[test]
+    fn hybrid_localnet_detection_returns_true_when_backend_is_hybrid_only() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-backend-only");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let manifest = rewrite_first_node_config(&unique_dir, |config| {
+            config.signing_backend = SigningBackendKind::HybridDeterministicMlDsaExperimental;
+        });
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn hybrid_localnet_detection_returns_true_for_hybrid_localnet() {
+        let unique_dir = temp_localnet_dir("hybrid-detect-enabled");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        assert!(localnet_requires_hybrid_enforcement(&manifest).unwrap());
+    }
+
+    #[cfg(not(all(feature = "pq-ml-dsa", feature = "pq-ml-kem")))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn hybrid_localnet_launch_requires_sim_pq_support() {
+        let unique_dir = temp_localnet_dir("hybrid-launch-feature-gate");
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        write_hybrid_requirement_to_first_node(&unique_dir);
+
+        let error = spawn_localnet_children(&unique_dir).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        );
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "boots a strict hybrid localnet with real localhost sockets"]
+    async fn hybrid_enforcement_localnet_boot_smoke_test() {
+        let unique_dir = temp_localnet_dir("hybrid-boot-smoke");
+        init_localnet(
+            4,
+            &unique_dir,
+            500,
+            5,
+            250,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&unique_dir).unwrap();
+        let mut children = spawn_localnet_children(&unique_dir).await.unwrap();
+        let smoke_result = async {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                for child in children.iter_mut() {
+                    if let Some(status) = child.try_wait()? {
+                        return Err(anyhow!(
+                            "hybrid localnet smoke saw node exit early with status {status}"
+                        ));
+                    }
+                }
+
+                if hybrid_boot_smoke_ready(&manifest)? {
+                    return Ok(());
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "hybrid localnet smoke did not produce blocks plus proposal-vote/qc activity within timeout"
+                    ));
+                }
+
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        .await;
+
+        shutdown_children(&mut children).await;
+        smoke_result.unwrap();
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn init_localnet_hybrid_enforcement_writes_hybrid_node_configs() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-node-config-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert!(node_config.feature_flags.consensus_v2);
+        assert!(
+            node_config
+                .feature_flags
+                .require_hybrid_validator_signatures
+        );
+        assert_eq!(
+            node_config.signing_backend,
+            entangrid_types::SigningBackendKind::HybridDeterministicMlDsaExperimental
+        );
+        assert_eq!(
+            node_config.session_backend,
+            entangrid_types::SessionBackendKind::HybridDeterministicMlKemExperimental
+        );
+        assert!(
+            !node_config
+                .signing_key_path
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            !node_config
+                .session_key_path
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn init_localnet_hybrid_enforcement_writes_hybrid_genesis_identities() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-genesis-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let genesis_path = unique_dir.join("genesis.toml");
+        let contents = fs::read_to_string(genesis_path).unwrap();
+        let genesis: GenesisConfig = toml::from_str(&contents).unwrap();
+        assert!(!genesis.validators.is_empty());
+        assert!(
+            genesis
+                .validators
+                .iter()
+                .all(|validator| validator.public_identity.scheme == PublicKeyScheme::Hybrid)
+        );
+        assert!(genesis.validators.iter().all(|validator| {
+            validator
+                .session_public_identity
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.scheme() == entangrid_types::SessionKeyScheme::Hybrid
+                })
+        }));
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn init_localnet_hybrid_enforcement_writes_ml_dsa_key_files() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-key-file-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let key_path = unique_dir.join("node-1").join("ml-dsa-key.json");
+        assert!(key_path.exists());
+        let key_file: MlDsa65SimKeyFile =
+            serde_json::from_slice(&fs::read(&key_path).unwrap()).unwrap();
+        assert!(!key_file.signing_key.is_empty());
+        assert!(!key_file.verifying_key.is_empty());
+    }
+
+    #[cfg(all(feature = "pq-ml-dsa", feature = "pq-ml-kem"))]
+    #[test]
+    fn init_localnet_hybrid_enforcement_writes_ml_kem_session_key_files() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-session-key-file-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let key_path = unique_dir.join("node-1").join("ml-kem-session-key.json");
+        assert!(key_path.exists());
+        let key_file: MlKem768SimSessionKeyFile =
+            serde_json::from_slice(&fs::read(&key_path).unwrap()).unwrap();
+        assert!(!key_file.decapsulation_key.is_empty());
+        assert!(!key_file.encapsulation_key.is_empty());
+    }
+
+    #[cfg(not(all(feature = "pq-ml-dsa", feature = "pq-ml-kem")))]
+    #[test]
+    fn init_localnet_hybrid_enforcement_requires_pq_feature() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-feature-gate-test-{}",
+            now_unix_millis()
+        ));
+        let error = init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "hybrid bootstrap requires entangrid-sim to be built with pq-ml-dsa and pq-ml-kem"
+        );
+    }
+
+    #[test]
+    fn init_localnet_without_hybrid_enforcement_keeps_hybrid_policy_disabled() {
+        let unique_dir = std::env::temp_dir().join(format!(
+            "entangrid-sim-hybrid-policy-test-{}",
+            now_unix_millis()
+        ));
+        init_localnet(
+            4,
+            &unique_dir,
+            1_000,
+            5,
+            1_000,
+            false,
+            3,
+            0.40,
+            4,
+            default_service_score_weights(),
+            None,
+            0,
+            0.0,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let node_one_path = unique_dir.join("node-1").join("node.toml");
+        let contents = fs::read_to_string(node_one_path).unwrap();
+        let node_config: NodeConfig = toml::from_str(&contents).unwrap();
+        assert_eq!(
+            node_config.signing_backend,
+            entangrid_types::SigningBackendKind::DevDeterministic
+        );
+        assert_eq!(node_config.signing_key_path, None);
+        assert!(
+            !node_config
+                .feature_flags
+                .require_hybrid_validator_signatures
+        );
+        assert!(!unique_dir.join("node-1").join("ml-dsa-key.json").exists());
     }
 
     #[test]
@@ -2428,6 +3716,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
             false,
         )
@@ -2538,6 +3827,7 @@ mod tests {
             0.0,
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -2635,6 +3925,7 @@ mod tests {
             0.0,
             false,
             true,
+            false,
         )
         .unwrap();
         let genesis: GenesisConfig =
@@ -2733,6 +4024,73 @@ mod tests {
         let markdown = report.render_markdown();
         assert!(markdown.contains("# Entangrid Rigorous Matrix"));
         assert!(markdown.contains("| Scenario | Status | Signal | Validators |"));
+    }
+
+    #[test]
+    fn pq_measurement_report_renders_backend_and_overhead_fields() {
+        let report = PqMeasurementReport {
+            generated_at_unix_millis: 1,
+            validator_count: 4,
+            iterations: 32,
+            output_path: "test-results/pq-ml-dsa-measurements.md".into(),
+            scenarios: vec![
+                PqMeasurementScenario {
+                    label: "block".into(),
+                    deterministic_signature_size_bytes: 32,
+                    ml_dsa_signature_size_bytes: 3309,
+                    deterministic_message_size_bytes: 480,
+                    ml_dsa_message_size_bytes: 3757,
+                    deterministic_median_sign_latency_nanos: 500,
+                    ml_dsa_median_sign_latency_nanos: 45_000,
+                    deterministic_median_verify_latency_nanos: 400,
+                    ml_dsa_median_verify_latency_nanos: 62_000,
+                },
+                PqMeasurementScenario {
+                    label: "proposal_vote".into(),
+                    deterministic_signature_size_bytes: 32,
+                    ml_dsa_signature_size_bytes: 3309,
+                    deterministic_message_size_bytes: 140,
+                    ml_dsa_message_size_bytes: 3417,
+                    deterministic_median_sign_latency_nanos: 450,
+                    ml_dsa_median_sign_latency_nanos: 42_000,
+                    deterministic_median_verify_latency_nanos: 390,
+                    ml_dsa_median_verify_latency_nanos: 59_000,
+                },
+            ],
+        };
+        let markdown = report.render_markdown();
+        assert!(markdown.contains("# Entangrid PQ Signing Measurements"));
+        assert!(markdown.contains("validator count"));
+        assert!(markdown.contains("block"));
+        assert!(markdown.contains("proposal_vote"));
+        assert!(markdown.contains("ML-DSA message size"));
+        assert!(markdown.contains("Median verify latency"));
+    }
+
+    #[test]
+    fn default_pq_measurement_output_path_uses_test_results_directory() {
+        let path = default_pq_measurement_output_path();
+        assert!(
+            path.starts_with("test-results"),
+            "unexpected output path: {path}"
+        );
+        assert!(
+            path.ends_with(".md"),
+            "unexpected output path extension: {path}"
+        );
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn pq_measurement_report_builds_real_block_and_vote_scenarios() {
+        let output_path = std::env::temp_dir().join("entangrid-pq-measure-test.md");
+        let report = build_pq_measurement_report(4, 4, &output_path).unwrap();
+        assert_eq!(report.validator_count, 4);
+        assert_eq!(report.scenarios.len(), 2);
+        assert_eq!(report.scenarios[0].label, "block");
+        assert_eq!(report.scenarios[1].label, "proposal_vote");
+        assert!(report.scenarios[0].ml_dsa_signature_size_bytes > 0);
+        assert!(report.scenarios[1].ml_dsa_message_size_bytes > 0);
     }
 
     #[test]
@@ -2880,6 +4238,7 @@ mod tests {
             None,
             0,
             0.0,
+            false,
             false,
             false,
         )

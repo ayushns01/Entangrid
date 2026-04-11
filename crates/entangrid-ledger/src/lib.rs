@@ -168,8 +168,8 @@ mod tests {
 
     use entangrid_crypto::{DeterministicCryptoBackend, Signer};
     use entangrid_types::{
-        GenesisConfig, SignedTransaction, Transaction, ValidatorConfig, canonical_hash, empty_hash,
-        now_unix_millis, validator_account,
+        GenesisConfig, PublicIdentity, SignedTransaction, Transaction, ValidatorConfig,
+        canonical_hash, empty_hash, now_unix_millis, validator_account,
     };
 
     use super::*;
@@ -194,14 +194,14 @@ mod tests {
                     stake: 100,
                     address: "127.0.0.1:3001".into(),
                     dev_secret: "secret-1".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 },
                 ValidatorConfig {
                     validator_id: 2,
                     stake: 100,
                     address: "127.0.0.1:3002".into(),
                     dev_secret: "secret-2".into(),
-                    public_identity: vec![],
+                    public_identity: PublicIdentity::default(),
                 },
             ],
             initial_balances: balances,
@@ -228,5 +228,281 @@ mod tests {
         state.apply_transaction(&signed).unwrap();
         assert_eq!(state.balance_of(&validator_account(1)), 90);
         assert_eq!(state.balance_of(&validator_account(2)), 10);
+    }
+
+    #[test]
+    fn typed_signature_transaction_validates_with_deterministic_backend() {
+        let mut balances = BTreeMap::new();
+        balances.insert(validator_account(1), 100);
+        balances.insert(validator_account(2), 0);
+
+        let genesis = GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+            ],
+            initial_balances: balances,
+        };
+        let crypto = DeterministicCryptoBackend::from_genesis(&genesis);
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: None,
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        let state = LedgerState::from_genesis(&genesis);
+        state.validate_tx(&signed, &crypto).unwrap();
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn ml_dsa_transaction_validates_with_configured_backend() {
+        use entangrid_crypto::build_crypto_backend;
+        use entangrid_types::{
+            FaultProfile, FeatureFlags, NodeConfig, PublicKeyScheme, SigningBackendKind,
+        };
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-ledger-ml-dsa-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        std::fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut balances = BTreeMap::new();
+        balances.insert(validator_account(1), 100);
+        balances.insert(validator_account(2), 0);
+
+        let genesis = GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: PublicIdentity::single(
+                        PublicKeyScheme::MlDsa,
+                        verifying_key.encode().as_slice().to_vec(),
+                    ),
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+            ],
+            initial_balances: balances,
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::MlDsa65Experimental,
+            signing_key_path: Some(key_path.display().to_string()),
+        };
+        let crypto = build_crypto_backend(&genesis, &config).unwrap();
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: Some("ml-dsa".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        let state = LedgerState::from_genesis(&genesis);
+        state.validate_tx(&signed, crypto.as_ref()).unwrap();
+    }
+
+    #[cfg(feature = "pq-ml-dsa")]
+    #[test]
+    fn hybrid_transaction_validates_with_configured_backend() {
+        use entangrid_crypto::build_crypto_backend;
+        use entangrid_types::{
+            FaultProfile, FeatureFlags, NodeConfig, PublicIdentityComponent, PublicKeyScheme,
+            SigningBackendKind,
+        };
+        use ml_dsa::{KeyGen, MlDsa65};
+        use rand_core::OsRng;
+        use serde::Serialize;
+
+        #[derive(Serialize)]
+        struct MlDsa65KeyFileFixture {
+            signing_key: Vec<u8>,
+            verifying_key: Vec<u8>,
+        }
+
+        let mut rng = OsRng;
+        let keypair = MlDsa65::key_gen(&mut rng);
+        let signing_key = keypair.signing_key().clone();
+        let verifying_key = keypair.verifying_key().clone();
+        let key_path = std::env::temp_dir().join(format!(
+            "entangrid-ledger-hybrid-{}.json",
+            std::process::id()
+        ));
+        let key_file = MlDsa65KeyFileFixture {
+            signing_key: signing_key.encode().as_slice().to_vec(),
+            verifying_key: verifying_key.encode().as_slice().to_vec(),
+        };
+        std::fs::write(&key_path, serde_json::to_vec(&key_file).unwrap()).unwrap();
+
+        let mut balances = BTreeMap::new();
+        balances.insert(validator_account(1), 100);
+        balances.insert(validator_account(2), 0);
+
+        let genesis = GenesisConfig {
+            chain_id: "test".into(),
+            epoch_seed: empty_hash(),
+            genesis_time_unix_millis: 0,
+            slot_duration_millis: 1000,
+            slots_per_epoch: 10,
+            max_txs_per_block: 16,
+            witness_count: 2,
+            validators: vec![
+                ValidatorConfig {
+                    validator_id: 1,
+                    stake: 100,
+                    address: "127.0.0.1:3001".into(),
+                    dev_secret: "secret-1".into(),
+                    public_identity: PublicIdentity::try_hybrid(vec![
+                        PublicIdentityComponent {
+                            scheme: PublicKeyScheme::DevDeterministic,
+                            bytes: format!("validator-{}", 1).into_bytes(),
+                        },
+                        PublicIdentityComponent {
+                            scheme: PublicKeyScheme::MlDsa,
+                            bytes: verifying_key.encode().as_slice().to_vec(),
+                        },
+                    ])
+                    .unwrap(),
+                },
+                ValidatorConfig {
+                    validator_id: 2,
+                    stake: 100,
+                    address: "127.0.0.1:3002".into(),
+                    dev_secret: "secret-2".into(),
+                    public_identity: PublicIdentity::default(),
+                },
+            ],
+            initial_balances: balances,
+        };
+        let config = NodeConfig {
+            validator_id: 1,
+            data_dir: "/tmp/node-1".into(),
+            genesis_path: "/tmp/genesis.toml".into(),
+            listen_address: "127.0.0.1:3001".into(),
+            peers: Vec::new(),
+            log_path: "/tmp/events.log".into(),
+            metrics_path: "/tmp/metrics.json".into(),
+            feature_flags: FeatureFlags::default(),
+            fault_profile: FaultProfile::default(),
+            sync_on_startup: true,
+            signing_backend: SigningBackendKind::HybridDeterministicMlDsaExperimental,
+            signing_key_path: Some(key_path.display().to_string()),
+        };
+        let crypto = build_crypto_backend(&genesis, &config).unwrap();
+        let transaction = Transaction {
+            from: validator_account(1),
+            to: validator_account(2),
+            amount: 10,
+            nonce: 0,
+            memo: Some("hybrid".into()),
+        };
+        let tx_hash = canonical_hash(&transaction);
+        let signed = SignedTransaction {
+            transaction,
+            signer_id: 1,
+            signature: crypto.sign(1, &tx_hash).unwrap(),
+            tx_hash,
+            submitted_at_unix_millis: now_unix_millis(),
+        };
+
+        assert_eq!(
+            signed.signature.scheme(),
+            entangrid_types::SignatureScheme::Hybrid
+        );
+        assert!(
+            signed
+                .signature
+                .component_bytes(entangrid_types::SignatureScheme::DevDeterministic)
+                .is_some()
+        );
+        assert!(
+            signed
+                .signature
+                .component_bytes(entangrid_types::SignatureScheme::MlDsa)
+                .is_some()
+        );
+
+        let state = LedgerState::from_genesis(&genesis);
+        state.validate_tx(&signed, crypto.as_ref()).unwrap();
     }
 }

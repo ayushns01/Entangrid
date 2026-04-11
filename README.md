@@ -42,19 +42,6 @@ This repository instead documents a more defensible design:
 - relay work matters more than connection count
 - the system can be simulated, benchmarked, and attacked in a controlled way
 
-## Documentation Index
-
-- [Architecture](docs/architecture.md)
-- [Current Main-Branch Flow](docs/current-flow.md)
-- [Protocol Specification](docs/protocol.md)
-- [Threat Model](docs/threat-model.md)
-- [Roadmap](docs/roadmap.md)
-- [Localnet Plan](docs/localnet.md)
-- [Benchmarking Plan](docs/benchmarks.md)
-- [Consensus V2 Redesign Plan](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md)
-- [Consensus V2 Status Update](docs/superpowers/plans/entangrid-consensus-v2-status.md)
-- [Consensus V2 Stabilization Plan](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
-
 ## MVP Scope
 
 The first milestone should stay intentionally small:
@@ -76,17 +63,17 @@ The first milestone should stay intentionally small:
 - internet-scale peer discovery
 - production hardening
 
-## Proposed Workspace Shape
+## Workspace Layout
 
-When implementation starts, this repository should become a Cargo workspace with crates similar to:
+The repository is now a real Cargo workspace with these primary crates:
 
-- `crypto`
-- `types`
-- `network`
-- `ledger`
-- `consensus`
-- `node`
-- `sim`
+- [`crates/entangrid-crypto`](crates/entangrid-crypto/README.md): crypto backends, typed signatures, and hybrid session primitives
+- [`crates/entangrid-types`](crates/entangrid-types/README.md): shared protocol, config, sync, and metrics types
+- [`crates/entangrid-network`](crates/entangrid-network/README.md): static-peer transport, signed envelopes, and hybrid session framing
+- [`crates/entangrid-ledger`](crates/entangrid-ledger/README.md): deterministic account-based execution and replay
+- [`crates/entangrid-consensus`](crates/entangrid-consensus/README.md): slot timing, proposer selection, witness assignment, and service scoring rules
+- [`crates/entangrid-node`](crates/entangrid-node/README.md): validator runtime, sync, voting, and persistence
+- [`crates/entangrid-sim`](crates/entangrid-sim/README.md): localnet generation, workload injection, and matrix reporting
 
 ## Current Implementation Status
 
@@ -105,12 +92,34 @@ The repository now includes a working Rust workspace with:
 
 Important:
 
-- the current backend is a deterministic development backend, not a production-strength post-quantum implementation
-- real PQ signatures and key exchange remain a later milestone behind the stable crypto interfaces already in place
+- the default localnet backend is still deterministic development crypto
+- the project now also has an experimental PQ Stage 1 path behind `pq-ml-dsa` and `pq-ml-kem`, but it is not yet a production-hardened cryptography release
+- `stage-1/pq-integration` is now the active branch for Stage 1 PQ work:
+  - typed signatures and typed public identities are in
+  - node-local signing backend selection is in
+  - an experimental ML-DSA signing backend now exists behind the `pq-ml-dsa` cargo feature
+  - first-class hybrid signature and identity containers are now in for transactions, blocks, proposal votes, relay receipts, and service attestations
+  - permissive hybrid verification is in
+  - strict hybrid localnet bootstrap is now available through `cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- init-localnet --validators 4 --hybrid-enforcement --base-dir var/pq-hybrid-smoke`
+  - that mode writes hybrid validator identities plus `session_public_identity` into genesis, generates one ML-DSA key file plus one ML-KEM session key file per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+  - `--hybrid-enforcement` is an operational/bootstrap slice, not a full hybrid performance matrix
+  - Stage 1G now adds a feature-gated hybrid session handshake behind `pq-ml-kem`
+  - validators now keep signing identity and session identity separate
+  - session setup is per-stream and mutually signed, then derives material from deterministic + ML-KEM components
+  - Stage 1I now encrypts every post-handshake frame body automatically when the hybrid session backend is active
+  - the handshake stays in cleartext, the outer frame length stays plaintext, and the frame body is protected after session establishment
+  - Stage 1J now adds node-local hybrid session lifetime control through `NodeConfig.session_ttl_millis`
+  - when that TTL is omitted, hybrid lanes default to a 10 minute lifetime while deterministic transport remains unchanged
+  - outbound hybrid lanes lazily drop expired cached streams and reconnect through a fresh handshake before sending the pending frame
+  - inbound hybrid lanes close expired streams before accepting the next application frame, so expiry stays transport-local instead of leaking into node logic
+  - deterministic transport remains the default path when `pq-ml-kem` is off
+  - transactions, relay receipts, and service attestations now join blocks and proposal votes under the strict hybrid-enforcement slice
+  - service aggregates inherit that enforcement transitively through validated embedded service attestations, which closes Stage 1K
+  - Stage 1 cryptography and transport integration are now in place for the first mergeable PQ milestone; rekeying/session rotation and stronger traffic-shaping remain explicitly deferred to a later hardening milestone
+  - the remaining blockers on the active PQ-enabled line are `baseline-6-bursty` and `gated-6-bursty`, not missing PQ signing or transport work
 - the older V1 baseline is preserved on the `codex/consensus-v1` branch and is still useful as a regression benchmark
 - the active protocol work now happens on `main`
 - `codex/consensus-v2` remains useful as a staging branch when we want isolated V2 experiments before merging back
-- the redesign direction and the latest implementation status are documented in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md)
 
 ## Current Main-Branch V2 Status
 
@@ -132,9 +141,9 @@ Current V2 shape:
 
 The main remaining V2 blockers are now:
 
-- proving the final healthy and degraded `4/5/6/7/8` bursty matrix on current `main`
-- tightening the simulator acceptance gates so regressions fail loudly
-- real PQ integration only after the full matrix is green
+- closing the remaining `baseline-6-bursty` and `gated-6-bursty` failures on the latest rigorous matrix
+- freezing that matrix as the simulator acceptance gate so regressions fail loudly
+- only then claiming final consensus signoff for the PQ-enabled branch
 
 ## Current Recommended Prototype Policy
 
@@ -158,21 +167,20 @@ Important:
 
 - the harsh 4-validator Entangrid scenarios and abuse scenarios are currently in a much better place than before
 - the current active correctness gate is still the single-machine healthy and degraded bursty matrix across `4/5/6/7/8`
-- because of that, this policy should be treated as the current pre-PQ baseline, not as a final all-topology signoff
+- because of that, this policy should be treated as the current acceptance baseline, not as a final all-topology signoff
 
 ## Active Redesign Direction
 
 The current prototype proved the core Entangrid idea is implementable, and `main` now carries the first real V2 stabilization slices, but the scaling work is not finished yet:
 
 - the baseline local-receipt path is still too topology-sensitive at larger validator counts
-- healthy `6/7/8` bursty runs now repeatedly shut down on one tip with QC-dominant branch choice active
+- the latest rigorous matrix on the active branch is `12/14`, with only `baseline-6-bursty` and `gated-6-bursty` still failing
 - certified sync now skips stale certified suffixes instead of rolling a node back after it already advanced
 - V2 service evidence and degraded punishment are materially better after the transport/session hardening on `main`
-- stale-restart recovery is now fixed enough that a restarted validator can catch up without falling back to full snapshot sync
-- the next step is to prove the full healthy/degraded matrix on current `main`, not to keep redesigning recovery again
+- stale-restart recovery is no longer the broad matrix-wide blocker, but one stuck-follower recovery case still survives inside `gated-6-bursty`
+- the next step is to close the remaining bursty `6`-validator pair: pre-QC multi-tip convergence in `baseline-6-bursty` and follower recovery in `gated-6-bursty`
 
-That work is tracked in [docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md](docs/superpowers/plans/2026-03-25-entangrid-consensus-v2.md), [docs/superpowers/plans/entangrid-consensus-v2-status.md](docs/superpowers/plans/entangrid-consensus-v2-status.md), and [docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md](docs/superpowers/plans/2026-03-27-entangrid-v2-stabilization.md).
-Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as not PQ-ready yet.
+Treat `main` as the active V2 development line, `codex/consensus-v1` as the benchmark branch, and the current architecture as PQ-integrated but not yet fully consensus-proven.
 
 ## Quickstart
 
@@ -190,6 +198,23 @@ cargo run -p entangrid-sim -- init-localnet --validators 4 --base-dir var/localn
 
 That default localnet still starts in the baseline path.
 To run the active V2 line on `main`, pass `--consensus-v2` when you initialize the network.
+
+To boot the strict hybrid Stage 1F slice, use:
+
+```bash
+cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- init-localnet \
+  --validators 4 \
+  --hybrid-enforcement \
+  --base-dir var/pq-hybrid-smoke
+```
+
+This mode now requires a build with both `pq-ml-dsa` and `pq-ml-kem`, writes hybrid validator identities plus `session_public_identity` into genesis, generates one `ml-dsa-key.json` plus one `ml-kem-session-key.json` per node, selects `HybridDeterministicMlDsaExperimental` plus `HybridDeterministicMlKemExperimental`, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`. It is meant as a bootstrap/operational smoke path, not as the full hybrid performance matrix.
+
+To start that hybrid localnet, use the same feature-enabled simulator and the matching base directory:
+
+```bash
+cargo run -p entangrid-sim --features "pq-ml-dsa pq-ml-kem" -- up --base-dir var/pq-hybrid-smoke
+```
 
 Start the localnet:
 

@@ -53,6 +53,7 @@ Current main-branch focus:
 
 - keep the ledger intentionally stable while the active work on `main` is still in consensus, evidence, ordering, and sync
 - preserve deterministic replay so V1 and V2 branch comparisons stay meaningful
+- stay compatible with the current typed-signature block format and the explicit commitment receipt bundle carried in prototype blocks
 
 ## What the ledger currently supports
 

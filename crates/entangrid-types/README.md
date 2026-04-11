@@ -20,6 +20,17 @@ If `entangrid-node`, `entangrid-ledger`, `entangrid-consensus`, and `entangrid-n
 
 Right now this crate is intentionally simple and very central.
 
+It also now contains the first crypto-agility primitives for the PQ work:
+
+- `SignatureScheme`
+- `PublicKeyScheme`
+- `TypedSignature`
+- `PublicIdentity`
+- `SigningBackendKind`
+- `SessionKeyScheme`
+- `SessionPublicIdentity`
+- `SessionBackendKind`
+
 - `GenesisConfig` describes the chain start state:
   - validator list
   - slot timing
@@ -32,6 +43,14 @@ Right now this crate is intentionally simple and very central.
   - static peers
   - feature flags
   - fault profile
+  - `signing_backend`
+  - optional `signing_key_path`
+  - `session_backend`
+  - optional `session_key_path`
+  - optional `session_ttl_millis`
+- `ValidatorConfig` now carries both:
+  - signing-facing `public_identity`
+  - optional transport-facing `session_public_identity`
 - `Transaction` is a native balance transfer:
   - `from`
   - `to`
@@ -40,7 +59,7 @@ Right now this crate is intentionally simple and very central.
   - optional `memo`
 - `SignedTransaction` wraps that transfer with:
   - signer id
-  - signature
+  - typed signature
   - transaction hash
   - submission timestamp
 - `Block` contains:
@@ -48,7 +67,7 @@ Right now this crate is intentionally simple and very central.
   - accepted transactions
   - an optional topology commitment
   - the receipt bundle that proves that commitment in the current prototype
-  - proposer signature
+  - typed proposer signature
   - block hash
 - `ProtocolMessage` is the current network message enum:
   - transaction broadcast
@@ -63,6 +82,7 @@ Right now this crate is intentionally simple and very central.
   - receipt enablement
   - service-gating enablement
   - `consensus_v2` enablement
+  - `require_hybrid_validator_signatures` for opt-in hybrid enforcement on validator-originated transactions and consensus objects
   - the epoch where gating should start
   - the score threshold used by service gating
   - the number of epochs included in the rolling service-score window
@@ -85,6 +105,11 @@ This crate also provides a few shared helpers:
 - `hash_many(...)` for combining byte parts
 - `validator_account(id)` for mapping validator ids to current account names like `validator-1`
 
+It now also carries the Stage 1G handshake wire types shared by crypto and transport:
+
+- `SessionClientHello`
+- `SessionServerHello`
+
 ## What this means in the current implementation
 
 Today, the chain is built around validator-owned accounts and transfer-only state transitions.
@@ -106,6 +131,16 @@ One recent example of that role is service gating:
 - the node reports score breakdowns back into `NodeMetrics` through these shared types
 - the consensus crate consumes the same `ServiceCounters` layout when turning receipts into scores
 - `NodeMetrics` now also carries the active score-weight profile so reports can explain not just the counters, but the policy that turned them into a score
+
+Another recent example is Stage 1G plus Stage 1I transport setup:
+
+- validator metadata can now advertise a separate session public identity
+- node-local config can now point at a separate session key file
+- node-local config now also carries `session_ttl_millis` so hybrid session lifetime stays transport-local instead of becoming a genesis setting
+- crypto and network share one handshake wire format through this crate
+- that shared handshake now feeds an encrypted post-handshake transport lane when the hybrid session backend is active
+- omitted TTL now means a 10 minute default lifetime for hybrid lanes, while `0` disables expiry and deterministic transport remains unchanged
+- the deterministic session path remains the default when `pq-ml-kem` is disabled
 
 The current recommended prototype policy now lives in these shared defaults too:
 
@@ -134,6 +169,17 @@ One recent example of the type layer evolving with the active main-branch V2 wor
 - `ServiceAttestation` and `ServiceAggregate` now carry the witness-aligned evidence needed for the V2 path
 - `NodeMetrics` now distinguishes actual gating rejections from enforcement skips when evidence is missing or insufficient
 
+One recent example of the type layer evolving with the active PQ branch is signing and identity metadata:
+
+- signature-bearing protocol objects now carry `TypedSignature` instead of anonymous bytes
+- validator config now carries `PublicIdentity` instead of an untyped byte blob
+- node config now carries `SigningBackendKind` so signer selection is local configuration, not a consensus feature flag
+- verification code can now dispatch by explicit signature scheme
+- typed signatures and identities now support first-class hybrid bundles while preserving the legacy single-form encoding
+- `FeatureFlags.require_hybrid_validator_signatures` now lets a network opt into hybrid validator identity enforcement at startup plus hybrid transaction/block/proposal-vote/relay-receipt/service-attestation enforcement at runtime
+- service aggregates stay unsigned in the type layer and inherit that strict policy transitively through embedded service attestations instead of gaining a second policy surface
+- Stage 1F plus Stage 1H use these same fields to bootstrap a strict hybrid localnet: the simulator writes hybrid validator identities plus `session_public_identity` into genesis, sets `signing_backend = HybridDeterministicMlDsaExperimental` plus `session_backend = HybridDeterministicMlKemExperimental` per node, enables `require_hybrid_validator_signatures = true`, and forces `consensus_v2 = true`
+
 ## Where we want to take it
 
 This crate should grow into the stable protocol schema of Entangrid.
@@ -144,6 +190,7 @@ Future direction:
 - add richer transaction types beyond simple transfers
 - support stronger proof and commitment structures
 - introduce versioning and upgrade-friendly wire/state formats
-- prepare the type layer for real post-quantum identities and network evidence
+- extend the typed identity and signature model into full PQ and hybrid production formats
+- decide when hybrid signatures become mandatory instead of permissive
 
 In short: this crate should become the clean, stable data model that the rest of the blockchain can rely on for a long time.

@@ -51,6 +51,12 @@ So the current mental model is:
 
 "enqueue onto the peer lane, reuse the stream if it is alive, reconnect only when needed, then receive and verify on the other side."
 
+When the hybrid session backend is active on the Stage 1 PQ line:
+
+- each TCP stream begins with a mutually signed session handshake
+- the outer frame length remains plaintext
+- every later frame body is encrypted and authenticated automatically
+
 ### Message integrity
 
 Before sending, the crate:
@@ -97,7 +103,7 @@ Today this is a clean localnet transport layer, not a production peer-to-peer st
 
 It does not yet provide:
 
-- real PQ transport security
+- production-grade PQ transport hardening
 - backpressure-aware gossip
 - peer reputation
 - discovery
@@ -109,7 +115,7 @@ Current main-branch focus:
 
 - keep the transport simple and observable while `consensus_v2` is stabilized on `main`
 - support the active V2 evidence and ordering messages cleanly
-- defer real PQ transport and larger-topology networking work until the single-machine V2 matrix is green
+- keep the current hybrid session and encrypted framing path stable while `baseline-6-bursty` and `gated-6-bursty` are closed
 
 ## Why this crate matters
 
@@ -128,7 +134,7 @@ This crate should become a more serious communication layer over time.
 
 Future direction:
 
-- replace dev session derivation with real PQ-secure session setup
+- harden the current experimental hybrid session setup into a production-strength PQ-secure transport path
 - improve sync and broadcast efficiency
 - add better retry and buffering behavior
 - prepare for more realistic peer topologies and partial connectivity
@@ -137,7 +143,7 @@ Future direction:
 Current runtime note:
 
 - the persistent-lane transport work materially improved Issue 3 on `main`
-- the transport/runtime edge is no longer basic bursty delivery or stale-node self-throttling
+- the transport/runtime edge is no longer missing hybrid framing or broad bursty delivery support
 - the next step is keeping this transport behavior stable while the full V2 matrix is frozen into acceptance gates
 
 In short: today this crate gives us a practical local validator network, but it is meant to become a much stronger transport layer for Entangrid.
