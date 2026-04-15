@@ -46,8 +46,10 @@ This repository instead documents a more defensible design:
 
 - [Architecture](docs/architecture.md)
 - [Current Main-Branch Flow](docs/current-flow.md)
+- [Sync And Recovery](docs/sync-and-recovery.md)
 - [Protocol Specification](docs/protocol.md)
 - [Threat Model](docs/threat-model.md)
+- [Verification Guide](docs/verification.md)
 - [Roadmap](docs/roadmap.md)
 - [Localnet Plan](docs/localnet.md)
 - [Benchmarking Plan](docs/benchmarks.md)
