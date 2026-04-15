@@ -164,6 +164,7 @@ Important current limit:
 - service evidence and degraded punishment are materially better after the recent transport/session hardening on `main`
 - the broad stale-node restart recovery gap is no longer the main blocker on the active line
 - PQ Stage 1 integration now exists on the active branch; the next runtime step is closing `baseline-6-bursty` and `gated-6-bursty`, then freezing the simulator acceptance gates
+- the current living status is summarized in [../../docs/pq-stage-1-status.md](../../docs/pq-stage-1-status.md), [../../docs/v2-issue-status.md](../../docs/v2-issue-status.md), and [../../docs/consensus-current-issue.md](../../docs/consensus-current-issue.md)
 
 ## Why this crate matters
 

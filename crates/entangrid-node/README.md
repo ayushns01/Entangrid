@@ -124,7 +124,7 @@ Current `consensus_v2` additions on `main`:
 - proposal votes and quorum certificates are live in the runtime
 - equal-QC uncertified sibling branches no longer replace the current canonical tip just because they gained extra local vote support
 
-Current Stage 1 PQ additions on `stage-1/pq-integration`:
+Current Stage 1 PQ additions on `main`:
 
 - strict hybrid validator-identity enforcement is available behind `require_hybrid_validator_signatures`
 - blocks, proposal votes, transactions, relay receipts, and service attestations can all be enforced as hybrid-signed validator artifacts
@@ -184,6 +184,7 @@ Important current limit:
 - stale certified-sync responses are now skipped instead of re-adopting an older certified suffix
 - restarted nodes now suppress historical proposer-slot replay and can hold proposals behind a startup sync barrier while peers are still ahead
 - stale-node restart recovery is no longer the broad matrix-wide blocker, but one stuck-follower recovery case still remains in `gated-6-bursty`
+- the current living status is documented in [../../docs/pq-stage-1-status.md](../../docs/pq-stage-1-status.md), [../../docs/v2-issue-status.md](../../docs/v2-issue-status.md), and [../../docs/consensus-current-issue.md](../../docs/consensus-current-issue.md)
 
 The recent validation-focused improvement in this crate was about correctness under degraded networking and stale restart recovery:
 
